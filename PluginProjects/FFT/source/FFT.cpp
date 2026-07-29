@@ -146,7 +146,6 @@ FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* rese
 bool
 FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserved1)
 {
-	info->startIndex = 0;
 	int bins = inputs->getParInt("Bins");
 
 	if (bins <= 0) bins = 16384;
@@ -154,9 +153,10 @@ FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserve
 	if (inputs->getNumInputs() > 0)
 	{
 		const OP_CHOPInput* cinput = inputs->getInputCHOP(0);
-		info->numChannels = cinput->numChannels; // Inherit input channel count
-		info->numSamples = bins;                 // Number of output frequency spectrum bins
-		info->sampleRate = cinput->sampleRate;
+		info->startIndex = 0;
+		info->numChannels = cinput->numChannels;
+		info->numSamples = bins;
+		info->sampleRate = bins;
 	}
 	else
 	{
