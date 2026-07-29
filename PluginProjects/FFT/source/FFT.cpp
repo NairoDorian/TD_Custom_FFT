@@ -597,9 +597,28 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 		break;
 	case 7:
 		entries->values[0]->setString("fft_engine");
-		entries->values[1]->setString("FFTW 3.3.5 Single Precision (FFTW_MEASURE)");
+		if (myFFTEngine) {
+			entries->values[1]->setString(myFFTEngine->getPlanStatus().c_str());
+		} else {
+			entries->values[1]->setString("Uninitialized");
+		}
 		break;
 	}
+}
+
+void
+FFT::getInfoPopupString(OP_String *info, void *reserved1)
+{
+	char tempBuffer[512];
+	snprintf(tempBuffer, sizeof(tempBuffer),
+		"TouchDesigner Custom FFT Plugin\n"
+		"Active Engine & Plan: %s\n"
+		"FFT Size: N = %zu | Buffer Capacity: %zu samples\n"
+		"Sample Rate: %.1f Hz (Nyquist: %.1f Hz)\n"
+		"SIMD Acceleration: AVX2 256-Bit FMA Vectorized",
+		myFFTEngine ? myFFTEngine->getPlanStatus().c_str() : "Uninitialized",
+		myFFTSize, myBufferCapacity, mySampleRate, mySampleRate / 2.0);
+	info->setString(tempBuffer);
 }
 
 /**

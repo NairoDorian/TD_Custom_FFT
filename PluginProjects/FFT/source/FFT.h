@@ -135,6 +135,8 @@ public:
 											OP_InfoDATEntries* entries,
 											void* reserved1) override;
 
+	virtual void		getInfoPopupString(OP_String *info, void *reserved1) override;
+
 	// Parameter setup & Pulse button callback
 	virtual void		setupParameters(OP_ParameterManager* manager, void *reserved1) override;
 	virtual void		pulsePressed(const char* name, void* reserved1) override;

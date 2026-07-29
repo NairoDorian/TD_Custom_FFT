@@ -785,6 +785,11 @@ public:
     virtual void executeRFFT(const std::vector<float>& padded_signal,
                              std::vector<float>& magnitude_spectrum,
                              std::vector<std::complex<float>>& scratch_complex) const noexcept = 0;
+
+    /**
+     * @brief Returns a descriptive status string of the engine and active FFT plan level.
+     */
+    virtual std::string getPlanStatus() const = 0;
 };
 
 /**
@@ -822,7 +827,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
 ===========================================================================
 High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 vector SIMD.
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
-- FFTW_PATIENT Hardware Benchmarking: Deep benchmarks assembly kernels on target CPU during plan creation.
+- FFTW_EXHAUSTIVE Hardware Benchmarking: Deep benchmarks assembly kernels on target CPU during plan creation.
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
 - FMA SIMD Parallel Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
 */
@@ -839,6 +844,7 @@ public:
     FFTWEngine(FFTWEngine&& other) noexcept {
         m_plan = other.m_plan;
         m_fft_size = other.m_fft_size;
+        m_planStatus = std::move(other.m_planStatus);
         other.m_plan = nullptr;
         other.m_fft_size = 0;
     }
@@ -848,6 +854,7 @@ public:
             destroyPlan();
             m_plan = other.m_plan;
             m_fft_size = other.m_fft_size;
+            m_planStatus = std::move(other.m_planStatus);
             other.m_plan = nullptr;
             other.m_fft_size = 0;
         }
@@ -860,6 +867,11 @@ public:
             m_plan = nullptr;
         }
         m_fft_size = 0;
+        m_planStatus = "FFTW3 (Uninitialized)";
+    }
+
+    std::string getPlanStatus() const override {
+        return m_planStatus.empty() ? "FFTW3 (Uninitialized)" : m_planStatus;
     }
 
     void prepare(size_t fft_size) override {
@@ -881,21 +893,25 @@ public:
 
             m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
             if (m_plan) {
+                m_planStatus = "FFTW3 (FFTW_EXHAUSTIVE)";
                 printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = %zu (Ultimate CPU Optimization Level)\n", fft_size);
             } else {
                 printf("[FFT Plugin] [FFTW3] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...\n");
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
                 if (m_plan) {
+                    m_planStatus = "FFTW3 (FFTW_PATIENT)";
                     printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_PATIENT plan for N = %zu\n", fft_size);
                 } else {
                     printf("[FFT Plugin] [FFTW3] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...\n");
                     m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                     if (m_plan) {
+                        m_planStatus = "FFTW3 (FFTW_MEASURE)";
                         printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = %zu\n", fft_size);
                     } else {
                         printf("[FFT Plugin] [FFTW3] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...\n");
                         m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
                         if (m_plan) {
+                            m_planStatus = "FFTW3 (FFTW_ESTIMATE)";
                             printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = %zu\n", fft_size);
                         }
                     }
@@ -933,6 +949,7 @@ public:
 private:
     fftwf_plan m_plan{ nullptr };
     size_t m_fft_size{ 0 };
+    std::string m_planStatus{ "FFTW3 (Uninitialized)" };
 };
 
 /*
@@ -952,6 +969,7 @@ public:
     MKLEngine(MKLEngine&& other) noexcept {
         m_plan = other.m_plan;
         m_fft_size = other.m_fft_size;
+        m_planStatus = std::move(other.m_planStatus);
         other.m_plan = nullptr;
         other.m_fft_size = 0;
     }
@@ -961,6 +979,7 @@ public:
             destroyPlan();
             m_plan = other.m_plan;
             m_fft_size = other.m_fft_size;
+            m_planStatus = std::move(other.m_planStatus);
             other.m_plan = nullptr;
             other.m_fft_size = 0;
         }
@@ -973,6 +992,11 @@ public:
             m_plan = nullptr;
         }
         m_fft_size = 0;
+        m_planStatus = "Intel MKL / IPP (Uninitialized)";
+    }
+
+    std::string getPlanStatus() const override {
+        return m_planStatus.empty() ? "Intel MKL / IPP (Uninitialized)" : m_planStatus;
     }
 
     void prepare(size_t fft_size) override {
@@ -992,21 +1016,25 @@ public:
 
             m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
             if (m_plan) {
+                m_planStatus = "Intel MKL / IPP (FFTW_EXHAUSTIVE)";
                 printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = %zu (Ultimate CPU Optimization Level)\n", fft_size);
             } else {
                 printf("[FFT Plugin] [Intel MKL / IPP] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...\n");
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
                 if (m_plan) {
+                    m_planStatus = "Intel MKL / IPP (FFTW_PATIENT)";
                     printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_PATIENT plan for N = %zu\n", fft_size);
                 } else {
                     printf("[FFT Plugin] [Intel MKL / IPP] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...\n");
                     m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                     if (m_plan) {
+                        m_planStatus = "Intel MKL / IPP (FFTW_MEASURE)";
                         printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = %zu\n", fft_size);
                     } else {
                         printf("[FFT Plugin] [Intel MKL / IPP] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...\n");
                         m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
                         if (m_plan) {
+                            m_planStatus = "Intel MKL / IPP (FFTW_ESTIMATE)";
                             printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = %zu\n", fft_size);
                         }
                     }
@@ -1040,6 +1068,7 @@ public:
 private:
     fftwf_plan m_plan{ nullptr };
     size_t m_fft_size{ 0 };
+    std::string m_planStatus{ "Intel MKL / IPP (Uninitialized)" };
 };
 
 } // namespace FFTDSP
