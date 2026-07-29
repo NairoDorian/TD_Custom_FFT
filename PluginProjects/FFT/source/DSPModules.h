@@ -620,11 +620,16 @@ public:
         size_t n = spectrum.size();
         float* data = spectrum.data();
 
-        // 256-bit AVX2 SIMD Parallel Peak Search across 8 floats per cycle
+        // 256-bit 2x Unrolled AVX2 SIMD Parallel Peak Search
         float max_val = 0.0f;
         size_t i = 0;
 #if defined(__AVX2__)
         __m256 v_max = _mm256_setzero_ps();
+        for (; i + 15 < n; i += 16) {
+            __m256 v0 = _mm256_loadu_ps(data + i);
+            __m256 v1 = _mm256_loadu_ps(data + i + 8);
+            v_max = _mm256_max_ps(v_max, _mm256_max_ps(v0, v1));
+        }
         for (; i + 7 < n; i += 8) {
             __m256 v = _mm256_loadu_ps(data + i);
             v_max = _mm256_max_ps(v_max, v);
@@ -645,18 +650,42 @@ public:
         float floor_val = static_cast<float>(-top_db);
         float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
 
-        if (mode == 2) { // Normalized dB (0.0 to 1.0 output range)
-            for (size_t k = 0; k < n; ++k) {
-                float raw_v = std::max(1e-12f, data[k]);
-                float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
-                db = std::max(db, floor_val);
-                data[k] = std::max(0.0f, std::min(1.0f, (db - floor_val) * inv_top_db));
+        // Vectorized SIMD Decibel Conversion & Clamping
+        size_t k = 0;
+#if defined(__AVX2__)
+        __m256 v_min_val = _mm256_set1_ps(1e-12f);
+        __m256 v_floor = _mm256_set1_ps(floor_val);
+        __m256 v_inv_top = _mm256_set1_ps(inv_top_db);
+        __m256 v_zero = _mm256_setzero_ps();
+        __m256 v_one = _mm256_set1_ps(1.0f);
+
+        for (; k + 7 < n; k += 8) {
+            __m256 v_raw = _mm256_max_ps(v_min_val, _mm256_loadu_ps(data + k));
+
+            alignas(32) float tmp[8];
+            _mm256_store_ps(tmp, v_raw);
+            alignas(32) float res[8];
+            for (int j = 0; j < 8; ++j) {
+                float db = 20.0f * std::log10(tmp[j]) + db_offset;
+                res[j] = std::max(db, floor_val);
             }
-        } else { // Raw dB output (-top_db to 0 dB)
-            for (size_t k = 0; k < n; ++k) {
-                float raw_v = std::max(1e-12f, data[k]);
-                float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
-                data[k] = std::max(db, floor_val);
+            __m256 v_db = _mm256_load_ps(res);
+
+            if (mode == 2) { // Normalized dB (0.0 to 1.0)
+                v_db = _mm256_mul_ps(_mm256_sub_ps(v_db, v_floor), v_inv_top);
+                v_db = _mm256_max_ps(v_zero, _mm256_min_ps(v_one, v_db));
+            }
+            _mm256_storeu_ps(data + k, v_db);
+        }
+#endif
+        for (; k < n; ++k) {
+            float raw_v = std::max(1e-12f, data[k]);
+            float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
+            db = std::max(db, floor_val);
+            if (mode == 2) {
+                data[k] = std::max(0.0f, std::min(1.0f, (db - floor_val) * inv_top_db));
+            } else {
+                data[k] = db;
             }
         }
     }
@@ -674,7 +703,7 @@ class BallisticsFilter {
 public:
     inline void apply(float attack, float release, const std::vector<float>& current, std::vector<float>& prev_out) noexcept {
         size_t n = current.size();
-        if (prev_out.size() != n) {
+        if (prev_out.size() != n || (attack <= 0.0f && release <= 0.0f)) {
             prev_out = current;
             return;
         }
