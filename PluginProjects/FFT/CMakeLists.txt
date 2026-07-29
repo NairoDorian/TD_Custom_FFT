@@ -39,12 +39,7 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/RelWithDebInfo)
 endif()
 
-project (FFT LANGUAGES CXX CUDA)
-
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 89)
-
-find_package(CUDAToolkit REQUIRED)
+project (FFT LANGUAGES CXX)
 
 # PluginBuilder SDK paths
 set(PLUGIN_BUILDER_DIR "C:\\Users\\Z\\Downloads\\PROJECTS\\TD_PROJECTS\\PluginBuilder\\PluginBuilder_V2" CACHE PATH "Path to PluginBuilder directory" FORCE)
@@ -119,7 +114,7 @@ endif()
 
 # Collect all C++ source and header files
 file(GLOB_RECURSE PROJ_SOURCE_FILES 
-"${SOURCE_DIR}/*.cpp" "${SOURCE_DIR}/*.c" "${SOURCE_DIR}/*.cu" "${SOURCE_DIR}/*.h" "${SOURCE_DIR}/*.cuh")
+"${SOURCE_DIR}/*.cpp" "${SOURCE_DIR}/*.c" "${SOURCE_DIR}/*.h")
 
 # Declare shared library target for TouchDesigner
 add_library(FFT SHARED ${PROJ_SOURCE_FILES})
@@ -133,8 +128,6 @@ if(FFTW3F_LIBRARY)
     target_link_libraries(FFT PRIVATE ${FFTW3F_LIBRARY})
 endif()
 
-target_link_libraries(FFT PRIVATE CUDA::cufft CUDA::cudart)
-
 # MSVC Compiler & Linker Optimization Flags for Ultra Real-Time Performance
 if(DEFINED ENV{PLUGINBUILDER_BUILD})
   message(STATUS "PluginBuilder is building FFT")
@@ -145,8 +138,8 @@ else()
     # /Ot: Favor fast code over small code
     # /fp:fast: Enable fast floating-point math optimizations
     # /arch:AVX2: Generate 256-bit AVX2 & FMA vector instructions
-    target_compile_options(FFT PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/O2> $<$<COMPILE_LANGUAGE:CXX>:/Oi> $<$<COMPILE_LANGUAGE:CXX>:/Ot> $<$<COMPILE_LANGUAGE:CXX>:/fp:fast> $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
-    target_compile_options(FFT PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/Zi>)
+    target_compile_options(FFT PRIVATE /O2 /Oi /Ot /fp:fast /arch:AVX2)
+    target_compile_options(FFT PUBLIC "/Zi")
     target_link_options(FFT PUBLIC "/INCREMENTAL")
   endif()
 

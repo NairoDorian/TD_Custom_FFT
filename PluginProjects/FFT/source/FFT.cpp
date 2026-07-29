@@ -50,9 +50,6 @@
 
 #include "FFT.h"
 #include "MKLEngine.h"
-#include "CUDAFFTEngine.h"
-#include "VkFFTEngine.h"
-#include "CUFFTDxEngine.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -214,21 +211,12 @@ FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int 
 	}
 	myFFTSize = std::max<size_t>(pad_size, std::max<size_t>(needed, 2));
 
-	// Instantiate selected CPU or GPU FFT Engine strategy
+	// Instantiate selected CPU FFT Engine strategy
 	switch (engineChoice) {
-		case 1: // CPU (Intel oneMKL / IPP)
+		case 1: // Intel MKL / IPP
 			myFFTEngine = std::make_unique<FFTDSP::MKLEngine>();
 			break;
-		case 2: // GPU (NVIDIA cuFFT)
-			myFFTEngine = std::make_unique<FFTDSP::CUDAFFTEngine>();
-			break;
-		case 3: // GPU (VkFFT CUDA/Vulkan)
-			myFFTEngine = std::make_unique<FFTDSP::VkFFTEngine>();
-			break;
-		case 4: // GPU Fused (cuFFTDx)
-			myFFTEngine = std::make_unique<FFTDSP::CUFFTDxEngine>();
-			break;
-		case 0: // CPU (FFTW3 AVX2)
+		case 0: // FFTW3
 		default:
 			myFFTEngine = std::make_unique<FFTDSP::FFTWEngine>();
 			break;

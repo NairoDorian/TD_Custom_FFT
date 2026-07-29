@@ -9,7 +9,7 @@ Header File: IFFTEngine.h
 
 Architectural Design Pattern: Polymorphic Strategy Pattern
 Abstract base interface allowing TouchDesigner CHOP to dynamically switch
-between CPU (FFTW3) and GPU (cuFFT, VkFFT, cuFFTDx) backends at runtime.
+between FFTW3 and Intel MKL / IPP CPU engines at runtime.
 ===========================================================================
 */
 
@@ -20,11 +20,8 @@ between CPU (FFTW3) and GPU (cuFFT, VkFFT, cuFFTDx) backends at runtime.
 namespace FFTDSP {
 
 enum class FFTEngineType {
-    CPU_FFTW3 = 0,
-    CPU_INTEL_MKL = 1,
-    GPU_CUFFT = 2,
-    GPU_VKFFT = 3,
-    GPU_CUFFTDX = 4
+    FFTW3 = 0,
+    INTEL_MKL = 1
 };
 
 class IFFTEngine {
@@ -32,7 +29,7 @@ public:
     virtual ~IFFTEngine() = default;
 
     /**
-     * @brief Prepares hardware structures (FFTW plans, CUDA streams, VRAM allocations) for target FFT size.
+     * @brief Prepares hardware structures and memory buffers for target FFT size.
      */
     virtual void prepare(size_t fft_size) = 0;
 

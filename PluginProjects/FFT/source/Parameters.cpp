@@ -41,9 +41,9 @@ void setup(TD::OP_ParameterManager* manager)
 		sp.label = EngineLabel;
 		sp.defaultValue = "Fftw3";
 
-		const char *names[]  = { "Fftw3", "Mkl", "Cufft", "Vkfft", "Cufftdx" };
-		const char *labels[] = { "CPU (FFTW3 AVX2)", "CPU (Intel oneMKL / IPP)", "GPU (NVIDIA cuFFT)", "GPU (VkFFT CUDA/Vulkan)", "GPU Fused (cuFFTDx)" };
-		manager->appendMenu(sp, 5, names, labels);
+		const char *names[]  = { "Fftw3", "Mkl" };
+		const char *labels[] = { "FFTW3", "Intel MKL / IPP" };
+		manager->appendMenu(sp, 2, names, labels);
 	}
 	{
 		TD::OP_StringParameter sp;
