@@ -1,0 +1,39 @@
+{
+    "version": "0.2.1",
+    "defaults": {},
+    "configurations": [
+        {
+            "name": "Launch Plugin_FFT.toe",
+            "project": "CMakeLists.txt",
+            "projectTarget": "FFT.dll (bin\\Debug\\FFT.dll)",
+            "args": [
+                "${workspaceRoot}/../../Plugin_FFT.toe"
+            ],
+            "cwd": "${workspaceRoot}/../../",
+            "type": "exe",
+            "exe": "C:/Program Files/Derivative/TouchDesigner/bin/TouchDesigner.exe"
+        },
+        {
+            "name": "Launch Plugin_FFT.toe",
+            "project": "CMakeLists.txt",
+            "projectTarget": "FFT.dll (bin\\Release\\FFT.dll)",
+            "args": [
+                "${workspaceRoot}/../../Plugin_FFT.toe"
+            ],
+            "cwd": "${workspaceRoot}/../../",
+            "type": "exe",
+            "exe": "C:/Program Files/Derivative/TouchDesigner/bin/TouchDesigner.exe"
+        },
+        {
+            "name": "Launch Plugin_FFT.toe",
+            "project": "CMakeLists.txt",
+            "projectTarget": "FFT.dll (bin\\RelWithDebInfo\\FFT.dll)",
+            "args": [
+                "${workspaceRoot}/../../Plugin_FFT.toe"
+            ],
+            "cwd": "${workspaceRoot}/../../",
+            "type": "exe",
+            "exe": "C:/Program Files/Derivative/TouchDesigner/bin/TouchDesigner.exe"
+        }
+    ]
+}

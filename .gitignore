@@ -1,0 +1,22 @@
+# CMake / Build directories
+build/
+bin/
+lib/
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Visual Studio & IDE temporary files
+.vs/
+launch.vs.json.user
+
+# Backup files
+*.bckp
+.bckp/
+Backup/
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
