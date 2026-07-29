@@ -49,7 +49,6 @@
  */
 
 #include "FFT.h"
-#include "MKLEngine.h"
 
 #include <stdio.h>
 #include <string.h>

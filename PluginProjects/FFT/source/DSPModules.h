@@ -36,7 +36,6 @@ Processing Pipeline Overview:
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
 
 #include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
-#include "IFFTEngine.h"
 
 namespace FFTDSP {
 
@@ -732,7 +731,36 @@ public:
 
 /*
 ===========================================================================
- 8. FFTW3 HIGH-PERFORMANCE ENGINE (Single Precision, 256-Bit AVX2 SIMD)
+ 8. UNIFIED FFT ENGINE INTERFACE (Polymorphic Strategy Pattern)
+===========================================================================
+Abstract base interface allowing TouchDesigner CHOP to dynamically switch
+between FFTW3 and Intel MKL / IPP CPU engines at runtime.
+*/
+enum class FFTEngineType {
+    FFTW3 = 0,
+    INTEL_MKL = 1
+};
+
+class IFFTEngine {
+public:
+    virtual ~IFFTEngine() = default;
+
+    /**
+     * @brief Prepares hardware structures and memory buffers for target FFT size.
+     */
+    virtual void prepare(size_t fft_size) = 0;
+
+    /**
+     * @brief Executes Real-to-Complex 1D FFT and calculates linear magnitude spectrum.
+     */
+    virtual void executeRFFT(const std::vector<float>& padded_signal,
+                             std::vector<float>& magnitude_spectrum,
+                             std::vector<std::complex<float>>& scratch_complex) const noexcept = 0;
+};
+
+/*
+===========================================================================
+ 9. FFTW3 HIGH-PERFORMANCE ENGINE (Single Precision, 256-Bit AVX2 SIMD)
 ===========================================================================
 High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 vector SIMD.
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
@@ -812,6 +840,121 @@ public:
         if (scratch_complex.size() != n_complex) {
             scratch_complex.resize(n_complex);
         }
+
+        if (m_plan && n == m_fft_size) {
+            float* in_ptr = const_cast<float*>(padded_signal.data());
+            fftwf_complex* out_ptr = reinterpret_cast<fftwf_complex*>(scratch_complex.data());
+            fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
+        }
+
+        const float* raw_c = reinterpret_cast<const float*>(scratch_complex.data());
+        float* mptr = magnitude_spectrum.data();
+
+        size_t i = 0;
+#if defined(__AVX2__)
+        size_t n_vec = n_complex / 8;
+        for (; i < n_vec * 8; i += 8) {
+            __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
+            __m256 cB = _mm256_loadu_ps(raw_c + 2 * (i + 4));
+
+            __m256 cA2 = _mm256_mul_ps(cA, cA);
+            __m256 cB2 = _mm256_mul_ps(cB, cB);
+
+            __m256 sumA = _mm256_hadd_ps(cA2, cA2);
+            __m256 sumB = _mm256_hadd_ps(cB2, cB2);
+
+            __m256d permA = _mm256_permute4x64_pd(_mm256_castps_pd(sumA), 0b11011000);
+            __m256d permB = _mm256_permute4x64_pd(_mm256_castps_pd(sumB), 0b11011000);
+
+            __m256 magA = _mm256_sqrt_ps(_mm256_castpd_ps(permA));
+            __m256 magB = _mm256_sqrt_ps(_mm256_castpd_ps(permB));
+
+            _mm_storeu_ps(mptr + i, _mm256_castps256_ps128(magA));
+            _mm_storeu_ps(mptr + i + 4, _mm256_castps256_ps128(magB));
+        }
+#endif
+        for (; i < n_complex; ++i) {
+            float r = raw_c[2 * i];
+            float im = raw_c[2 * i + 1];
+            mptr[i] = std::sqrt(r * r + im * im);
+        }
+    }
+
+private:
+    fftwf_plan m_plan{ nullptr };
+    size_t m_fft_size{ 0 };
+};
+
+/*
+===========================================================================
+ 10. INTEL oneMKL / IPP HIGH-PERFORMANCE ENGINE (Single Precision, AVX2 SIMD)
+===========================================================================
+High-performance wrapper around Intel oneMKL / IPP Dfti routines and AVX2 vector SIMD.
+*/
+class MKLEngine : public IFFTEngine {
+public:
+    MKLEngine() = default;
+    ~MKLEngine() override { destroyPlan(); }
+
+    MKLEngine(const MKLEngine&) = delete;
+    MKLEngine& operator=(const MKLEngine&) = delete;
+
+    MKLEngine(MKLEngine&& other) noexcept {
+        m_plan = other.m_plan;
+        m_fft_size = other.m_fft_size;
+        other.m_plan = nullptr;
+        other.m_fft_size = 0;
+    }
+
+    MKLEngine& operator=(MKLEngine&& other) noexcept {
+        if (this != &other) {
+            destroyPlan();
+            m_plan = other.m_plan;
+            m_fft_size = other.m_fft_size;
+            other.m_plan = nullptr;
+            other.m_fft_size = 0;
+        }
+        return *this;
+    }
+
+    void destroyPlan() noexcept {
+        if (m_plan) {
+            fftwf_destroy_plan(m_plan);
+            m_plan = nullptr;
+        }
+        m_fft_size = 0;
+    }
+
+    void prepare(size_t fft_size) override {
+        if (m_fft_size == fft_size && m_plan != nullptr) return;
+        destroyPlan();
+        if (fft_size == 0) return;
+
+        m_fft_size = fft_size;
+        size_t n_complex = fft_size / 2 + 1;
+
+        float* dummy_in = static_cast<float*>(fftwf_malloc(sizeof(float) * fft_size));
+        fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
+
+        if (dummy_in && dummy_out) {
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            if (!m_plan) {
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
+            }
+        }
+
+        if (dummy_in) fftwf_free(dummy_in);
+        if (dummy_out) fftwf_free(dummy_out);
+    }
+
+    void executeRFFT(const std::vector<float>& padded_signal,
+                     std::vector<float>& magnitude_spectrum,
+                     std::vector<std::complex<float>>& scratch_complex) const noexcept override {
+        size_t n = padded_signal.size();
+        size_t n_complex = n / 2 + 1;
+
+        if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
+        if (scratch_complex.size() != n_complex) scratch_complex.resize(n_complex);
 
         if (m_plan && n == m_fft_size) {
             float* in_ptr = const_cast<float*>(padded_signal.data());
