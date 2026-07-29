@@ -15,6 +15,9 @@ launch.vs.json.user
 *.bckp
 .bckp/
 Backup/
+Plugin_FFT.[0-9]*.toe
+*.[0-9]*.toe
+
 
 # OS metadata
 Thumbs.db
