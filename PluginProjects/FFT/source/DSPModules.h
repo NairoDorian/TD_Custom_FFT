@@ -237,6 +237,7 @@ public:
     void designShelf(bool is_high, double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
         if (std::abs(gain_db) < 0.01) {
             sec.active = false;
+            sec.reset();
             return;
         }
         double w0 = 2.0 * PI_D * cutoff_hz / m_sample_rate;
@@ -261,27 +262,23 @@ public:
         sec.active = true;
     }
 
-    inline void processAudio(const std::vector<float>& original_audio,
-                             double gain_db, double cutoff_hz,
-                             double low_gain_db, double low_cutoff_hz,
-                             double q_factor, double amount,
-                             std::vector<float>& processed_output) noexcept {
-        if (original_audio.empty()) {
-            processed_output.clear();
-            return;
-        }
-
+    bool updateAndCheckActive(double gain_db, double cutoff_hz,
+                              double low_gain_db, double low_cutoff_hz,
+                              double q_factor, double amount) noexcept {
         std::tuple<double, double, double, double, double> key{ gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor };
         if (m_design_key != key) {
             designShelf(true, cutoff_hz, gain_db, q_factor, m_high_shelf);
             designShelf(false, low_cutoff_hz, low_gain_db, q_factor, m_low_shelf);
             m_design_key = key;
         }
+        return (m_high_shelf.active || m_low_shelf.active) && (amount > 0.0);
+    }
 
-        float amt = static_cast<float>(amount);
-        bool has_filter = (m_high_shelf.active || m_low_shelf.active) && (amt > 0.0f);
-
-        if (!has_filter) {
+    inline void processAudio(const std::vector<float>& original_audio,
+                             double amount,
+                             std::vector<float>& processed_output) noexcept {
+        if (original_audio.empty()) {
+            processed_output.clear();
             return;
         }
 
@@ -289,14 +286,16 @@ public:
             processed_output.resize(original_audio.size());
         }
 
+        float amt = static_cast<float>(amount);
         const float* src = original_audio.data();
         float* dst = processed_output.data();
         size_t n = original_audio.size();
 
         for (size_t i = 0; i < n; ++i) {
             float x = src[i];
-            float filtered = m_high_shelf.process(x);
-            filtered = m_low_shelf.process(filtered);
+            float filtered = x;
+            if (m_high_shelf.active) filtered = m_high_shelf.process(filtered);
+            if (m_low_shelf.active) filtered = m_low_shelf.process(filtered);
             dst[i] = x + amt * (filtered - x);
         }
     }

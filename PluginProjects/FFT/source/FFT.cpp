@@ -376,9 +376,9 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		st.fifo.get(st.captured_signal);
 
 		// 3. Process audio frame through EQ (Zero-copy bypass if EQ is inactive)
-		bool has_eq = st.eq.hasActiveFilter(amount);
+		bool has_eq = st.eq.updateAndCheckActive(gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor, amount);
 		if (has_eq) {
-			st.eq.processAudio(st.captured_signal, gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor, amount, st.processed_signal);
+			st.eq.processAudio(st.captured_signal, amount, st.processed_signal);
 		}
 		const float* proc_data = has_eq ? st.processed_signal.data() : st.captured_signal.data();
 
