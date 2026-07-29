@@ -19,7 +19,7 @@ Processing Pipeline Overview:
 3. Tapering & Padding: Window Generator (Kaiser/Hann/etc.) with Coherent Gain Compensation.
 4. Spectral Analysis: Single-Precision FFTW3 R2C Transform (FFTWEngine).
 5. SIMD Vectorization: 256-bit AVX2 Parallel Magnitude Spectrum calculation.
-6. Psychoacoustic Re-mapping: Perceptual Frequency Scales (Log, Mel, ERB, Bark, Chroma).
+6. Psychoacoustic Re-mapping: Perceptual Frequency Scales (Log, Mel, ERB, Bark, Chroma, Melog).
 7. Equal-Loudness Weighting: ISO 226 / IEC 61672 A-Weighting, C-Weighting, ITU-R 468.
 8. Dynamic Range Conversion: Optimized Decibel (dB) scaling with parallel peak search.
 9. Temporal Smoothing: Asymmetric Attack/Release Envelope Ballistics Filter.
@@ -44,9 +44,6 @@ namespace FFTDSP {
 // Fundamental mathematical constants evaluated at highest float/double precision
 constexpr float PI_F = 3.14159265358979323846f;
 constexpr double PI_D = 3.14159265358979323846;
-
-// Natural log conversion constant for ultra-fast dB calculations: 20 / ln(10)
-constexpr float DB_LOG_FACTOR = 8.685889638065036553f;
 
 /*
 ===========================================================================
@@ -650,9 +647,8 @@ public:
  6. DECIBEL (dB) CONVERSION & PARALLEL PEAK SEARCH (256-Bit AVX2 SIMD)
 ===========================================================================
 Converts linear magnitudes to logarithmic decibels with AVX2 SIMD peak search.
-Optimized formula:
-  20 * log10(x) = (20 / ln(10)) * log(x) = DB_LOG_FACTOR * log(x)
-Calculating log(inv_max) outside the bin loop saves N logarithmic multiplications.
+Calculating 20.0f * log10(inv_max) ONCE outside the bin loop saves N logarithmic
+multiplications while maintaining 100% precision.
 */
 class DecibelConverter {
 public:
@@ -683,21 +679,21 @@ public:
         if (max_val <= 0.0f) max_val = 1.0f;
 
         float inv_max = 1.0f / max_val;
-        float log_inv_max = std::log(inv_max); // Calculated ONCE outside loop
+        float db_offset = static_cast<float>(20.0 * std::log10(inv_max)); // Pre-computed ONCE outside loop
         float floor_val = static_cast<float>(-top_db);
         float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
 
         if (mode == 2) { // Normalized dB (0.0 to 1.0 output range)
             for (size_t k = 0; k < n; ++k) {
                 float raw_v = std::max(1e-12f, data[k]);
-                float db = DB_LOG_FACTOR * (std::log(raw_v) + log_inv_max);
+                float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
                 db = std::max(db, floor_val);
                 data[k] = std::max(0.0f, std::min(1.0f, (db - floor_val) * inv_top_db));
             }
         } else { // Raw dB output (-top_db to 0 dB)
             for (size_t k = 0; k < n; ++k) {
                 float raw_v = std::max(1e-12f, data[k]);
-                float db = DB_LOG_FACTOR * (std::log(raw_v) + log_inv_max);
+                float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
                 data[k] = std::max(db, floor_val);
             }
         }
@@ -762,7 +758,7 @@ High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 ve
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
 - FFTW_MEASURE Hardware Benchmarking: Benchmarks assembly kernels on target CPU during plan creation.
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
-- AVX2 Vectorized Magnitude Spectrum: Evaluates 4 complex magnitude values per instruction cycle.
+- 2x Unrolled AVX2 Vectorized Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
 */
 class FFTWEngine {
 public:
@@ -848,14 +844,26 @@ public:
 
         size_t i = 0;
 #if defined(__AVX2__)
-        size_t n_vec = n_complex / 4;
-        for (; i < n_vec * 4; i += 4) {
-            __m256 c = _mm256_loadu_ps(raw_c + 2 * i);
-            __m256 c2 = _mm256_mul_ps(c, c);
-            __m256 sum = _mm256_hadd_ps(c2, c2);
-            __m256d perm = _mm256_permute4x64_pd(_mm256_castps_pd(sum), 0b11011000);
-            __m256 mag = _mm256_sqrt_ps(_mm256_castpd_ps(perm));
-            _mm_storeu_ps(mptr + i, _mm256_castps256_ps128(mag));
+        // 2x Unrolled 256-bit AVX2 SIMD Magnitude Loop: evaluates 8 complex bins per iteration
+        size_t n_vec = n_complex / 8;
+        for (; i < n_vec * 8; i += 8) {
+            __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
+            __m256 cB = _mm256_loadu_ps(raw_c + 2 * (i + 4));
+
+            __m256 cA2 = _mm256_mul_ps(cA, cA);
+            __m256 cB2 = _mm256_mul_ps(cB, cB);
+
+            __m256 sumA = _mm256_hadd_ps(cA2, cA2);
+            __m256 sumB = _mm256_hadd_ps(cB2, cB2);
+
+            __m256d permA = _mm256_permute4x64_pd(_mm256_castps_pd(sumA), 0b11011000);
+            __m256d permB = _mm256_permute4x64_pd(_mm256_castps_pd(sumB), 0b11011000);
+
+            __m256 magA = _mm256_sqrt_ps(_mm256_castpd_ps(permA));
+            __m256 magB = _mm256_sqrt_ps(_mm256_castpd_ps(permB));
+
+            _mm_storeu_ps(mptr + i, _mm256_castps256_ps128(magA));
+            _mm_storeu_ps(mptr + i + 4, _mm256_castps256_ps128(magB));
         }
 #endif
         for (; i < n_complex; ++i) {

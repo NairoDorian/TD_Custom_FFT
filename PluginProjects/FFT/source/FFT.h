@@ -20,17 +20,14 @@
  *    and FFT scratchpads to prevent inter-channel cross-talk or race conditions.
  *
  * 2. Parameter Caching & Incremental Recalculation:
- *    TouchDesigner evaluates parameters every frame. Calling complex trigonometry routines
- *    (e.g., generating 32,768-point Kaiser window tables or re-building 16,384-bin psychoacoustic
- *    warping lookup tables) every frame would consume excessive CPU time.
- *    Cached variables (myCachedScale, myCachedDisplayMax, etc.) track parameter states and only
- *    trigger DSP updates when UI controls are actually modified.
+ *    TouchDesigner evaluates parameters every frame. Cached variables track parameter
+ *    states and only trigger DSP updates when UI controls are actually modified.
  *
- * 3. Zero-Allocation Per-Frame Cooking:
- *    The `execute()` method runs once per frame. Allocating dynamic vectors inside `execute()`
- *    triggers thread synchronization and OS memory manager overhead. All channel vectors
- *    are pre-sized during setup/rebuild, guaranteeing 0 bytes of dynamic memory allocation
- *    during real-time cooking.
+ * 3. Persistent Zero-Allocation & Zero-Padding Cooking:
+ *    `ChannelState::initBuffers()` pre-sizes work vectors and initializes `padded_frame`
+ *    with zeros ONCE during setup/rebuild. During real-time `execute()`, only the active windowed
+ *    audio slice is written into `padded_frame`, while the zero-padded regions on the left and right
+ *    remain zero persistently, eliminating millions of redundant zero-writes per second.
  * ===========================================================================
  */
 
@@ -62,7 +59,21 @@ struct ChannelState {
     std::vector<float> rfft_magnitude;                   // Linear RFFT magnitude spectrum output
     std::vector<float> warped_spectrum;                  // Re-mapped psychoacoustic frequency spectrum
     std::vector<std::complex<float>> scratch_complex;    // FFTW3 complex output buffer (size: N/2 + 1)
-    int prev_loudness_mode{ -1 };                         // Mode history tracker to reset dynamic ranges cleanly
+    int prev_loudness_mode{ -1 };                        // Mode history tracker to reset dynamic ranges cleanly
+
+    void initBuffers(size_t windowCapacity, size_t fftSize, size_t numBins) {
+        fifo.resize(windowCapacity);
+        if (captured_signal.size() != windowCapacity) captured_signal.resize(windowCapacity);
+        if (processed_signal.size() != windowCapacity) processed_signal.resize(windowCapacity);
+        
+        // Zero-fill padded_frame ONCE on initialization or DSP rebuild
+        padded_frame.assign(fftSize, 0.0f);
+
+        size_t numComplexBins = fftSize / 2 + 1;
+        if (rfft_magnitude.size() != numComplexBins) rfft_magnitude.resize(numComplexBins);
+        if (scratch_complex.size() != numComplexBins) scratch_complex.resize(numComplexBins);
+        if (warped_spectrum.size() != numBins) warped_spectrum.resize(numBins);
+    }
 };
 
 /**
