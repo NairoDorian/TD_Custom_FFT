@@ -1,13 +1,13 @@
 # TouchDesigner Custom FFT Plugin (`Plugin_FFT`)
 
-An ultra-high-performance, real-time Custom C++ CHOP (Channel Operator) plugin for **Derivative TouchDesigner**, featuring dual CPU FFT backends (**FFTW3** and **Intel MKL / IPP**), 256-bit AVX2 FMA SIMD vectorization, `FFTW_EXHAUSTIVE` plan benchmarking, and native TouchDesigner Python Textport console logging.
+An ultra-high-performance, real-time Custom C++ CHOP (Channel Operator) plugin for **Derivative TouchDesigner**, featuring dual CPU FFT backends (**FFTW3** and **Intel MKL / IPP**), 256-bit AVX2 FMA SIMD vectorization, `FFTW_PATIENT` plan benchmarking, and native TouchDesigner Python Textport console logging.
 
 ---
 
 ## ✨ Features
 
 - **Dual CPU FFT Engine Selection**: Switch dynamically between `FFTW3` and `Intel MKL / IPP` from TouchDesigner's parameter drop-down menu.
-- **`FFTW_EXHAUSTIVE` Plan Benchmarking**: Exhaustively benchmarks assembly codelets, SIMD vector factorizations, and memory strides on host CPU during setup for theoretical peak execution speed.
+- **`FFTW_PATIENT` Plan Benchmarking**: Benchmarks assembly codelets, SIMD vector factorizations, and memory strides on host CPU during setup (`FFTW_PATIENT` primary, with `FFTW_MEASURE` and `FFTW_ESTIMATE` fallbacks).
 - **256-Bit AVX2 FMA Vectorization**:
   - De-interleaved FMA complex magnitude spectrum calculation (`computeMagnitudeAVX2_FMA`).
   - 2x unrolled AVX2 parallel peak magnitude search (`_mm256_max_ps`).

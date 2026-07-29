@@ -13,9 +13,9 @@ All notable changes, architectural milestones, performance findings, and discove
 - **Solution**: Implemented a zero-dependency C++ bridge that dynamically resolves `python311.dll` / `python3.dll` at runtime, acquires the Python Global Interpreter Lock (GIL) via `PyGILState_Ensure()`, and executes Python's `sys.stdout.write(...)` via `PyRun_SimpleString()`.
 - **Result**: C++ DSP log messages and benchmark timing now output directly into TouchDesigner's Python Textport console in real time!
 
-#### 2. Ultimate `FFTW_EXHAUSTIVE` Plan Benchmarking
-- **Finding**: Running `FFTW_EXHAUSTIVE` benchmarks every possible AVX2 SIMD codelet, vector factorization, and memory stride on the host CPU.
-- **Empirical Evidence**: Benchmarking $N = 16,384$ took **32,415 ms (~32.4 seconds)** during plan creation. Once created, the plan is stored in memory and executes during the 60–120 FPS cook loop in sub-millisecond real time with theoretical maximum CPU performance.
+#### 2. Real-Time `FFTW_PATIENT` Plan Benchmarking
+- **Optimization**: Set `FFTW_PATIENT` as the primary planner flag, with `FFTW_MEASURE` and `FFTW_ESTIMATE` as fallbacks.
+- **Result**: Generates highly optimized CPU SIMD execution plans instantly without long setup delays, maintaining sub-millisecond real-time cook loops.
 
 ---
 
@@ -26,7 +26,7 @@ All notable changes, architectural milestones, performance findings, and discove
   `DSPModules.h`, `FFT.h`, `FFT.cpp`, `Parameters.h`, `Parameters.cpp`.
 
 - **Dual CPU FFT Backend**:
-  - **FFTW3**: Single-precision 1D R2C transform with `FFTW_EXHAUSTIVE` planning.
+  - **FFTW3**: Single-precision 1D R2C transform with `FFTW_PATIENT` primary planning.
   - **Intel MKL / IPP**: High-performance Intel oneMKL / IPP execution.
 
 - **AVX2 256-Bit FMA SIMD Magnitude Kernel**:

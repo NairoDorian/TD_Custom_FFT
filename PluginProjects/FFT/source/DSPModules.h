@@ -946,41 +946,31 @@ public:
             logPlanEvent("[FFT Plugin] [FFTW3] Benchmarking & generating FFT plan for size N = " + std::to_string(fft_size) + "...");
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             if (m_plan) {
-                m_planStatus = "FFTW3 (FFTW_EXHAUSTIVE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms (Ultimate CPU Optimization)");
+                m_planStatus = "FFTW3 (FFTW_PATIENT - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_PATIENT plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
             } else {
-                logPlanEvent("[FFT Plugin] [FFTW3] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...");
+                logPlanEvent("[FFT Plugin] [FFTW3] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...");
                 t0 = std::chrono::high_resolution_clock::now();
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                 t1 = std::chrono::high_resolution_clock::now();
                 ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (m_plan) {
-                    m_planStatus = "FFTW3 (FFTW_PATIENT - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                    logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_PATIENT plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                    m_planStatus = "FFTW3 (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                    logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                 } else {
-                    logPlanEvent("[FFT Plugin] [FFTW3] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...");
+                    logPlanEvent("[FFT Plugin] [FFTW3] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
                     t0 = std::chrono::high_resolution_clock::now();
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
                     t1 = std::chrono::high_resolution_clock::now();
                     ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     if (m_plan) {
-                        m_planStatus = "FFTW3 (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                        logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
-                    } else {
-                        logPlanEvent("[FFT Plugin] [FFTW3] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
-                        t0 = std::chrono::high_resolution_clock::now();
-                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
-                        t1 = std::chrono::high_resolution_clock::now();
-                        ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                        if (m_plan) {
-                            m_planStatus = "FFTW3 (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                            logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
-                        }
+                        m_planStatus = "FFTW3 (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                        logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                     }
                 }
             }
@@ -1080,41 +1070,31 @@ public:
             logPlanEvent("[FFT Plugin] [Intel MKL / IPP] Benchmarking & generating FFT plan for size N = " + std::to_string(fft_size) + "...");
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             if (m_plan) {
-                m_planStatus = "Intel MKL / IPP (FFTW_EXHAUSTIVE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms (Ultimate CPU Optimization)");
+                m_planStatus = "Intel MKL / IPP (FFTW_PATIENT - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_PATIENT plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
             } else {
-                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...");
+                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...");
                 t0 = std::chrono::high_resolution_clock::now();
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                 t1 = std::chrono::high_resolution_clock::now();
                 ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (m_plan) {
-                    m_planStatus = "Intel MKL / IPP (FFTW_PATIENT - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_PATIENT plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                    m_planStatus = "Intel MKL / IPP (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                 } else {
-                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...");
+                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
                     t0 = std::chrono::high_resolution_clock::now();
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
                     t1 = std::chrono::high_resolution_clock::now();
                     ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     if (m_plan) {
-                        m_planStatus = "Intel MKL / IPP (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                        logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
-                    } else {
-                        logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
-                        t0 = std::chrono::high_resolution_clock::now();
-                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
-                        t1 = std::chrono::high_resolution_clock::now();
-                        ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                        if (m_plan) {
-                            m_planStatus = "Intel MKL / IPP (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                            logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
-                        }
+                        m_planStatus = "Intel MKL / IPP (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                        logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                     }
                 }
             }
