@@ -160,9 +160,10 @@ FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserve
 	}
 	else
 	{
+		info->startIndex = 0;
 		info->numChannels = 1;
 		info->numSamples = bins;
-		info->sampleRate = 44100;
+		info->sampleRate = bins;
 	}
 	return true;
 }
