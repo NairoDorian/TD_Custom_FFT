@@ -731,7 +731,7 @@ public:
 
 /*
 ===========================================================================
- 8. UNIFIED FFT ENGINE INTERFACE (Polymorphic Strategy Pattern)
+ 8. UNIFIED FFT ENGINE INTERFACE & FMA SIMD MAGNITUDE COMPUTATION
 ===========================================================================
 Abstract base interface allowing TouchDesigner CHOP to dynamically switch
 between FFTW3 and Intel MKL / IPP CPU engines at runtime.
@@ -758,15 +758,44 @@ public:
                              std::vector<std::complex<float>>& scratch_complex) const noexcept = 0;
 };
 
+/**
+ * @brief Ultra-Fast 256-Bit AVX2 FMA Vectorized Magnitude Spectrum Calculation.
+ * Evaluates 8 complex magnitude bins simultaneously without horizontal addition latency.
+ */
+inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_complex) noexcept {
+    size_t i = 0;
+#if defined(__AVX2__)
+    size_t n_vec = n_complex / 8;
+    for (; i < n_vec * 8; i += 8) {
+        __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);     // [R0, I0, R1, I1, R2, I2, R3, I3]
+        __m256 cB = _mm256_loadu_ps(raw_c + 2 * i + 8); // [R4, I4, R5, I5, R6, I6, R7, I7]
+
+        __m256 re = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(2, 0, 2, 0)); // [R0, R1, R4, R5, R2, R3, R6, R7]
+        __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1)); // [I0, I1, I4, I5, I2, I3, I6, I7]
+
+        __m256 sum_sq = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
+        __m256 mag = _mm256_sqrt_ps(sum_sq);
+
+        __m256 mag_ordered = _mm256_permute4x64_ps(mag, _MM_SHUFFLE(3, 1, 2, 0));
+        _mm256_storeu_ps(mptr + i, mag_ordered);
+    }
+#endif
+    for (; i < n_complex; ++i) {
+        float r = raw_c[2 * i];
+        float im_val = raw_c[2 * i + 1];
+        mptr[i] = std::sqrt(r * r + im_val * im_val);
+    }
+}
+
 /*
 ===========================================================================
  9. FFTW3 HIGH-PERFORMANCE ENGINE (Single Precision, 256-Bit AVX2 SIMD)
 ===========================================================================
 High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 vector SIMD.
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
-- FFTW_MEASURE Hardware Benchmarking: Benchmarks assembly kernels on target CPU during plan creation.
+- FFTW_PATIENT Hardware Benchmarking: Deep benchmarks assembly kernels on target CPU during plan creation.
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
-- 2x Unrolled AVX2 Vectorized Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
+- FMA SIMD Parallel Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
 */
 class FFTWEngine : public IFFTEngine {
 public:
@@ -818,7 +847,10 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+            if (!m_plan) {
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            }
             if (!m_plan) {
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
             }
@@ -847,37 +879,7 @@ public:
             fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
         }
 
-        const float* raw_c = reinterpret_cast<const float*>(scratch_complex.data());
-        float* mptr = magnitude_spectrum.data();
-
-        size_t i = 0;
-#if defined(__AVX2__)
-        size_t n_vec = n_complex / 8;
-        for (; i < n_vec * 8; i += 8) {
-            __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
-            __m256 cB = _mm256_loadu_ps(raw_c + 2 * (i + 4));
-
-            __m256 cA2 = _mm256_mul_ps(cA, cA);
-            __m256 cB2 = _mm256_mul_ps(cB, cB);
-
-            __m256 sumA = _mm256_hadd_ps(cA2, cA2);
-            __m256 sumB = _mm256_hadd_ps(cB2, cB2);
-
-            __m256d permA = _mm256_permute4x64_pd(_mm256_castps_pd(sumA), 0b11011000);
-            __m256d permB = _mm256_permute4x64_pd(_mm256_castps_pd(sumB), 0b11011000);
-
-            __m256 magA = _mm256_sqrt_ps(_mm256_castpd_ps(permA));
-            __m256 magB = _mm256_sqrt_ps(_mm256_castpd_ps(permB));
-
-            _mm_storeu_ps(mptr + i, _mm256_castps256_ps128(magA));
-            _mm_storeu_ps(mptr + i + 4, _mm256_castps256_ps128(magB));
-        }
-#endif
-        for (; i < n_complex; ++i) {
-            float r = raw_c[2 * i];
-            float im = raw_c[2 * i + 1];
-            mptr[i] = std::sqrt(r * r + im * im);
-        }
+        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), n_complex);
     }
 
 private:
@@ -937,7 +939,10 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+            if (!m_plan) {
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            }
             if (!m_plan) {
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
             }
@@ -962,37 +967,7 @@ public:
             fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
         }
 
-        const float* raw_c = reinterpret_cast<const float*>(scratch_complex.data());
-        float* mptr = magnitude_spectrum.data();
-
-        size_t i = 0;
-#if defined(__AVX2__)
-        size_t n_vec = n_complex / 8;
-        for (; i < n_vec * 8; i += 8) {
-            __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
-            __m256 cB = _mm256_loadu_ps(raw_c + 2 * (i + 4));
-
-            __m256 cA2 = _mm256_mul_ps(cA, cA);
-            __m256 cB2 = _mm256_mul_ps(cB, cB);
-
-            __m256 sumA = _mm256_hadd_ps(cA2, cA2);
-            __m256 sumB = _mm256_hadd_ps(cB2, cB2);
-
-            __m256d permA = _mm256_permute4x64_pd(_mm256_castps_pd(sumA), 0b11011000);
-            __m256d permB = _mm256_permute4x64_pd(_mm256_castps_pd(sumB), 0b11011000);
-
-            __m256 magA = _mm256_sqrt_ps(_mm256_castpd_ps(permA));
-            __m256 magB = _mm256_sqrt_ps(_mm256_castpd_ps(permB));
-
-            _mm_storeu_ps(mptr + i, _mm256_castps256_ps128(magA));
-            _mm_storeu_ps(mptr + i + 4, _mm256_castps256_ps128(magB));
-        }
-#endif
-        for (; i < n_complex; ++i) {
-            float r = raw_c[2 * i];
-            float im = raw_c[2 * i + 1];
-            mptr[i] = std::sqrt(r * r + im * im);
-        }
+        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), n_complex);
     }
 
 private:
