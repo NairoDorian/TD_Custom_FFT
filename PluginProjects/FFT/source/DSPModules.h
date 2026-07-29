@@ -40,15 +40,33 @@ Processing Pipeline Overview:
 
 #include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace FFTDSP {
 
 inline void logPlanEvent(const std::string& msg) {
-    printf("%s\n", msg.c_str());
-    fflush(stdout);
     std::ofstream logFile("fft_plan_log.txt", std::ios::app);
     if (logFile.is_open()) {
         logFile << msg << std::endl;
     }
+
+#ifdef _WIN32
+    HMODULE hPy = GetModuleHandleA("python311.dll");
+    if (!hPy) hPy = GetModuleHandleA("python312.dll");
+    if (!hPy) hPy = GetModuleHandleA("python310.dll");
+    if (!hPy) hPy = GetModuleHandleA("python39.dll");
+    if (!hPy) hPy = GetModuleHandleA("python3.dll");
+    if (hPy) {
+        typedef int (*PyRun_SimpleString_t)(const char*);
+        auto pyRun = reinterpret_cast<PyRun_SimpleString_t>(GetProcAddress(hPy, "PyRun_SimpleString"));
+        if (pyRun) {
+            std::string pyScript = "print(\"" + msg + "\")";
+            pyRun(pyScript.c_str());
+        }
+    }
+#endif
 }
 
 // Fundamental mathematical constants evaluated at highest float/double precision
