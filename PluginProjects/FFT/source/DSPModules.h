@@ -54,16 +54,30 @@ inline void logPlanEvent(const std::string& msg) {
 
 #ifdef _WIN32
     HMODULE hPy = GetModuleHandleA("python311.dll");
+    if (!hPy) hPy = GetModuleHandleA("python3.dll");
     if (!hPy) hPy = GetModuleHandleA("python312.dll");
     if (!hPy) hPy = GetModuleHandleA("python310.dll");
     if (!hPy) hPy = GetModuleHandleA("python39.dll");
-    if (!hPy) hPy = GetModuleHandleA("python3.dll");
+
     if (hPy) {
+        typedef enum { PyGILState_LOCKED, PyGILState_UNLOCKED } PyGILState_STATE;
+        typedef PyGILState_STATE (*PyGILState_Ensure_t)(void);
+        typedef void (*PyGILState_Release_t)(PyGILState_STATE);
         typedef int (*PyRun_SimpleString_t)(const char*);
+
+        auto pyEnsure = reinterpret_cast<PyGILState_Ensure_t>(GetProcAddress(hPy, "PyGILState_Ensure"));
+        auto pyRelease = reinterpret_cast<PyGILState_Release_t>(GetProcAddress(hPy, "PyGILState_Release"));
         auto pyRun = reinterpret_cast<PyRun_SimpleString_t>(GetProcAddress(hPy, "PyRun_SimpleString"));
-        if (pyRun) {
-            std::string pyScript = "print(\"" + msg + "\")";
+
+        if (pyEnsure && pyRelease && pyRun) {
+            PyGILState_STATE gstate = pyEnsure();
+            std::string cleanMsg = msg;
+            for (char& c : cleanMsg) {
+                if (c == '"' || c == '\\') c = '\'';
+            }
+            std::string pyScript = "import sys; print(\"" + cleanMsg + "\"); sys.stdout.flush()";
             pyRun(pyScript.c_str());
+            pyRelease(gstate);
         }
     }
 #endif
