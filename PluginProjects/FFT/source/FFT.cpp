@@ -82,7 +82,7 @@ FillCHOPPluginInfo(CHOP_PluginInfo *info)
 	info->customOPInfo.opIcon->setString("FFT");         // 3-letter node icon in TouchDesigner networks
 	info->customOPInfo.authorName->setString("Author");
 	info->customOPInfo.authorEmail->setString("email@domain.com");
-	info->customOPInfo.minInputs = 0; // Standalone or input-driven
+	info->customOPInfo.minInputs = 1; // Standalone or input-driven
 	info->customOPInfo.maxInputs = 1;
 }
 
@@ -146,7 +146,9 @@ FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* rese
 bool
 FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserved1)
 {
+	info->startIndex = 0;
 	int bins = inputs->getParInt("Bins");
+
 	if (bins <= 0) bins = 16384;
 
 	if (inputs->getNumInputs() > 0)
@@ -299,14 +301,13 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	if (bins <= 0) bins = 16384;
 	if (display_max <= 0.0) display_max = 24000.0;
 
+	// Cache input CHOP pointer once (avoids redundant API calls per frame)
+	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
+
 	// Ingest sample rate from input CHOP
 	double sr = 44100.0;
-	if (inputs->getNumInputs() > 0)
-	{
-		const OP_CHOPInput* cinput = inputs->getInputCHOP(0);
-		if (cinput->sampleRate > 0) {
-			sr = cinput->sampleRate;
-		}
+	if (cinput && cinput->sampleRate > 0) {
+		sr = cinput->sampleRate;
 	}
 
 	// Check if DSP engine rebuild is required
@@ -348,8 +349,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		ChannelState& st = myChannels[ch];
 
 		// 1. Ingest new audio samples from TouchDesigner input CHOP into FIFO ring buffer
-		if (inputs->getNumInputs() > 0) {
-			const OP_CHOPInput* cinput = inputs->getInputCHOP(0);
+		if (cinput) {
 			int num_in_samples = cinput->numSamples;
 			if (num_in_samples > 0) {
 				const float* cdata = cinput->getChannelData(std::min(ch, cinput->numChannels - 1));
@@ -366,11 +366,6 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 			st.eq.processAudio(st.captured_signal, gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor, amount, st.processed_signal);
 		}
 		const float* proc_data = has_eq ? st.processed_signal.data() : st.captured_signal.data();
-
-		// 4. Persistent zero-padded audio frame (Zero-filled ONCE on size change only)
-		if (st.padded_frame.size() != myFFTSize) {
-			st.padded_frame.assign(myFFTSize, 0.0f);
-		}
 
 		const float* win_data = myWindowBuffer.data();
 		float* pad_data = st.padded_frame.data() + pad_start;
@@ -488,44 +483,39 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
-	if (index == 0)
-	{
+	switch (index) {
+	case 0:
 		chan->name->setString("execute_count");
 		chan->value = static_cast<float>(myExecuteCount);
-	}
-	else if (index == 1)
-	{
+		break;
+	case 1:
 		chan->name->setString("fft_size");
 		chan->value = static_cast<float>(myFFTSize);
-	}
-	else if (index == 2)
-	{
+		break;
+	case 2:
 		chan->name->setString("window_samples");
 		chan->value = static_cast<float>(myBufferCapacity);
-	}
-	else if (index == 3)
-	{
+		break;
+	case 3:
 		chan->name->setString("sample_rate");
 		chan->value = static_cast<float>(mySampleRate);
-	}
-	else if (index == 4)
-	{
+		break;
+	case 4:
 		chan->name->setString("peak_freq_hz");
 		chan->value = myPeakFrequencyHz;
-	}
-	else if (index == 5)
-	{
+		break;
+	case 5:
 		chan->name->setString("peak_magnitude");
 		chan->value = myPeakMagnitude;
-	}
-	else if (index == 6)
-	{
+		break;
+	case 6:
 		chan->name->setString("simd_avx2_active");
 #if defined(__AVX2__)
 		chan->value = 1.0f;
 #else
 		chan->value = 0.0f;
 #endif
+		break;
 	}
 }
 
@@ -549,55 +539,49 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 {
 	char tempBuffer[256];
 
-	if (index == 0)
-	{
+	switch (index) {
+	case 0:
 		entries->values[0]->setString("execute_count");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%d", myExecuteCount);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 1)
-	{
+		break;
+	case 1:
 		entries->values[0]->setString("fft_size");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myFFTSize);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 2)
-	{
+		break;
+	case 2:
 		entries->values[0]->setString("window_samples");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myBufferCapacity);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 3)
-	{
+		break;
+	case 3:
 		entries->values[0]->setString("sample_rate");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 4)
-	{
+		break;
+	case 4:
 		entries->values[0]->setString("nyquist_frequency");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate / 2.0);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 5)
-	{
+		break;
+	case 5:
 		entries->values[0]->setString("spectral_peak_freq");
 		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", myPeakFrequencyHz);
 		entries->values[1]->setString(tempBuffer);
-	}
-	else if (index == 6)
-	{
+		break;
+	case 6:
 		entries->values[0]->setString("simd_acceleration");
 #if defined(__AVX2__)
 		entries->values[1]->setString("AVX2 256-bit SIMD");
 #else
 		entries->values[1]->setString("Scalar Fallback");
 #endif
-	}
-	else if (index == 7)
-	{
+		break;
+	case 7:
 		entries->values[0]->setString("fft_engine");
 		entries->values[1]->setString("FFTW 3.3.5 Single Precision (FFTW_MEASURE)");
+		break;
 	}
 }
 

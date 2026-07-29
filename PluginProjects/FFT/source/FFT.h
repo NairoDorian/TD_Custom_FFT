@@ -166,7 +166,6 @@ private:
 	int    myCachedKaiserBeta{ -1 };
 	int    myCachedWeighting{ -1 };
 	int    myCachedPadChoice{ -1 };
-	size_t myCachedFrameLen{ 0 };
 
 	/**
 	 * @brief Rebuilds DSP buffer capacities and hardware-benchmarks FFTW plans when FFT size changes.

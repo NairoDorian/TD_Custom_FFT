@@ -30,9 +30,7 @@ Processing Pipeline Overview:
 #include <cmath>
 #include <complex>
 #include <algorithm>
-#include <string>
 #include <tuple>
-#include <iostream>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
@@ -176,7 +174,12 @@ public:
         }
     }
 
-    void designHighShelf(double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
+    /*
+     * Unified shelf filter design (RBJ Audio EQ Cookbook).
+     * is_high=true for high-shelf, is_high=false for low-shelf.
+     * Uses sign factor s (+1 high, -1 low) to select coefficient variants.
+     */
+    void designShelf(bool is_high, double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
         if (std::abs(gain_db) < 0.01) {
             sec.active = false;
             return;
@@ -186,39 +189,14 @@ public:
         double alpha = std::sin(w0) / (2.0 * std::max(0.01, q_factor));
         double cos_w0 = std::cos(w0);
         double sqrt_A = std::sqrt(A);
+        double s = is_high ? 1.0 : -1.0;
 
-        double b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha);
-        double b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0);
-        double b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha);
-        double a0 = (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha;
-        double a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0);
-        double a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha;
-
-        sec.b0 = static_cast<float>(b0 / a0);
-        sec.b1 = static_cast<float>(b1 / a0);
-        sec.b2 = static_cast<float>(b2 / a0);
-        sec.a1 = static_cast<float>(a1 / a0);
-        sec.a2 = static_cast<float>(a2 / a0);
-        sec.active = true;
-    }
-
-    void designLowShelf(double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
-        if (std::abs(gain_db) < 0.01) {
-            sec.active = false;
-            return;
-        }
-        double w0 = 2.0 * PI_D * cutoff_hz / m_sample_rate;
-        double A = std::pow(10.0, gain_db / 40.0);
-        double alpha = std::sin(w0) / (2.0 * std::max(0.01, q_factor));
-        double cos_w0 = std::cos(w0);
-        double sqrt_A = std::sqrt(A);
-
-        double b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha);
-        double b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0);
-        double b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha);
-        double a0 = (A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha;
-        double a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0);
-        double a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha;
+        double b0 =  A * ((A + 1.0) + s * (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha);
+        double b1 = -s * 2.0 * A * ((A - 1.0) + s * (A + 1.0) * cos_w0);
+        double b2 =  A * ((A + 1.0) + s * (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha);
+        double a0 = (A + 1.0) - s * (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha;
+        double a1 =  s * 2.0 * ((A - 1.0) - s * (A + 1.0) * cos_w0);
+        double a2 = (A + 1.0) - s * (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha;
 
         sec.b0 = static_cast<float>(b0 / a0);
         sec.b1 = static_cast<float>(b1 / a0);
@@ -240,8 +218,8 @@ public:
 
         std::tuple<double, double, double, double, double> key{ gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor };
         if (m_design_key != key) {
-            designHighShelf(cutoff_hz, gain_db, q_factor, m_high_shelf);
-            designLowShelf(low_cutoff_hz, low_gain_db, q_factor, m_low_shelf);
+            designShelf(true, cutoff_hz, gain_db, q_factor, m_high_shelf);
+            designShelf(false, low_cutoff_hz, low_gain_db, q_factor, m_low_shelf);
             m_design_key = key;
         }
 
@@ -309,6 +287,10 @@ public:
         double denom = (length > 1) ? static_cast<double>(length - 1) : 1.0;
         double sum = 0.0;
 
+        // Pre-compute Kaiser denominator once (saves N besselI0 calls in the per-sample loop)
+        double kaiser_beta_d = static_cast<double>(kaiser_beta);
+        double kaiser_inv_I0 = 1.0 / besselI0(kaiser_beta_d);
+
         for (size_t n = 0; n < length; ++n) {
             double w = 1.0;
             double fn = static_cast<double>(n);
@@ -333,10 +315,9 @@ public:
                     break;
                 case 0: // Kaiser Window (Beta parameter control)
                 default: {
-                    double beta = static_cast<double>(kaiser_beta);
                     double term = 2.0 * fn / denom - 1.0;
                     double arg = std::sqrt(std::max(0.0, 1.0 - term * term));
-                    w = besselI0(beta * arg) / besselI0(beta);
+                    w = besselI0(kaiser_beta_d * arg) * kaiser_inv_I0;
                     break;
                 }
             }
@@ -401,13 +382,9 @@ public:
 
     static void computeTargetHzGrid(int scale_code, double fmax, size_t n_out, double nyquist, double warp_blend, double log_floor_hz, std::vector<double>& target_hz) {
         target_hz.resize(n_out);
+        if (n_out == 0) return;
+        double inv_denom = (n_out > 1) ? 1.0 / static_cast<double>(n_out - 1) : 0.0;
         std::vector<double> perceptual(n_out);
-        std::vector<double> linear(n_out);
-
-        for (size_t i = 0; i < n_out; ++i) {
-            double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
-            linear[i] = frac * fmax;
-        }
 
         switch (scale_code) {
             case 1: { // Logarithmic Scale
@@ -416,7 +393,7 @@ public:
                 double log_min = std::log(fmin);
                 double log_max = std::log(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     perceptual[i] = std::exp(log_min + frac * (log_max - log_min));
                 }
                 break;
@@ -425,7 +402,7 @@ public:
                 double m_min = htkHzToMel(0.0);
                 double m_max = htkHzToMel(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     perceptual[i] = htkMelToHz(m_min + frac * (m_max - m_min));
                 }
                 break;
@@ -434,7 +411,7 @@ public:
                 double e_min = erbRateGlasberg(0.0);
                 double e_max = erbRateGlasberg(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     perceptual[i] = erbRateToHz(e_min + frac * (e_max - e_min));
                 }
                 break;
@@ -443,7 +420,7 @@ public:
                 double b_min = hzToBark(0.0);
                 double b_max = hzToBark(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     perceptual[i] = barkToHz(b_min + frac * (b_max - b_min));
                 }
                 break;
@@ -452,7 +429,7 @@ public:
                 double c_min = hzToChroma(20.0);
                 double c_max = hzToChroma(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     perceptual[i] = chromaToHz(c_min + frac * (c_max - c_min));
                 }
                 break;
@@ -465,7 +442,7 @@ public:
                 double log_min = std::log(fmin);
                 double log_max = std::log(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
-                    double frac = (n_out > 1) ? static_cast<double>(i) / (n_out - 1) : 0.0;
+                    double frac = i * inv_denom;
                     double mel_hz = htkMelToHz(m_min + frac * (m_max - m_min));
                     double log_hz = std::exp(log_min + frac * (log_max - log_min));
                     perceptual[i] = 0.5 * (mel_hz + log_hz);
@@ -475,14 +452,15 @@ public:
             case 0: // Linear Scale
             default: {
                 for (size_t i = 0; i < n_out; ++i) {
-                    perceptual[i] = linear[i];
+                    perceptual[i] = i * inv_denom * fmax;
                 }
                 break;
             }
         }
 
         for (size_t i = 0; i < n_out; ++i) {
-            double axis_val = (1.0 - warp_blend) * linear[i] + warp_blend * perceptual[i];
+            double lin = i * inv_denom * fmax;
+            double axis_val = (1.0 - warp_blend) * lin + warp_blend * perceptual[i];
             target_hz[i] = std::max(0.0, std::min(fmax, axis_val));
         }
     }
@@ -583,6 +561,18 @@ public:
             return;
         }
 
+        // Pre-compute 1kHz reference normalization (constant across all bins)
+        double inv_ref = 1.0;
+        if (weighting_code == 1) {
+            const double f1k = 1e6;
+            double ra_1k = ((12194.0 * 12194.0) * (f1k * f1k)) / ((f1k + 20.6 * 20.6) * std::sqrt((f1k + 107.7 * 107.7) * (f1k + 737.9 * 737.9)) * (f1k + 12194.0 * 12194.0));
+            inv_ref = 1.0 / ra_1k;
+        } else if (weighting_code == 2) {
+            const double f1k = 1e6;
+            double rc_1k = ((12194.0 * 12194.0) * f1k) / ((f1k + 20.6 * 20.6) * (f1k + 12194.0 * 12194.0));
+            inv_ref = 1.0 / rc_1k;
+        }
+
         for (size_t i = 0; i < freqs_hz.size(); ++i) {
             double f = std::max(1e-5, freqs_hz[i]);
             double w = 1.0;
@@ -591,20 +581,12 @@ public:
                 double f2 = f * f;
                 double num = (12194.0 * 12194.0) * (f2 * f2);
                 double den = (f2 + 20.6 * 20.6) * std::sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) * (f2 + 12194.0 * 12194.0);
-                double ra = num / std::max(1e-12, den);
-
-                double f1k = 1000.0 * 1000.0;
-                double ra_1k = ((12194.0 * 12194.0) * (f1k * f1k)) / ((f1k + 20.6 * 20.6) * std::sqrt((f1k + 107.7 * 107.7) * (f1k + 737.9 * 737.9)) * (f1k + 12194.0 * 12194.0));
-                w = ra / ra_1k;
+                w = (num / std::max(1e-12, den)) * inv_ref;
             } else if (weighting_code == 2) { // C-weighting
                 double f2 = f * f;
                 double num = (12194.0 * 12194.0) * f2;
                 double den = (f2 + 20.6 * 20.6) * (f2 + 12194.0 * 12194.0);
-                double rc = num / std::max(1e-12, den);
-
-                double f1k = 1000.0 * 1000.0;
-                double rc_1k = ((12194.0 * 12194.0) * f1k) / ((f1k + 20.6 * 20.6) * (f1k + 12194.0 * 12194.0));
-                w = rc / rc_1k;
+                w = (num / std::max(1e-12, den)) * inv_ref;
             } else if (weighting_code == 3) { // ITU-R 468 Weighting
                 double f2 = f * f;
                 double f3 = f2 * f;
@@ -648,7 +630,7 @@ public:
             v_max = _mm256_max_ps(v_max, v);
         }
         alignas(32) float max_arr[8];
-        _mm256_storeu_ps(max_arr, v_max);
+        _mm256_store_ps(max_arr, v_max);
         for (int k = 0; k < 8; ++k) {
             max_val = std::max(max_val, max_arr[k]);
         }
