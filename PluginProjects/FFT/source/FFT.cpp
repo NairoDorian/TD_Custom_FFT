@@ -29,19 +29,21 @@
  *    - Step A: Fetches current UI parameter states from TouchDesigner's OP_Inputs manager.
  *    - Step B: Checks parameter caches. If window size or FFT pad choice changed,
  *              triggers rebuildDSP(), which pre-computes hardware-tuned FFTW plans
- *              via FFTW_MEASURE.
+ *              via FFTW_MEASURE and zero-fills padded_frame once.
  *    - Step C: If psychoacoustic scale or window type changed, triggers updateWarpingAndWindow(),
- *              which builds unrolled frequency index lookup tables.
+ *              which builds unrolled frequency index lookup tables with identity bypass.
  *    - Step D: Loops through each audio channel:
  *              1. Ingests incoming CHOP audio slice into circular FIFOBuffer via fast memcpy.
  *              2. Extracts contiguous sample history frame from FIFO.
- *              3. Applies Direct Form II Transposed High/Low Shelving EQ (bypassed with zero-copy if inactive).
- *              4. Centers audio in zero-padded frame and applies 2x unrolled AVX2 SIMD windowing (_mm256_mul_ps).
+ *              3. Applies Direct Form II Transposed High/Low Shelving EQ (zero-copy bypass if inactive).
+ *              4. Multiplies tapering window directly into active slice [pad_start, pad_start + win_len)
+ *                 of persistent zero-padded frame using 2x unrolled AVX2 SIMD (_mm256_mul_ps). Zero-padded boundaries
+ *                 remain zero persistently, eliminating millions of zero-writes per second.
  *              5. Executes R2C FFTW transform and evaluates magnitude spectrum via 2x unrolled 256-bit AVX2 SIMD.
  *              6. Re-maps linear magnitudes to psychoacoustic scale (with 1-to-1 identity bypass for linear grids).
- *              7. Applies Equal-Loudness Weighting Curve (AVX2 SIMD _mm256_mul_ps).
+ *              7. Applies Equal-Loudness Weighting Curve (2x unrolled AVX2 SIMD).
  *              8. Converts magnitudes to Decibels (dB) with parallel peak search and pre-computed db_offset.
- *              9. Applies Asymmetric Attack/Release Ballistics dynamic smoothing (zero-copy when 0.0).
+ *              9. Applies Asymmetric Attack/Release Ballistics dynamic smoothing (2x unrolled AVX2 FMA, zero-copy when disabled).
  *              10. Copies output channels directly to TouchDesigner's CHOP_Output memory array via memcpy.
  * ===========================================================================
  */
@@ -190,6 +192,7 @@ FFT::getChannelName(int32_t index, OP_String *name, const OP_Inputs* inputs, voi
  * - FFTW_MEASURE: Benchmarks multiple SIMD assembly routines on your CPU hardware
  *   during plan creation, selecting the absolute fastest kernel for your processor.
  * - Calling prepare() here ensures zero plan creation overhead inside execute().
+ * - Zero-fills padded_frame ONCE during DSP rebuild so boundary zeroes stay persistent.
  */
 void
 FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
@@ -207,9 +210,10 @@ FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
 	// Pre-benchmark hardware-optimized FFTW3 plan for new FFT size
 	myFFTWEngine.prepare(myFFTSize);
 
-	// Resize per-channel circular buffers and reset EQ states
+	// Resize per-channel circular buffers, pre-zero padded_frame ONCE, and reset EQ states
 	for (auto& ch : myChannels) {
 		ch.fifo.resize(myBufferCapacity);
+		ch.padded_frame.assign(myFFTSize, 0.0f); // Pre-zero padded_frame ONCE on rebuild
 		ch.eq.setSampleRate(sr);
 		ch.prev_spectrum.clear();
 	}
@@ -227,7 +231,7 @@ FFT::updateWarpingAndWindow(int scale, double displayMax, int bins, double warp,
 	double nyquist = mySampleRate / 2.0;
 	double fmax = std::min(displayMax, nyquist);
 
-	// Rebuild psychoacoustic re-mapping tables with pre-clamped indices (optimizes applyWarp)
+	// Rebuild psychoacoustic re-mapping tables with pre-clamped indices and identity bypass detection
 	myWarping.buildWarpTables(scale, fmax, static_cast<size_t>(bins), nyquist, warp, logFloor, n_linear_bins);
 
 	// Pre-calculate equal-loudness weighting curve (A-Weighting / C-Weighting / ITU-R 468)
@@ -251,9 +255,10 @@ FFT::updateWarpingAndWindow(int scale, double displayMax, int bins, double warp,
  * @brief Primary real-time execution loop called 60-120 times per second by TouchDesigner.
  *
  * HARDWARE & LATENCY OPTIMIZATION HIGHLIGHTS:
- * 1. Zero-Allocation Guarantee: All work vectors are pre-sized during setup/rebuild.
+ * 1. Zero Allocation & Persistent Zero-Padding: All work vectors are pre-sized during rebuildDSP().
+ *    Zero-filling of padded_frame is executed ONCE during rebuild, eliminating millions of zero-writes per second.
  * 2. EQ & Ballistics Bypass: Memory copies are completely skipped when EQ or envelope ballistics are disabled.
- * 3. 2x Unrolled AVX2 SIMD Windowing: Multiplies audio samples by window values 16 floats per cycle.
+ * 3. 2x Unrolled AVX2 SIMD Windowing: Multiplies audio samples by window values 16 floats per cycle into active slice.
  * 4. FFTW3 R2C Execution: Executes fftwf_execute_dft_r2c with 0 plan creation overhead.
  * 5. 2x Unrolled AVX2 Magnitude Calculation: Evaluates 8 complex bins per iteration using 256-bit SIMD registers.
  * 6. Identity Warp Bypass: Uses fast memcpy when spectrum mapping is 1-to-1 linear identity.
@@ -321,6 +326,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		myChannels.resize(num_channels, ChannelState());
 		for (auto& ch : myChannels) {
 			ch.fifo.resize(myBufferCapacity);
+			ch.padded_frame.assign(myFFTSize, 0.0f);
 			ch.eq.setSampleRate(mySampleRate);
 		}
 	}
@@ -361,11 +367,10 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		}
 		const float* proc_data = has_eq ? st.processed_signal.data() : st.captured_signal.data();
 
-		// 4. Zero-pad audio frame
+		// 4. Persistent zero-padded audio frame (Zero-filled ONCE on size change only)
 		if (st.padded_frame.size() != myFFTSize) {
-			st.padded_frame.resize(myFFTSize);
+			st.padded_frame.assign(myFFTSize, 0.0f);
 		}
-		std::fill(st.padded_frame.begin(), st.padded_frame.end(), 0.0f);
 
 		const float* win_data = myWindowBuffer.data();
 		float* pad_data = st.padded_frame.data() + pad_start;
@@ -399,13 +404,22 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		// 7. Apply Psychoacoustic Frequency Scale Warping (Log/Mel/ERB/Bark/Chroma with Identity Bypass)
 		myWarping.applyWarp(st.rfft_magnitude, st.warped_spectrum);
 
-		// 8. Apply Equal-Loudness Weighting Curve (AVX2 SIMD)
+		// 8. Apply Equal-Loudness Weighting Curve (2x Unrolled AVX2 SIMD)
 		if (weighting != 0 && myWeightingCurve.size() == st.warped_spectrum.size()) {
 			float* w_spec = st.warped_spectrum.data();
 			const float* w_curve = myWeightingCurve.data();
 			size_t w_len = st.warped_spectrum.size();
 			size_t wk = 0;
 #if defined(__AVX2__)
+			for (; wk + 15 < w_len; wk += 16) {
+				__m256 s0 = _mm256_loadu_ps(w_spec + wk);
+				__m256 c0 = _mm256_loadu_ps(w_curve + wk);
+				_mm256_storeu_ps(w_spec + wk, _mm256_mul_ps(s0, c0));
+
+				__m256 s1 = _mm256_loadu_ps(w_spec + wk + 8);
+				__m256 c1 = _mm256_loadu_ps(w_curve + wk + 8);
+				_mm256_storeu_ps(w_spec + wk + 8, _mm256_mul_ps(s1, c1));
+			}
 			for (; wk + 7 < w_len; wk += 8) {
 				__m256 s = _mm256_loadu_ps(w_spec + wk);
 				__m256 c = _mm256_loadu_ps(w_curve + wk);
@@ -430,7 +444,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		}
 		st.prev_loudness_mode = loudness;
 
-		// 10. Apply Asymmetric Attack/Release Dynamic Ballistics Envelope Smoothing (Zero-copy when disabled)
+		// 10. Apply Asymmetric Attack/Release Dynamic Ballistics Envelope Smoothing (2x Unrolled AVX2 FMA, Zero-copy when disabled)
 		if (attack > 0.0 || release > 0.0) {
 			st.ballistics.apply(static_cast<float>(attack), static_cast<float>(release), st.warped_spectrum, st.prev_spectrum);
 		}

@@ -20,9 +20,9 @@ Processing Pipeline Overview:
 4. Spectral Analysis: Single-Precision FFTW3 R2C Transform (FFTWEngine).
 5. SIMD Vectorization: 256-bit AVX2 Parallel Magnitude Spectrum calculation (2x unrolled).
 6. Psychoacoustic Re-mapping: Perceptual Frequency Scales with Identity Bypass (Log, Mel, ERB, Bark, Chroma, Melog).
-7. Equal-Loudness Weighting: ISO 226 / IEC 61672 A-Weighting, C-Weighting, ITU-R 468.
+7. Equal-Loudness Weighting: ISO 226 / IEC 61672 A-Weighting, C-Weighting, ITU-R 468 (2x unrolled).
 8. Dynamic Range Conversion: Optimized Decibel (dB) scaling with parallel peak search.
-9. Temporal Smoothing: Asymmetric Attack/Release Envelope Ballistics Filter.
+9. Temporal Smoothing: Asymmetric Attack/Release Envelope Ballistics Filter (2x unrolled FMA).
 ===========================================================================
 */
 
@@ -71,7 +71,6 @@ public:
 
     size_t capacity() const noexcept { return m_capacity; }
 
-    // Appends incoming audio samples to the circular buffer using fast memory copies
     inline void add(const float* signal, size_t count) noexcept {
         if (count == 0) return;
         
@@ -98,7 +97,6 @@ public:
         }
     }
 
-    // Unrolls circular buffer samples into a linear sequential vector [oldest -> newest]
     inline void get(std::vector<float>& out) const noexcept {
         if (out.size() != m_capacity) {
             out.resize(m_capacity);
@@ -139,16 +137,6 @@ private:
  2. DIRECT FORM II TRANSPOSED BIQUAD EQUALIZER
 ===========================================================================
 Second-order Infinite Impulse Response (IIR) Biquad Filter section.
-
-Transfer function H(z):
-       b0 + b1*z^-1 + b2*z^-2
-H(z) = -----------------------
-        1 + a1*z^-1 + a2*z^-2
-
-Direct Form II Transposed equations:
-  y[n]  = b0 * x[n] + z1[n-1]
-  z1[n] = b1 * x[n] - a1 * y[n] + z2[n-1]
-  z2[n] = b2 * x[n] - a2 * y[n]
 */
 struct BiquadSection {
     float b0{ 1.0f }, b1{ 0.0f }, b2{ 0.0f };
@@ -240,7 +228,6 @@ public:
         sec.active = true;
     }
 
-    // Process audio buffer through High/Low biquad filters
     inline void processAudio(const std::vector<float>& original_audio,
                              double gain_db, double cutoff_hz,
                              double low_gain_db, double low_cutoff_hz,
@@ -262,7 +249,6 @@ public:
         bool has_filter = (m_high_shelf.active || m_low_shelf.active) && (amt > 0.0f);
 
         if (!has_filter) {
-            // Bypass copying: calling function will use original_audio directly
             return;
         }
 
@@ -373,16 +359,6 @@ public:
  4. PSYCHOACOUSTIC FREQUENCY SCALES & UNROLLED SIMD INTERPOLATION
 ===========================================================================
 Converts linear FFT frequency spectrums to psychoacoustic perception scales.
-
-Scales supported:
-- Logarithmic Scale
-- Mel Scale
-- ERB Scale
-- Bark Scale
-- Chroma Scale
-- Melog Hybrid
-
-Optimization: Pre-clamped lookup tables remove boundary checks from the real-time loop.
 Identity Bypass: Fast memcpy when grid mapping is 1-to-1 linear identity.
 FMA formulation: v0 + w * (v1 - v0) unrolled 4x for SIMD execution.
 */
@@ -706,11 +682,11 @@ public:
 
 /*
 ===========================================================================
- 7. ASYMMETRIC ATTACK / RELEASE BALLISTICS FILTER (Branchless 256-Bit AVX2 SIMD)
+ 7. ASYMMETRIC ATTACK / RELEASE BALLISTICS FILTER (2x Unrolled 256-Bit AVX2 SIMD)
 ===========================================================================
 Dynamic envelope smoothing filter with independent attack and release coefficients.
 Branchless AVX2 SIMD uses _mm256_blendv_ps and _mm256_fmadd_ps for zero branch
-mispredictions across 8 bins per CPU cycle.
+mispredictions across 16 bins per CPU loop iteration.
 */
 class BallisticsFilter {
 public:
@@ -736,6 +712,23 @@ public:
         __m256 v_rel = _mm256_set1_ps(rel_factor);
         __m256 v_zero = _mm256_setzero_ps();
 
+        for (; i + 15 < n; i += 16) {
+            __m256 s0 = _mm256_loadu_ps(src + i);
+            __m256 d0 = _mm256_loadu_ps(dst + i);
+            __m256 diff0 = _mm256_sub_ps(s0, d0);
+            __m256 mask0 = _mm256_cmp_ps(diff0, v_zero, _CMP_GT_OQ);
+            __m256 factor0 = _mm256_blendv_ps(v_rel, v_att, mask0);
+            __m256 res0 = _mm256_fmadd_ps(factor0, diff0, d0);
+            _mm256_storeu_ps(dst + i, res0);
+
+            __m256 s1 = _mm256_loadu_ps(src + i + 8);
+            __m256 d1 = _mm256_loadu_ps(dst + i + 8);
+            __m256 diff1 = _mm256_sub_ps(s1, d1);
+            __m256 mask1 = _mm256_cmp_ps(diff1, v_zero, _CMP_GT_OQ);
+            __m256 factor1 = _mm256_blendv_ps(v_rel, v_att, mask1);
+            __m256 res1 = _mm256_fmadd_ps(factor1, diff1, d1);
+            _mm256_storeu_ps(dst + i + 8, res1);
+        }
         for (; i + 7 < n; i += 8) {
             __m256 s = _mm256_loadu_ps(src + i);
             __m256 d = _mm256_loadu_ps(dst + i);
@@ -848,7 +841,6 @@ public:
 
         size_t i = 0;
 #if defined(__AVX2__)
-        // 2x Unrolled 256-bit AVX2 SIMD Magnitude Loop: evaluates 8 complex bins per iteration
         size_t n_vec = n_complex / 8;
         for (; i < n_vec * 8; i += 8) {
             __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
