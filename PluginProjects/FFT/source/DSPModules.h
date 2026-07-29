@@ -876,16 +876,32 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
+            printf("[FFT Plugin] [FFTW3] Benchmarking & generating FFT plan for size N = %zu...\n", fft_size);
+            fflush(stdout);
+
             m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
-            if (!m_plan) {
+            if (m_plan) {
+                printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = %zu (Ultimate CPU Optimization Level)\n", fft_size);
+            } else {
+                printf("[FFT Plugin] [FFTW3] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...\n");
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+                if (m_plan) {
+                    printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_PATIENT plan for N = %zu\n", fft_size);
+                } else {
+                    printf("[FFT Plugin] [FFTW3] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...\n");
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+                    if (m_plan) {
+                        printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = %zu\n", fft_size);
+                    } else {
+                        printf("[FFT Plugin] [FFTW3] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...\n");
+                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
+                        if (m_plan) {
+                            printf("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = %zu\n", fft_size);
+                        }
+                    }
+                }
             }
-            if (!m_plan) {
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
-            }
-            if (!m_plan) {
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
-            }
+            fflush(stdout);
         }
 
         if (dummy_in) fftwf_free(dummy_in);
@@ -971,16 +987,32 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
+            printf("[FFT Plugin] [Intel MKL / IPP] Benchmarking & generating FFT plan for size N = %zu...\n", fft_size);
+            fflush(stdout);
+
             m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_EXHAUSTIVE);
-            if (!m_plan) {
+            if (m_plan) {
+                printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_EXHAUSTIVE plan for N = %zu (Ultimate CPU Optimization Level)\n", fft_size);
+            } else {
+                printf("[FFT Plugin] [Intel MKL / IPP] FFTW_EXHAUSTIVE returned null, falling back to FFTW_PATIENT...\n");
                 m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_PATIENT);
+                if (m_plan) {
+                    printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_PATIENT plan for N = %zu\n", fft_size);
+                } else {
+                    printf("[FFT Plugin] [Intel MKL / IPP] FFTW_PATIENT returned null, falling back to FFTW_MEASURE...\n");
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+                    if (m_plan) {
+                        printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = %zu\n", fft_size);
+                    } else {
+                        printf("[FFT Plugin] [Intel MKL / IPP] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...\n");
+                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
+                        if (m_plan) {
+                            printf("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = %zu\n", fft_size);
+                        }
+                    }
+                }
             }
-            if (!m_plan) {
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
-            }
-            if (!m_plan) {
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
-            }
+            fflush(stdout);
         }
 
         if (dummy_in) fftwf_free(dummy_in);
