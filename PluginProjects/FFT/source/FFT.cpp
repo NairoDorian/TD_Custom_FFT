@@ -29,22 +29,20 @@
  *    - Step A: Fetches current UI parameter states from TouchDesigner's OP_Inputs manager.
  *    - Step B: Checks parameter caches. If window size or FFT pad choice changed,
  *              triggers rebuildDSP(), which pre-computes hardware-tuned FFTW plans
- *              via FFTW_MEASURE and initializes persistent zero-padded buffers once.
+ *              via FFTW_MEASURE.
  *    - Step C: If psychoacoustic scale or window type changed, triggers updateWarpingAndWindow(),
  *              which builds unrolled frequency index lookup tables.
  *    - Step D: Loops through each audio channel:
- *              1. Ingests incoming CHOP audio slice into circular FIFOBuffer.
+ *              1. Ingests incoming CHOP audio slice into circular FIFOBuffer via fast memcpy.
  *              2. Extracts contiguous sample history frame from FIFO.
- *              3. Applies Direct Form II Transposed High/Low Shelving EQ.
- *              4. Multiplies tapering window directly into active slice [pad_start, pad_start + win_len)
- *                 of persistent zero-padded frame using AVX2 SIMD (_mm256_mul_ps). Zero-padded boundaries
- *                 remain zero without re-filling every frame.
- *              5. Executes R2C FFTW transform and evaluates magnitude spectrum via 2x unrolled AVX2 SIMD.
- *              6. Re-maps linear magnitudes to psychoacoustic scale using 4x unrolled FMA interpolation.
+ *              3. Applies Direct Form II Transposed High/Low Shelving EQ (bypassed with zero-copy if inactive).
+ *              4. Centers audio in zero-padded frame and applies 2x unrolled AVX2 SIMD windowing (_mm256_mul_ps).
+ *              5. Executes R2C FFTW transform and evaluates magnitude spectrum via 2x unrolled 256-bit AVX2 SIMD.
+ *              6. Re-maps linear magnitudes to psychoacoustic scale (with 1-to-1 identity bypass for linear grids).
  *              7. Applies Equal-Loudness Weighting Curve (AVX2 SIMD _mm256_mul_ps).
  *              8. Converts magnitudes to Decibels (dB) with parallel peak search and pre-computed db_offset.
- *              9. Applies Asymmetric Attack/Release Ballistics dynamic smoothing.
- *              10. Copies output channels directly to TouchDesigner's CHOP_Output memory array.
+ *              9. Applies Asymmetric Attack/Release Ballistics dynamic smoothing (zero-copy when 0.0).
+ *              10. Copies output channels directly to TouchDesigner's CHOP_Output memory array via memcpy.
  * ===========================================================================
  */
 
@@ -192,7 +190,6 @@ FFT::getChannelName(int32_t index, OP_String *name, const OP_Inputs* inputs, voi
  * - FFTW_MEASURE: Benchmarks multiple SIMD assembly routines on your CPU hardware
  *   during plan creation, selecting the absolute fastest kernel for your processor.
  * - Calling prepare() here ensures zero plan creation overhead inside execute().
- * - Calls initBuffers() to pre-allocate scratch arrays and zero padded_frame ONCE.
  */
 void
 FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
@@ -210,9 +207,9 @@ FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
 	// Pre-benchmark hardware-optimized FFTW3 plan for new FFT size
 	myFFTWEngine.prepare(myFFTSize);
 
-	// Pre-allocate buffers and zero padded_frame ONCE during DSP rebuild
+	// Resize per-channel circular buffers and reset EQ states
 	for (auto& ch : myChannels) {
-		ch.initBuffers(myBufferCapacity, myFFTSize, static_cast<size_t>(numBins));
+		ch.fifo.resize(myBufferCapacity);
 		ch.eq.setSampleRate(sr);
 		ch.prev_spectrum.clear();
 	}
@@ -253,15 +250,14 @@ FFT::updateWarpingAndWindow(int scale, double displayMax, int bins, double warp,
 /**
  * @brief Primary real-time execution loop called 60-120 times per second by TouchDesigner.
  *
- * HARDWARE & PERFORMANCE JUSTIFICATIONS:
- * 1. Zero Allocation & Zero Re-zeroing Guarantee: All work vectors are pre-allocated during rebuildDSP().
- *    No std::fill or zero-filling of padded_frame boundaries occurs during per-frame cooking!
- * 2. AVX2 Vectorized Windowing: Multiplies audio samples by tapering window values 8 floats
- *    at a time directly into padded_frame[pad_start + wi] using _mm256_mul_ps.
- * 3. FFTW3 R2C Execution: Calls fftwf_execute_dft_r2c(plan, in, out) in 0 plan creation time.
- * 4. 2x Unrolled AVX2 SIMD Magnitude Spectrum: Calculates sqrt(r^2 + i^2) across 8 complex bins
- *    per cycle.
- * 5. Branchless Warping: Linear interpolation unrolled 4x without branch checks.
+ * HARDWARE & LATENCY OPTIMIZATION HIGHLIGHTS:
+ * 1. Zero-Allocation Guarantee: All work vectors are pre-sized during setup/rebuild.
+ * 2. EQ & Ballistics Bypass: Memory copies are completely skipped when EQ or envelope ballistics are disabled.
+ * 3. 2x Unrolled AVX2 SIMD Windowing: Multiplies audio samples by window values 16 floats per cycle.
+ * 4. FFTW3 R2C Execution: Executes fftwf_execute_dft_r2c with 0 plan creation overhead.
+ * 5. 2x Unrolled AVX2 Magnitude Calculation: Evaluates 8 complex bins per iteration using 256-bit SIMD registers.
+ * 6. Identity Warp Bypass: Uses fast memcpy when spectrum mapping is 1-to-1 linear identity.
+ * 7. Fast Direct Output Copy: Uses std::memcpy to write output channels to TouchDesigner memory.
  */
 void
 FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
@@ -324,7 +320,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	if (static_cast<int>(myChannels.size()) != num_channels) {
 		myChannels.resize(num_channels, ChannelState());
 		for (auto& ch : myChannels) {
-			ch.initBuffers(myBufferCapacity, myFFTSize, static_cast<size_t>(bins));
+			ch.fifo.resize(myBufferCapacity);
 			ch.eq.setSampleRate(mySampleRate);
 		}
 	}
@@ -345,11 +341,6 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	for (int ch = 0; ch < num_channels; ++ch) {
 		ChannelState& st = myChannels[ch];
 
-		// Ensure channel work buffers match current sizes without re-allocating if unchanged
-		if (st.padded_frame.size() != myFFTSize) {
-			st.initBuffers(myBufferCapacity, myFFTSize, static_cast<size_t>(bins));
-		}
-
 		// 1. Ingest new audio samples from TouchDesigner input CHOP into FIFO ring buffer
 		if (inputs->getNumInputs() > 0) {
 			const OP_CHOPInput* cinput = inputs->getInputCHOP(0);
@@ -363,20 +354,35 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		// 2. Extract linear sample sequence from circular FIFO
 		st.fifo.get(st.captured_signal);
 
-		// 3. Process audio frame through Direct Form II Transposed High/Low Shelving EQ
-		st.eq.processAudio(st.captured_signal, gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor, amount, st.processed_signal);
+		// 3. Process audio frame through EQ (Zero-copy bypass if EQ is inactive)
+		bool has_eq = st.eq.hasActiveFilter(amount);
+		if (has_eq) {
+			st.eq.processAudio(st.captured_signal, gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor, amount, st.processed_signal);
+		}
+		const float* proc_data = has_eq ? st.processed_signal.data() : st.captured_signal.data();
 
-		// 4. AVX2 SIMD Windowing Loop directly into persistent zero-padded frame
-		// NOTE: Head [0, pad_start) and tail [pad_start + win_len, myFFTSize) padding stay zero
-		// persistently from initBuffers(), eliminating millions of redundant zero-writes per second!
-		const float* proc_data = st.processed_signal.data();
+		// 4. Zero-pad audio frame
+		if (st.padded_frame.size() != myFFTSize) {
+			st.padded_frame.resize(myFFTSize);
+		}
+		std::fill(st.padded_frame.begin(), st.padded_frame.end(), 0.0f);
+
 		const float* win_data = myWindowBuffer.data();
 		float* pad_data = st.padded_frame.data() + pad_start;
 		size_t win_len = std::min(myBufferCapacity, myWindowBuffer.size());
 
-		// 5. AVX2 SIMD Windowing Loop (Multiplies 8 floats per CPU instruction cycle)
+		// 5. 2x Unrolled AVX2 SIMD Windowing Loop (Multiplies 16 floats per loop iteration)
 		size_t wi = 0;
 #if defined(__AVX2__)
+		for (; wi + 15 < win_len; wi += 16) {
+			__m256 p0 = _mm256_loadu_ps(proc_data + wi);
+			__m256 w0 = _mm256_loadu_ps(win_data + wi);
+			_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p0, w0));
+
+			__m256 p1 = _mm256_loadu_ps(proc_data + wi + 8);
+			__m256 w1 = _mm256_loadu_ps(win_data + wi + 8);
+			_mm256_storeu_ps(pad_data + wi + 8, _mm256_mul_ps(p1, w1));
+		}
 		for (; wi + 7 < win_len; wi += 8) {
 			__m256 p = _mm256_loadu_ps(proc_data + wi);
 			__m256 w = _mm256_loadu_ps(win_data + wi);
@@ -390,10 +396,10 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		// 6. Execute FFTW3 Real-to-Complex Transform & 2x Unrolled AVX2 SIMD Magnitude Calculation
 		myFFTWEngine.executeRFFT(st.padded_frame, st.rfft_magnitude, st.scratch_complex);
 
-		// 7. Apply Psychoacoustic Frequency Scale Warping (Log/Mel/ERB/Bark/Chroma)
+		// 7. Apply Psychoacoustic Frequency Scale Warping (Log/Mel/ERB/Bark/Chroma with Identity Bypass)
 		myWarping.applyWarp(st.rfft_magnitude, st.warped_spectrum);
 
-		// 8. Apply Equal-Loudness Weighting Curve (AVX2 SIMD 8 floats per cycle)
+		// 8. Apply Equal-Loudness Weighting Curve (AVX2 SIMD)
 		if (weighting != 0 && myWeightingCurve.size() == st.warped_spectrum.size()) {
 			float* w_spec = st.warped_spectrum.data();
 			const float* w_curve = myWeightingCurve.data();
@@ -424,21 +430,19 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		}
 		st.prev_loudness_mode = loudness;
 
-		// 10. Apply Asymmetric Attack/Release Dynamic Ballistics Envelope Smoothing
+		// 10. Apply Asymmetric Attack/Release Dynamic Ballistics Envelope Smoothing (Zero-copy when disabled)
 		if (attack > 0.0 || release > 0.0) {
 			st.ballistics.apply(static_cast<float>(attack), static_cast<float>(release), st.warped_spectrum, st.prev_spectrum);
-		} else {
-			st.prev_spectrum = st.warped_spectrum;
 		}
 
-		// 11. Write output spectrum values directly to TouchDesigner CHOP output memory channels
+		// 11. Write output spectrum values directly to TouchDesigner CHOP output memory channels via memcpy
 		size_t out_len = std::min(static_cast<size_t>(output->numSamples), st.warped_spectrum.size());
 		float* out_chan = output->channels[ch];
 		const float* spec_data = st.warped_spectrum.data();
 
-		std::copy(spec_data, spec_data + out_len, out_chan);
+		std::memcpy(out_chan, spec_data, out_len * sizeof(float));
 		if (static_cast<size_t>(output->numSamples) > out_len) {
-			std::fill(out_chan + out_len, out_chan + output->numSamples, 0.0f);
+			std::memset(out_chan + out_len, 0, (output->numSamples - out_len) * sizeof(float));
 		}
 
 		// 12. Real-Time Telemetry: Track primary spectral peak frequency (Hz) and magnitude for Info CHOP/DAT

@@ -18,8 +18,8 @@ Processing Pipeline Overview:
 2. Pre-Filtering: Parametric Biquad Equalizer (BiquadEQ / Direct Form II Transposed).
 3. Tapering & Padding: Window Generator (Kaiser/Hann/etc.) with Coherent Gain Compensation.
 4. Spectral Analysis: Single-Precision FFTW3 R2C Transform (FFTWEngine).
-5. SIMD Vectorization: 256-bit AVX2 Parallel Magnitude Spectrum calculation.
-6. Psychoacoustic Re-mapping: Perceptual Frequency Scales (Log, Mel, ERB, Bark, Chroma, Melog).
+5. SIMD Vectorization: 256-bit AVX2 Parallel Magnitude Spectrum calculation (2x unrolled).
+6. Psychoacoustic Re-mapping: Perceptual Frequency Scales with Identity Bypass (Log, Mel, ERB, Bark, Chroma, Melog).
 7. Equal-Loudness Weighting: ISO 226 / IEC 61672 A-Weighting, C-Weighting, ITU-R 468.
 8. Dynamic Range Conversion: Optimized Decibel (dB) scaling with parallel peak search.
 9. Temporal Smoothing: Asymmetric Attack/Release Envelope Ballistics Filter.
@@ -54,7 +54,7 @@ Zero-allocation circular ring buffer for real-time audio sample ingestion.
 Performance & Architecture Details:
 - Guaranteed zero heap allocation during real-time cook calls once capacity is set.
 - Handles incoming variable sub-block sizes (e.g. 512, 735, 1024 samples) seamlessly.
-- Uses split std::copy operations when incoming block wraps around buffer boundaries.
+- Uses split std::memcpy operations when incoming block wraps around buffer boundaries.
 */
 class FIFOBuffer {
 public:
@@ -71,13 +71,12 @@ public:
 
     size_t capacity() const noexcept { return m_capacity; }
 
-    // Appends incoming audio samples to the circular buffer.
+    // Appends incoming audio samples to the circular buffer using fast memory copies
     inline void add(const float* signal, size_t count) noexcept {
         if (count == 0) return;
         
         if (count >= m_capacity) {
-            // Incoming block exceeds capacity: retain only the latest capacity samples
-            std::copy(signal + count - m_capacity, signal + count, m_data.begin());
+            std::memcpy(m_data.data(), signal + count - m_capacity, m_capacity * sizeof(float));
             m_idx = 0;
             m_filled = m_capacity;
             return;
@@ -85,14 +84,12 @@ public:
 
         size_t end = m_idx + count;
         if (end <= m_capacity) {
-            // Contiguous space available before buffer boundary
-            std::copy(signal, signal + count, m_data.begin() + m_idx);
+            std::memcpy(m_data.data() + m_idx, signal, count * sizeof(float));
             m_idx = end % m_capacity;
         } else {
-            // Boundary wrap-around split write
             size_t first = m_capacity - m_idx;
-            std::copy(signal, signal + first, m_data.begin() + m_idx);
-            std::copy(signal + first, signal + count, m_data.begin());
+            std::memcpy(m_data.data() + m_idx, signal, first * sizeof(float));
+            std::memcpy(m_data.data(), signal + first, (count - first) * sizeof(float));
             m_idx = count - first;
         }
 
@@ -101,34 +98,32 @@ public:
         }
     }
 
-    // Unrolls circular buffer samples into a linear sequential vector [oldest -> newest].
+    // Unrolls circular buffer samples into a linear sequential vector [oldest -> newest]
     inline void get(std::vector<float>& out) const noexcept {
         if (out.size() != m_capacity) {
             out.resize(m_capacity);
         }
         
-        // Zero-fill preceding padding if buffer is not yet fully populated
         if (m_filled < m_capacity) {
-            std::fill(out.begin(), out.end(), 0.0f);
+            std::memset(out.data(), 0, m_capacity * sizeof(float));
             if (m_filled > 0) {
                 size_t start_dest = m_capacity - m_filled;
                 if (m_idx >= m_filled) {
-                    std::copy(m_data.begin() + m_idx - m_filled, m_data.begin() + m_idx, out.begin() + start_dest);
+                    std::memcpy(out.data() + start_dest, m_data.data() + m_idx - m_filled, m_filled * sizeof(float));
                 } else {
                     size_t part1 = m_filled - m_idx;
-                    std::copy(m_data.end() - part1, m_data.end(), out.begin() + start_dest);
-                    std::copy(m_data.begin(), m_data.begin() + m_idx, out.begin() + start_dest + part1);
+                    std::memcpy(out.data() + start_dest, m_data.data() + m_capacity - part1, part1 * sizeof(float));
+                    std::memcpy(out.data() + start_dest + part1, m_data.data(), m_idx * sizeof(float));
                 }
             }
             return;
         }
 
-        // Unroll circular array to linear output sequence
         if (m_idx == 0) {
-            std::copy(m_data.begin(), m_data.end(), out.begin());
+            std::memcpy(out.data(), m_data.data(), m_capacity * sizeof(float));
         } else {
-            std::copy(m_data.begin() + m_idx, m_data.end(), out.begin());
-            std::copy(m_data.begin(), m_data.begin() + m_idx, out.begin() + (m_capacity - m_idx));
+            std::memcpy(out.data(), m_data.data() + m_idx, (m_capacity - m_idx) * sizeof(float));
+            std::memcpy(out.data() + (m_capacity - m_idx), m_data.data(), m_idx * sizeof(float));
         }
     }
 
@@ -156,12 +151,11 @@ Direct Form II Transposed equations:
   z2[n] = b2 * x[n] - a2 * y[n]
 */
 struct BiquadSection {
-    float b0{ 1.0f }, b1{ 0.0f }, b2{ 0.0f }; // Feedforward numerator coefficients
-    float a1{ 0.0f }, a2{ 0.0f };             // Feedback denominator coefficients
-    float z1{ 0.0f }, z2{ 0.0f };             // Delay state registers
-    bool active{ false };                     // Active filter bypass flag
+    float b0{ 1.0f }, b1{ 0.0f }, b2{ 0.0f };
+    float a1{ 0.0f }, a2{ 0.0f };
+    float z1{ 0.0f }, z2{ 0.0f };
+    bool active{ false };
 
-    // Single-sample Direct Form II Transposed processing step
     inline float process(float x) noexcept {
         if (!active) return x;
         float y = b0 * x + z1;
@@ -194,7 +188,6 @@ public:
         }
     }
 
-    // High-Shelf RBJ coefficient design calculation
     void designHighShelf(double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
         if (std::abs(gain_db) < 0.01) {
             sec.active = false;
@@ -221,7 +214,6 @@ public:
         sec.active = true;
     }
 
-    // Low-Shelf RBJ coefficient design calculation
     void designLowShelf(double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
         if (std::abs(gain_db) < 0.01) {
             sec.active = false;
@@ -238,7 +230,7 @@ public:
         double b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha);
         double a0 = (A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrt_A * alpha;
         double a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0);
-        double a2 = (A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha;
+        double a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrt_A * alpha;
 
         sec.b0 = static_cast<float>(b0 / a0);
         sec.b1 = static_cast<float>(b1 / a0);
@@ -248,7 +240,7 @@ public:
         sec.active = true;
     }
 
-    // Process audio buffer through High/Low biquad filters with wet/dry blend
+    // Process audio buffer through High/Low biquad filters
     inline void processAudio(const std::vector<float>& original_audio,
                              double gain_db, double cutoff_hz,
                              double low_gain_db, double low_cutoff_hz,
@@ -266,16 +258,16 @@ public:
             m_design_key = key;
         }
 
-        if (processed_output.size() != original_audio.size()) {
-            processed_output.resize(original_audio.size());
-        }
-
         float amt = static_cast<float>(amount);
         bool has_filter = (m_high_shelf.active || m_low_shelf.active) && (amt > 0.0f);
 
         if (!has_filter) {
-            std::copy(original_audio.begin(), original_audio.end(), processed_output.begin());
+            // Bypass copying: calling function will use original_audio directly
             return;
+        }
+
+        if (processed_output.size() != original_audio.size()) {
+            processed_output.resize(original_audio.size());
         }
 
         const float* src = original_audio.data();
@@ -286,8 +278,12 @@ public:
             float x = src[i];
             float filtered = m_high_shelf.process(x);
             filtered = m_low_shelf.process(filtered);
-            dst[i] = x + amt * (filtered - x); // FMA wet/dry linear blend
+            dst[i] = x + amt * (filtered - x);
         }
+    }
+
+    bool hasActiveFilter(double amount) const noexcept {
+        return (m_high_shelf.active || m_low_shelf.active) && (amount > 0.0);
     }
 
 private:
@@ -307,7 +303,6 @@ preserving exact sinusoidal peak values in spectral outputs.
 */
 class WindowGenerator {
 public:
-    // Zero-Order Modified Bessel Function of First Kind I0(x) for Kaiser window calculation
     static double besselI0(double x) {
         double ax = std::abs(x);
         if (ax < 3.75) {
@@ -321,7 +316,6 @@ public:
         }
     }
 
-    // Generates tapering window coefficients according to window_type choice code
     static void generateWindow(int window_type, int kaiser_beta, size_t length, std::vector<float>& window) {
         window.resize(length);
         if (length == 0) return;
@@ -364,7 +358,6 @@ public:
             sum += w;
         }
 
-        // Scale window values so mean == 1.0 for coherent amplitude preservation
         double mean_val = sum / static_cast<double>(length);
         if (mean_val > 0.0) {
             float inv_mean = static_cast<float>(1.0 / mean_val);
@@ -382,14 +375,15 @@ public:
 Converts linear FFT frequency spectrums to psychoacoustic perception scales.
 
 Scales supported:
-- Logarithmic Scale (Pitch octaves log2 relationship)
-- Mel Scale (HTK formula: Mel(f) = 2595 * log10(1 + f / 700))
-- ERB Scale (Glasberg & Moore auditory filter selectivity)
-- Bark Scale (Zwicker basilar membrane resonance scale)
-- Chroma Scale (12 semitones per octave pitch classification, A4 = 440 Hz = MIDI 69)
-- Melog Hybrid (Equal blend of Mel and Log scales)
+- Logarithmic Scale
+- Mel Scale
+- ERB Scale
+- Bark Scale
+- Chroma Scale
+- Melog Hybrid
 
 Optimization: Pre-clamped lookup tables remove boundary checks from the real-time loop.
+Identity Bypass: Fast memcpy when grid mapping is 1-to-1 linear identity.
 FMA formulation: v0 + w * (v1 - v0) unrolled 4x for SIMD execution.
 */
 class PerceptualWarping {
@@ -429,7 +423,6 @@ public:
         return 440.0 * std::pow(2.0, (chroma - 69.0) / 12.0);
     }
 
-    // Computes target frequencies across output spectrum bins based on selected scale
     static void computeTargetHzGrid(int scale_code, double fmax, size_t n_out, double nyquist, double warp_blend, double log_floor_hz, std::vector<double>& target_hz) {
         target_hz.resize(n_out);
         std::vector<double> perceptual(n_out);
@@ -512,14 +505,12 @@ public:
             }
         }
 
-        // Blend linear and perceptual frequency axes using warp_blend
         for (size_t i = 0; i < n_out; ++i) {
             double axis_val = (1.0 - warp_blend) * linear[i] + warp_blend * perceptual[i];
             target_hz[i] = std::max(0.0, std::min(fmax, axis_val));
         }
     }
 
-    // Pre-calculates integer index and fractional weight arrays with pre-clamped bounds
     void buildWarpTables(int scale_code, double fmax, size_t n_out, double nyquist, double warp_blend, double log_floor_hz, size_t nlin) {
         computeTargetHzGrid(scale_code, fmax, n_out, nyquist, warp_blend, log_floor_hz, m_target_hz);
         m_i0.resize(n_out);
@@ -527,21 +518,34 @@ public:
         m_w.resize(n_out);
 
         double denom = (nlin > 1) ? static_cast<double>(nlin - 1) : 1.0;
+        bool is_id = (n_out == nlin);
+
         for (size_t i = 0; i < n_out; ++i) {
             double frac = (m_target_hz[i] / nyquist) * denom;
             size_t i0_val = static_cast<size_t>(std::max(0.0, std::min(static_cast<double>(nlin - 2), std::floor(frac))));
             m_i0[i] = i0_val;
             m_i1[i] = i0_val + 1;
-            m_w[i] = static_cast<float>(frac - static_cast<double>(i0_val));
+            float weight = static_cast<float>(frac - static_cast<double>(i0_val));
+            m_w[i] = weight;
+
+            if (is_id && (i0_val != i || weight > 1e-5f)) {
+                is_id = false;
+            }
         }
+        m_is_identity = is_id;
     }
 
-    // Re-maps linear magnitude spectrum to non-linear frequency grid using 4x unrolled FMA interpolation
     inline void applyWarp(const std::vector<float>& linear_magnitude, std::vector<float>& output_spectrum) const noexcept {
         size_t n_out = m_i0.size();
         if (output_spectrum.size() != n_out) {
             output_spectrum.resize(n_out);
         }
+
+        if (m_is_identity && linear_magnitude.size() == n_out) {
+            std::memcpy(output_spectrum.data(), linear_magnitude.data(), n_out * sizeof(float));
+            return;
+        }
+
         const float* src = linear_magnitude.data();
         float* dst = output_spectrum.data();
         const size_t* idx0_ptr = m_i0.data();
@@ -550,7 +554,6 @@ public:
 
         size_t i = 0;
 #if defined(__AVX2__)
-        // 4x unrolled FMA interpolation loop: dst = v0 + w * (v1 - v0)
         for (; i + 3 < n_out; i += 4) {
             size_t i0_0 = idx0_ptr[i],     i1_0 = idx1_ptr[i];
             size_t i0_1 = idx0_ptr[i + 1], i1_1 = idx1_ptr[i + 1];
@@ -583,6 +586,7 @@ private:
     std::vector<size_t> m_i0;
     std::vector<size_t> m_i1;
     std::vector<float> m_w;
+    bool m_is_identity{ false };
 };
 
 /*
@@ -615,7 +619,7 @@ public:
 
                 double f1k = 1000.0 * 1000.0;
                 double ra_1k = ((12194.0 * 12194.0) * (f1k * f1k)) / ((f1k + 20.6 * 20.6) * std::sqrt((f1k + 107.7 * 107.7) * (f1k + 737.9 * 737.9)) * (f1k + 12194.0 * 12194.0));
-                w = ra / ra_1k; // Normalized to 1.0 (0 dB) at 1 kHz
+                w = ra / ra_1k;
             } else if (weighting_code == 2) { // C-weighting
                 double f2 = f * f;
                 double num = (12194.0 * 12194.0) * f2;
@@ -679,7 +683,7 @@ public:
         if (max_val <= 0.0f) max_val = 1.0f;
 
         float inv_max = 1.0f / max_val;
-        float db_offset = static_cast<float>(20.0 * std::log10(inv_max)); // Pre-computed ONCE outside loop
+        float db_offset = static_cast<float>(20.0 * std::log10(inv_max));
         float floor_val = static_cast<float>(-top_db);
         float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
 
