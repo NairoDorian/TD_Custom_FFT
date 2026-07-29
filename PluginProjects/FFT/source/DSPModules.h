@@ -46,8 +46,16 @@ Processing Pipeline Overview:
 
 namespace FFTDSP {
 
+inline std::vector<std::string>& getPlanLogHistory() {
+    static std::vector<std::string> history;
+    return history;
+}
+
 inline void logPlanEvent(const std::string& msg) {
-    std::ofstream logFile("fft_plan_log.txt", std::ios::app);
+    getPlanLogHistory().push_back(msg);
+
+    // Absolute file path guarantees fft_plan_log.txt is written directly inside Plugin_FFT root
+    std::ofstream logFile("c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT/fft_plan_log.txt", std::ios::app);
     if (logFile.is_open()) {
         logFile << msg << std::endl;
     }

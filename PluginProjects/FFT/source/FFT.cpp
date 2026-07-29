@@ -542,7 +542,8 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 bool
 FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-	infoSize->rows = 8;
+	auto& logs = FFTDSP::getPlanLogHistory();
+	infoSize->rows = 8 + static_cast<int32_t>(logs.size());
 	infoSize->cols = 2;
 	infoSize->byColumn = false;
 	return true;
@@ -556,69 +557,81 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 {
 	char tempBuffer[256];
 
-	switch (index) {
-	case 0:
-		entries->values[0]->setString("execute_count");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%d", myExecuteCount);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 1:
-		entries->values[0]->setString("fft_size");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myFFTSize);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 2:
-		entries->values[0]->setString("window_samples");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myBufferCapacity);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 3:
-		entries->values[0]->setString("sample_rate");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 4:
-		entries->values[0]->setString("nyquist_frequency");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate / 2.0);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 5:
-		entries->values[0]->setString("spectral_peak_freq");
-		snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", myPeakFrequencyHz);
-		entries->values[1]->setString(tempBuffer);
-		break;
-	case 6:
-		entries->values[0]->setString("simd_acceleration");
+	if (index < 8) {
+		switch (index) {
+		case 0:
+			entries->values[0]->setString("execute_count");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%d", myExecuteCount);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 1:
+			entries->values[0]->setString("fft_size");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myFFTSize);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 2:
+			entries->values[0]->setString("window_samples");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%zu", myBufferCapacity);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 3:
+			entries->values[0]->setString("sample_rate");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 4:
+			entries->values[0]->setString("nyquist_frequency");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate / 2.0);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 5:
+			entries->values[0]->setString("spectral_peak_freq");
+			snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", myPeakFrequencyHz);
+			entries->values[1]->setString(tempBuffer);
+			break;
+		case 6:
+			entries->values[0]->setString("simd_acceleration");
 #if defined(__AVX2__)
-		entries->values[1]->setString("AVX2 256-bit SIMD");
+			entries->values[1]->setString("AVX2 256-bit SIMD");
 #else
-		entries->values[1]->setString("Scalar Fallback");
+			entries->values[1]->setString("Scalar Fallback");
 #endif
-		break;
-	case 7:
-		entries->values[0]->setString("fft_engine");
-		if (myFFTEngine) {
-			entries->values[1]->setString(myFFTEngine->getPlanStatus().c_str());
-		} else {
-			entries->values[1]->setString("Uninitialized");
+			break;
+		case 7:
+			entries->values[0]->setString("fft_engine");
+			if (myFFTEngine) {
+				entries->values[1]->setString(myFFTEngine->getPlanStatus().c_str());
+			} else {
+				entries->values[1]->setString("Uninitialized");
+			}
+			break;
 		}
-		break;
+	} else {
+		auto& logs = FFTDSP::getPlanLogHistory();
+		size_t log_idx = static_cast<size_t>(index - 8);
+		if (log_idx < logs.size()) {
+			snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
+			entries->values[0]->setString(tempBuffer);
+			entries->values[1]->setString(logs[log_idx].c_str());
+		}
 	}
 }
 
 void
 FFT::getInfoPopupString(OP_String *info, void *reserved1)
 {
-	char tempBuffer[512];
-	snprintf(tempBuffer, sizeof(tempBuffer),
-		"TouchDesigner Custom FFT Plugin\n"
-		"Active Engine & Plan: %s\n"
-		"FFT Size: N = %zu | Buffer Capacity: %zu samples\n"
-		"Sample Rate: %.1f Hz (Nyquist: %.1f Hz)\n"
-		"SIMD Acceleration: AVX2 256-Bit FMA Vectorized",
-		myFFTEngine ? myFFTEngine->getPlanStatus().c_str() : "Uninitialized",
-		myFFTSize, myBufferCapacity, mySampleRate, mySampleRate / 2.0);
-	info->setString(tempBuffer);
+	std::string text = "TouchDesigner Custom FFT Plugin\n";
+	text += "Active Engine & Plan: " + (myFFTEngine ? myFFTEngine->getPlanStatus() : "Uninitialized") + "\n";
+	text += "FFT Size: N = " + std::to_string(myFFTSize) + " | Buffer Capacity: " + std::to_string(myBufferCapacity) + " samples\n";
+	text += "Sample Rate: " + std::to_string(mySampleRate) + " Hz\n";
+	text += "SIMD Acceleration: AVX2 256-Bit FMA Vectorized\n\n";
+	text += "--- Recent Plan Event Logs ---\n";
+	auto& logs = FFTDSP::getPlanLogHistory();
+	size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
+	for (size_t i = start_idx; i < logs.size(); ++i) {
+		text += logs[i] + "\n";
+	}
+	info->setString(text.c_str());
 }
 
 /**
