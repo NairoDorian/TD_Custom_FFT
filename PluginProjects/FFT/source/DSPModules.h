@@ -34,7 +34,6 @@ Processing Pipeline Overview:
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <fstream>
 #include <chrono>
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
 
@@ -54,18 +53,12 @@ inline std::vector<std::string>& getPlanLogHistory() {
 inline void logPlanEvent(const std::string& msg) {
     getPlanLogHistory().push_back(msg);
 
-    // Absolute file path guarantees fft_plan_log.txt is written directly inside Plugin_FFT root
-    std::ofstream logFile("c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT/fft_plan_log.txt", std::ios::app);
-    if (logFile.is_open()) {
-        logFile << msg << std::endl;
-    }
-
 #ifdef _WIN32
     HMODULE hPy = GetModuleHandleA("python311.dll");
     if (!hPy) hPy = GetModuleHandleA("python3.dll");
     if (!hPy) hPy = GetModuleHandleA("python312.dll");
     if (!hPy) hPy = GetModuleHandleA("python310.dll");
-    if (!hPy) hPy = GetModuleHandleA("python39.dll");
+    if (!hPy) hPy = GetModuleHandleA(NULL);
 
     if (hPy) {
         typedef enum { PyGILState_LOCKED, PyGILState_UNLOCKED } PyGILState_STATE;
@@ -77,15 +70,25 @@ inline void logPlanEvent(const std::string& msg) {
         auto pyRelease = reinterpret_cast<PyGILState_Release_t>(GetProcAddress(hPy, "PyGILState_Release"));
         auto pyRun = reinterpret_cast<PyRun_SimpleString_t>(GetProcAddress(hPy, "PyRun_SimpleString"));
 
-        if (pyEnsure && pyRelease && pyRun) {
-            PyGILState_STATE gstate = pyEnsure();
+        if (pyRun) {
+            PyGILState_STATE gstate = PyGILState_UNLOCKED;
+            if (pyEnsure) gstate = pyEnsure();
+
             std::string cleanMsg = msg;
             for (char& c : cleanMsg) {
-                if (c == '"' || c == '\\') c = '\'';
+                if (c == '"' || c == '\\' || c == '\n' || c == '\r') c = ' ';
             }
-            std::string pyScript = "import sys; print(\"" + cleanMsg + "\"); sys.stdout.flush()";
+
+            std::string pyScript = "import sys\n"
+                                 "try:\n"
+                                 "    sys.stdout.write('[FFT Plugin] " + cleanMsg + "\\n')\n"
+                                 "    sys.stdout.flush()\n"
+                                 "except:\n"
+                                 "    print('[FFT Plugin] " + cleanMsg + "')\n";
+
             pyRun(pyScript.c_str());
-            pyRelease(gstate);
+
+            if (pyRelease) pyRelease(gstate);
         }
     }
 #endif
