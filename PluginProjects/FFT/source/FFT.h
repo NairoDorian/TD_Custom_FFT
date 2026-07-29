@@ -150,13 +150,14 @@ private:
 	float				myPeakMagnitude{ 0.0f };   // Real-time peak spectral magnitude / dB
 
 	FFTDSP::PerceptualWarping myWarping;    // Psychoacoustic frequency warping manager
-	FFTDSP::FFTWEngine       myFFTWEngine; // FFTW3 hardware-tuned execution engine
+	std::unique_ptr<FFTDSP::IFFTEngine> myFFTEngine; // Polymorphic CPU/GPU FFT execution engine
 	std::vector<float>       myWeightingCurve; // Pre-calculated equal-loudness weighting curve
 	std::vector<float>       myWindowBuffer;   // Pre-calculated audio tapering window shape
 
 	std::vector<ChannelState> myChannels;  // Per-channel state vector
 
 	// Parameter Caching fields to eliminate redundant DSP recalculations
+	int    myCachedEngine{ -1 };
 	int    myCachedScale{ -1 };
 	double myCachedDisplayMax{ -1.0 };
 	int    myCachedBins{ -1 };
@@ -170,7 +171,7 @@ private:
 	/**
 	 * @brief Rebuilds DSP buffer capacities and hardware-benchmarks FFTW plans when FFT size changes.
 	 */
-	void rebuildDSP(double sr, int winSamples, int padChoice, int numBins);
+	void rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int numBins);
 
 	/**
 	 * @brief Updates psychoacoustic warping lookup tables, weighting curves, and window shapes.

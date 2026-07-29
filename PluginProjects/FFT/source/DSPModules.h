@@ -36,6 +36,7 @@ Processing Pipeline Overview:
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
 
 #include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
+#include "IFFTEngine.h"
 
 namespace FFTDSP {
 
@@ -739,10 +740,10 @@ High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 ve
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
 - 2x Unrolled AVX2 Vectorized Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
 */
-class FFTWEngine {
+class FFTWEngine : public IFFTEngine {
 public:
     FFTWEngine() = default;
-    ~FFTWEngine() {
+    ~FFTWEngine() override {
         destroyPlan();
     }
 
@@ -775,7 +776,7 @@ public:
         m_fft_size = 0;
     }
 
-    void prepare(size_t fft_size) {
+    void prepare(size_t fft_size) override {
         if (m_fft_size == fft_size && m_plan != nullptr) {
             return;
         }
@@ -799,9 +800,9 @@ public:
         if (dummy_out) fftwf_free(dummy_out);
     }
 
-    inline void executeRFFT(const std::vector<float>& padded_signal,
-                           std::vector<float>& magnitude_spectrum,
-                           std::vector<std::complex<float>>& scratch_complex) const noexcept {
+    void executeRFFT(const std::vector<float>& padded_signal,
+                     std::vector<float>& magnitude_spectrum,
+                     std::vector<std::complex<float>>& scratch_complex) const noexcept override {
         size_t n = padded_signal.size();
         size_t n_complex = n / 2 + 1;
 

@@ -37,6 +37,17 @@ void setup(TD::OP_ParameterManager* manager)
 	{
 		TD::OP_StringParameter sp;
 		sp.page = "Spectrum";
+		sp.name = EngineName;
+		sp.label = EngineLabel;
+		sp.defaultValue = "Fftw3";
+
+		const char *names[]  = { "Fftw3", "Mkl", "Cufft", "Vkfft", "Cufftdx" };
+		const char *labels[] = { "CPU (FFTW3 AVX2)", "CPU (Intel oneMKL / IPP)", "GPU (NVIDIA cuFFT)", "GPU (VkFFT CUDA/Vulkan)", "GPU Fused (cuFFTDx)" };
+		manager->appendMenu(sp, 5, names, labels);
+	}
+	{
+		TD::OP_StringParameter sp;
+		sp.page = "Spectrum";
 		sp.name = ScaleName;
 		sp.label = ScaleLabel;
 		sp.defaultValue = "Log";

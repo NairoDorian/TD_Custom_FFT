@@ -18,6 +18,9 @@ logic into a dedicated module.
 
 namespace Parameters {
     // --- Page 1: Spectrum Parameters ---
+    constexpr char EngineName[]       = "Engine";
+    constexpr char EngineLabel[]      = "FFT Engine";
+
     constexpr char ScaleName[]        = "Scale";
     constexpr char ScaleLabel[]       = "Scale";
 

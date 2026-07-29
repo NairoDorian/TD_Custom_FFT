@@ -49,6 +49,10 @@
  */
 
 #include "FFT.h"
+#include "MKLEngine.h"
+#include "CUDAFFTEngine.h"
+#include "VkFFTEngine.h"
+#include "CUFFTDxEngine.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -198,7 +202,7 @@ FFT::getChannelName(int32_t index, OP_String *name, const OP_Inputs* inputs, voi
  * - Zero-fills padded_frame ONCE during DSP rebuild so boundary zeroes stay persistent.
  */
 void
-FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
+FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int numBins)
 {
 	mySampleRate = sr;
 	myBufferCapacity = std::max<size_t>(1, static_cast<size_t>(winSamples));
@@ -210,8 +214,29 @@ FFT::rebuildDSP(double sr, int winSamples, int padChoice, int numBins)
 	}
 	myFFTSize = std::max<size_t>(pad_size, std::max<size_t>(needed, 2));
 
-	// Pre-benchmark hardware-optimized FFTW3 plan for new FFT size
-	myFFTWEngine.prepare(myFFTSize);
+	// Instantiate selected CPU or GPU FFT Engine strategy
+	switch (engineChoice) {
+		case 1: // CPU (Intel oneMKL / IPP)
+			myFFTEngine = std::make_unique<FFTDSP::MKLEngine>();
+			break;
+		case 2: // GPU (NVIDIA cuFFT)
+			myFFTEngine = std::make_unique<FFTDSP::CUDAFFTEngine>();
+			break;
+		case 3: // GPU (VkFFT CUDA/Vulkan)
+			myFFTEngine = std::make_unique<FFTDSP::VkFFTEngine>();
+			break;
+		case 4: // GPU Fused (cuFFTDx)
+			myFFTEngine = std::make_unique<FFTDSP::CUFFTDxEngine>();
+			break;
+		case 0: // CPU (FFTW3 AVX2)
+		default:
+			myFFTEngine = std::make_unique<FFTDSP::FFTWEngine>();
+			break;
+	}
+
+	if (myFFTEngine) {
+		myFFTEngine->prepare(myFFTSize);
+	}
 
 	// Resize per-channel circular buffers, pre-zero padded_frame ONCE, and reset EQ states
 	for (auto& ch : myChannels) {
@@ -273,6 +298,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	myExecuteCount++;
 
 	// Fetch UI parameter values from TouchDesigner
+	int engine_choice   = inputs->getParInt("Engine");
 	int scale          = inputs->getParInt("Scale");
 	double display_max = inputs->getParDouble("Displaymax");
 	int bins           = inputs->getParInt("Bins");
@@ -313,13 +339,14 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 
 	// Check if DSP engine rebuild is required
 	bool rebuild_needed = false;
-	if (std::abs(sr - mySampleRate) > 1e-3 || static_cast<size_t>(win_samples) != myBufferCapacity || pad_choice != myCachedPadChoice) {
+	if (std::abs(sr - mySampleRate) > 1e-3 || static_cast<size_t>(win_samples) != myBufferCapacity || pad_choice != myCachedPadChoice || engine_choice != myCachedEngine || !myFFTEngine) {
 		rebuild_needed = true;
 	}
 
 	if (rebuild_needed) {
-		rebuildDSP(sr, win_samples, pad_choice, bins);
+		rebuildDSP(engine_choice, sr, win_samples, pad_choice, bins);
 		myCachedPadChoice = pad_choice;
+		myCachedEngine = engine_choice;
 	}
 
 	// Resize channel state array if channel count changed
@@ -394,8 +421,10 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 			pad_data[wi] = proc_data[wi] * win_data[wi];
 		}
 
-		// 6. Execute FFTW3 Real-to-Complex Transform & 2x Unrolled AVX2 SIMD Magnitude Calculation
-		myFFTWEngine.executeRFFT(st.padded_frame, st.rfft_magnitude, st.scratch_complex);
+		// 6. Execute selected Real-to-Complex FFT Transform (CPU or GPU)
+		if (myFFTEngine) {
+			myFFTEngine->executeRFFT(st.padded_frame, st.rfft_magnitude, st.scratch_complex);
+		}
 
 		// 7. Apply Psychoacoustic Frequency Scale Warping (Log/Mel/ERB/Bark/Chroma with Identity Bypass)
 		myWarping.applyWarp(st.rfft_magnitude, st.warped_spectrum);
