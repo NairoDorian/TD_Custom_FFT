@@ -853,19 +853,37 @@ public:
 inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_complex) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
-    size_t n_vec = n_complex / 8;
-    for (; i < n_vec * 8; i += 8) {
-        __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);     // [R0, I0, R1, I1, R2, I2, R3, I3]
-        __m256 cB = _mm256_loadu_ps(raw_c + 2 * i + 8); // [R4, I4, R5, I5, R6, I6, R7, I7]
+    size_t n_vec16 = n_complex / 16;
+    for (; i < n_vec16 * 16; i += 16) {
+        // Block 1 (bins 0..7)
+        __m256 cA0 = _mm256_loadu_ps(raw_c + 2 * i);
+        __m256 cB0 = _mm256_loadu_ps(raw_c + 2 * i + 8);
+        __m256 re0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(2, 0, 2, 0));
+        __m256 im0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(3, 1, 3, 1));
+        __m256 sum0 = _mm256_fmadd_ps(re0, re0, _mm256_mul_ps(im0, im0));
+        __m256 mag0 = _mm256_sqrt_ps(sum0);
+        __m256 ord0 = _mm256_permute4x64_ps(mag0, _MM_SHUFFLE(3, 1, 2, 0));
+        _mm256_storeu_ps(mptr + i, ord0);
 
-        __m256 re = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(2, 0, 2, 0)); // [R0, R1, R4, R5, R2, R3, R6, R7]
-        __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1)); // [I0, I1, I4, I5, I2, I3, I6, I7]
-
-        __m256 sum_sq = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
-        __m256 mag = _mm256_sqrt_ps(sum_sq);
-
-        __m256 mag_ordered = _mm256_permute4x64_ps(mag, _MM_SHUFFLE(3, 1, 2, 0));
-        _mm256_storeu_ps(mptr + i, mag_ordered);
+        // Block 2 (bins 8..15)
+        __m256 cA1 = _mm256_loadu_ps(raw_c + 2 * i + 16);
+        __m256 cB1 = _mm256_loadu_ps(raw_c + 2 * i + 24);
+        __m256 re1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(2, 0, 2, 0));
+        __m256 im1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(3, 1, 3, 1));
+        __m256 sum1 = _mm256_fmadd_ps(re1, re1, _mm256_mul_ps(im1, im1));
+        __m256 mag1 = _mm256_sqrt_ps(sum1);
+        __m256 ord1 = _mm256_permute4x64_ps(mag1, _MM_SHUFFLE(3, 1, 2, 0));
+        _mm256_storeu_ps(mptr + i + 8, ord1);
+    }
+    for (; i + 7 < n_complex; i += 8) {
+        __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
+        __m256 cB = _mm256_loadu_ps(raw_c + 2 * i + 8);
+        __m256 re = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(2, 0, 2, 0));
+        __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1));
+        __m256 sum = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
+        __m256 mag = _mm256_sqrt_ps(sum);
+        __m256 ord = _mm256_permute4x64_ps(mag, _MM_SHUFFLE(3, 1, 2, 0));
+        _mm256_storeu_ps(mptr + i, ord);
     }
 #endif
     for (; i < n_complex; ++i) {
@@ -881,9 +899,9 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
 ===========================================================================
 High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 vector SIMD.
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
-- FFTW_EXHAUSTIVE Hardware Benchmarking: Deep benchmarks assembly kernels on target CPU during plan creation.
+- FFTW_PATIENT Hardware Benchmarking: Deep benchmarks assembly kernels on target CPU during plan creation.
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
-- FMA SIMD Parallel Magnitude Spectrum: Evaluates 8 complex magnitude values per loop iteration.
+- FMA SIMD Parallel Magnitude Spectrum: Evaluates 16 complex magnitude values per loop iteration.
 */
 class FFTWEngine : public IFFTEngine {
 public:

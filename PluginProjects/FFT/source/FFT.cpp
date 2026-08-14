@@ -156,7 +156,7 @@ FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserve
 		info->startIndex = 0;
 		info->numChannels = cinput->numChannels;
 		info->numSamples = bins;
-		info->sampleRate = bins;
+		info->sampleRate = cinput->sampleRate;
 	}
 	else
 	{
@@ -624,7 +624,7 @@ FFT::getInfoPopupString(OP_String *info, void *reserved1)
 	text += "Active Engine & Plan: " + (myFFTEngine ? myFFTEngine->getPlanStatus() : "Uninitialized") + "\n";
 	text += "FFT Size: N = " + std::to_string(myFFTSize) + " | Buffer Capacity: " + std::to_string(myBufferCapacity) + " samples\n";
 	text += "Sample Rate: " + std::to_string(mySampleRate) + " Hz\n";
-	text += "SIMD Acceleration: AVX2 256-Bit FMA Vectorized\n\n";
+	text += "SIMD Acceleration: AVX2 256-Bit FMA Vectorized (2x Unrolled)\n\n";
 	text += "--- Recent Plan Event Logs ---\n";
 	auto& logs = FFTDSP::getPlanLogHistory();
 	size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
@@ -632,6 +632,22 @@ FFT::getInfoPopupString(OP_String *info, void *reserved1)
 		text += logs[i] + "\n";
 	}
 	info->setString(text.c_str());
+}
+
+void
+FFT::getWarningString(OP_String *warning, void *reserved1)
+{
+	if (myExecuteCount > 0 && myBufferCapacity > myFFTSize) {
+		warning->setString("Window sampling size exceeds zero-padded FFT size; audio window will be clipped.");
+	}
+}
+
+void
+FFT::getErrorString(OP_String *error, void *reserved1)
+{
+	if (mySampleRate <= 0.0) {
+		error->setString("Invalid or missing audio sample rate from input CHOP.");
+	}
 }
 
 /**
