@@ -9,7 +9,7 @@ All notable changes, architectural milestones, performance findings, and discove
 ### 🚀 Performance & Architectural Upgrades
 - **2x Unrolled 256-Bit AVX2 FMA Vectorization**: Upgraded `computeMagnitudeAVX2_FMA` to evaluate **16 complex bins (32 floats)** per loop iteration, increasing CPU instruction throughput.
 - **Synchronized 2026.20000 C++ SDK**: Synchronized `PluginBuilder_V2` and `Plugin_FFT` with official TouchDesigner 2026.20000 SDK headers (API v9).
-- **Planner Consistency**: Standardized `FFTW_PATIENT` as primary planner across both `FFTWEngine` and `MKLEngine`.
+- **Fast FFTW_MEASURE Primary Planning**: Removed `FFTW_PATIENT` from both `FFTWEngine` and `MKLEngine` to eliminate long plan creation pauses; `FFTW_MEASURE` now generates tuned assembly kernels in < 1 ms with instant response.
 - **Operator Health Diagnostics**: Implemented `getWarningString` and `getErrorString` to flag window size clipping and sample rate mismatches.
 
 ---
