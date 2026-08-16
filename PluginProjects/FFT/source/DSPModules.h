@@ -465,7 +465,7 @@ public:
         switch (scale_code) {
             case 0: { // Logarithmic Scale
                 double floor_hz = std::max(1.0, log_floor_hz);
-                double fmin = std::min(floor_hz, std::min(0.5 * fmax, std::max(1.0, fmax * 0.1)));
+                double fmin = floor_hz;
                 double log_min = std::log(fmin);
                 double log_max = std::log(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
@@ -514,7 +514,7 @@ public:
                 double m_min = htkHzToMel(0.0);
                 double m_max = htkHzToMel(fmax);
                 double floor_hz = std::max(1.0, log_floor_hz);
-                double fmin = std::min(floor_hz, std::min(0.5 * fmax, std::max(1.0, fmax * 0.1)));
+                double fmin = floor_hz;
                 double log_min = std::log(fmin);
                 double log_max = std::log(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
