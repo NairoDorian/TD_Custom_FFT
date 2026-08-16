@@ -172,15 +172,34 @@ private:
 	int    myCachedWeighting{ -1 };
 	int    myCachedPadChoice{ -1 };
 
+	// Crash-guard diagnostics: records which execute() stage was running when an
+	// exception was caught, so the failing phase is visible in the plan log / Textport.
+	int    myExecStage{ 0 };
+
 	/**
 	 * @brief Rebuilds DSP buffer capacities and hardware-benchmarks FFTW plans when FFT size changes.
 	 */
 	void rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int numBins);
 
 	/**
+	 * @brief Internal implementation of rebuildDSP (exception-safe wrapper calls this).
+	 */
+	void rebuildDSPInternal(int engineChoice, double sr, int winSamples, int padChoice, int numBins);
+
+	/**
 	 * @brief Updates psychoacoustic warping lookup tables, weighting curves, and window shapes.
 	 */
 	void updateWarpingAndWindow(int scale, double displayMax, int bins, double warp, double logFloor, int winType, int kaiserBeta, int weighting);
+
+	/**
+	 * @brief Body of execute() with stage markers and defensive clamps on host-provided values.
+	 */
+	void executeImpl(CHOP_Output* output, const OP_Inputs* inputs);
+
+	/**
+	 * @brief Zeros the output CHOP within safe bounds after a caught exception.
+	 */
+	void zeroOutputSafe(CHOP_Output* output) noexcept;
 };
 
 #endif // FFT_H

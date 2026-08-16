@@ -42,6 +42,9 @@ namespace Parameters {
     constexpr char PadName[]          = "Pad";
     constexpr char PadLabel[]         = "Zero-Pad Len";
 
+    // Zero-padded FFT transform length choices, indexed by the "Pad" menu (matches menu order in Parameters.cpp)
+    inline constexpr int kPadValues[7] = { 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
+
     // --- Page 2: EQ Parameters ---
     constexpr char GaindbName[]       = "Gaindb";
     constexpr char GaindbLabel[]      = "High Boost dB";

@@ -28,8 +28,8 @@
  * 2. Multi-Channel Input Processing Loop (execute()):
  *    - Step A: Fetches current UI parameter states from TouchDesigner's OP_Inputs manager.
  *    - Step B: Checks parameter caches. If window size or FFT pad choice changed,
- *              triggers rebuildDSP(), which pre-computes hardware-tuned FFTW plans
- *              via FFTW_MEASURE and zero-fills padded_frame once.
+ *              triggers rebuildDSP(), which pre-computes instant FFTW plans
+ *              via FFTW_ESTIMATE and zero-fills padded_frame once.
  *    - Step C: If psychoacoustic scale or window type changed, triggers updateWarpingAndWindow(),
  *              which builds unrolled frequency index lookup tables with identity bypass.
  *    - Step D: Loops through each audio channel:
@@ -56,6 +56,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <immintrin.h> // AVX2 (Advanced Vector Extensions 2) SIMD Compiler Intrinsics
+#include <exception>
 
 /// C-ABI Exported Functions for TouchDesigner Plugin Architecture
 extern "C"
@@ -108,8 +109,57 @@ DestroyCHOPInstance(CHOP_CPlusPlusBase* instance)
 
 } // extern "C"
 
-// Pre-defined menu choices for zero-padded FFT sizes (1024 to 65536)
-static const int PAD_VALUES[7] = { 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
+namespace {
+
+// Applies the tapering window into the active slice of the zero-padded frame (2x unrolled AVX2)
+inline void applyWindow(const float* proc_data, const float* win_data, float* pad_data, size_t len) {
+	size_t wi = 0;
+#if defined(__AVX2__)
+	for (; wi + 15 < len; wi += 16) {
+		__m256 p0 = _mm256_loadu_ps(proc_data + wi);
+		__m256 w0 = _mm256_loadu_ps(win_data + wi);
+		_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p0, w0));
+
+		__m256 p1 = _mm256_loadu_ps(proc_data + wi + 8);
+		__m256 w1 = _mm256_loadu_ps(win_data + wi + 8);
+		_mm256_storeu_ps(pad_data + wi + 8, _mm256_mul_ps(p1, w1));
+	}
+	for (; wi + 7 < len; wi += 8) {
+		__m256 p = _mm256_loadu_ps(proc_data + wi);
+		__m256 w = _mm256_loadu_ps(win_data + wi);
+		_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p, w));
+	}
+#endif
+	for (; wi < len; ++wi) {
+		pad_data[wi] = proc_data[wi] * win_data[wi];
+	}
+}
+
+// Multiplies the spectrum by the equal-loudness weighting curve in place (2x unrolled AVX2)
+inline void applyWeightingCurve(float* spectrum, const float* curve, size_t len) {
+	size_t wk = 0;
+#if defined(__AVX2__)
+	for (; wk + 15 < len; wk += 16) {
+		__m256 s0 = _mm256_loadu_ps(spectrum + wk);
+		__m256 c0 = _mm256_loadu_ps(curve + wk);
+		_mm256_storeu_ps(spectrum + wk, _mm256_mul_ps(s0, c0));
+
+		__m256 s1 = _mm256_loadu_ps(spectrum + wk + 8);
+		__m256 c1 = _mm256_loadu_ps(curve + wk + 8);
+		_mm256_storeu_ps(spectrum + wk + 8, _mm256_mul_ps(s1, c1));
+	}
+	for (; wk + 7 < len; wk += 8) {
+		__m256 s = _mm256_loadu_ps(spectrum + wk);
+		__m256 c = _mm256_loadu_ps(curve + wk);
+		_mm256_storeu_ps(spectrum + wk, _mm256_mul_ps(s, c));
+	}
+#endif
+	for (; wk < len; ++wk) {
+		spectrum[wk] *= curve[wk];
+	}
+}
+
+} // anonymous namespace
 
 /**
  * @brief Constructor: Sets up default internal state variables.
@@ -189,16 +239,15 @@ FFT::getChannelName(int32_t index, OP_String *name, const OP_Inputs* inputs, voi
 }
 
 /**
- * @brief Rebuilds DSP buffer sizes and pre-benchmarks hardware-tuned FFTW plans.
+ * @brief Rebuilds DSP buffer capacities and FFTW plans when FFT size changes.
  *
  * PERFORMANCE EXPLANATION:
- * - FFTW_MEASURE: Benchmarks multiple SIMD assembly routines on your CPU hardware
- *   during plan creation, selecting the absolute fastest kernel for your processor.
+ * - FFTW_ESTIMATE: Instant, allocation-light plan creation (no benchmark sweep).
  * - Calling prepare() here ensures zero plan creation overhead inside execute().
  * - Zero-fills padded_frame ONCE during DSP rebuild so boundary zeroes stay persistent.
  */
 void
-FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int numBins)
+FFT::rebuildDSPInternal(int engineChoice, double sr, int winSamples, int padChoice, int numBins)
 {
 	mySampleRate = sr;
 	myBufferCapacity = std::max<size_t>(1, static_cast<size_t>(winSamples));
@@ -221,19 +270,38 @@ FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int 
 			break;
 	}
 
+	// Update cache FIRST so a failed prepare() doesn't trigger endless retries
+	myCachedPadChoice = padChoice;
+	myCachedEngine = engineChoice;
+	myCachedScale = -1;
+
 	if (myFFTEngine) {
 		myFFTEngine->prepare(myFFTSize);
 	}
 
 	// Resize per-channel circular buffers, pre-zero padded_frame ONCE, and reset EQ states
 	for (auto& ch : myChannels) {
-		ch.fifo.resize(myBufferCapacity);
-		ch.padded_frame.assign(myFFTSize, 0.0f); // Pre-zero padded_frame ONCE on rebuild
+		ch.initBuffers(myBufferCapacity, myFFTSize, static_cast<size_t>(numBins)); // Pre-zero padded_frame ONCE on rebuild
 		ch.eq.setSampleRate(sr);
 		ch.prev_spectrum.clear();
 	}
+}
 
-	myCachedScale = -1; // Invalidate parameter cache
+/**
+ * @brief Exception-safe wrapper around rebuildDSPInternal().
+ */
+void
+FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int numBins)
+{
+	try {
+		rebuildDSPInternal(engineChoice, sr, winSamples, padChoice, numBins);
+	} catch (const std::exception& e) {
+		FFTDSP::logPlanEvent("[FFT Plugin] ERROR: Caught exception in rebuildDSP: " + std::string(e.what()) + " — retaining previous DSP state");
+		if (!myFFTEngine) {
+			myFFTEngine = std::make_unique<FFTDSP::FFTWEngine>();
+			myFFTEngine->prepare(myFFTSize);
+		}
+	}
 }
 
 /**
@@ -267,23 +335,47 @@ FFT::updateWarpingAndWindow(int scale, double displayMax, int bins, double warp,
 }
 
 /**
- * @brief Primary real-time execution loop called 60-120 times per second by TouchDesigner.
+ * @brief Zeros the output CHOP within safe bounds after a caught exception, ensuring
+ *        TouchDesigner receives silence instead of garbage or null pointer dereference.
+ */
+void
+FFT::zeroOutputSafe(CHOP_Output* output) noexcept
+{
+	if (!output || !output->channels) return;
+	int chans = std::max(0, std::min(output->numChannels, 64));
+	int samples = std::max(0, output->numSamples);
+	for (int c = 0; c < chans; ++c) {
+		if (output->channels[c]) {
+			std::memset(output->channels[c], 0, samples * sizeof(float));
+		}
+	}
+}
+
+/**
+ * @brief Internal implementation of execute() — the full FFT analysis pipeline.
+ *        The public execute() wrapper provides crash protection around this.
  *
  * HARDWARE & LATENCY OPTIMIZATION HIGHLIGHTS:
  * 1. Zero Allocation & Persistent Zero-Padding: All work vectors are pre-sized during rebuildDSP().
  *    Zero-filling of padded_frame is executed ONCE during rebuild, eliminating millions of zero-writes per second.
  * 2. EQ & Ballistics Bypass: Memory copies are completely skipped when EQ or envelope ballistics are disabled.
  * 3. 2x Unrolled AVX2 SIMD Windowing: Multiplies audio samples by window values 16 floats per cycle into active slice.
- * 4. FFTW3 R2C Execution: Executes fftwf_execute_dft_r2c with 0 plan creation overhead.
+ * 4. FFT R2C Execution: Executes FFT plan with 0 plan creation overhead (FFTW_ESTIMATE).
  * 5. 2x Unrolled AVX2 Magnitude Calculation: Evaluates 8 complex bins per iteration using 256-bit SIMD registers.
  * 6. Identity Warp Bypass: Uses fast memcpy when spectrum mapping is 1-to-1 linear identity.
  * 7. Fast Direct Output Copy: Uses std::memcpy to write output channels to TouchDesigner memory.
  */
 void
-FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
+FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 {
 	myExecuteCount++;
 
+	// Defensive: null-check and clamp host-provided values
+	if (!output || !output->channels || !inputs) {
+		return;
+	}
+
+	myExecStage = 1; // Parameter fetch
 	// Fetch UI parameter values from TouchDesigner
 	int engine_choice   = inputs->getParInt("Engine");
 	int scale          = inputs->getParInt("Scale");
@@ -311,7 +403,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	double release     = inputs->getParDouble("Release");
 	int pad_idx        = inputs->getParInt("Pad");
 
-	int pad_choice = (pad_idx >= 0 && pad_idx < 7) ? PAD_VALUES[pad_idx] : 32768;
+	int pad_choice = (pad_idx >= 0 && pad_idx < 7) ? Parameters::kPadValues[pad_idx] : 32768;
 	if (bins <= 0) bins = 16384;
 	if (display_max <= 0.0) display_max = 24000.0;
 
@@ -323,7 +415,10 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	if (cinput && cinput->sampleRate > 0) {
 		sr = cinput->sampleRate;
 	}
+	// Defensive clamp: sample rate to a sane range
+	sr = std::max(1.0, std::min(192000.0, sr));
 
+	myExecStage = 2; // DSP rebuild
 	// Check if DSP engine rebuild is required
 	bool rebuild_needed = false;
 	if (std::abs(sr - mySampleRate) > 1e-3 || static_cast<size_t>(win_samples) != myBufferCapacity || pad_choice != myCachedPadChoice || engine_choice != myCachedEngine || !myFFTEngine) {
@@ -332,21 +427,20 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 
 	if (rebuild_needed) {
 		rebuildDSP(engine_choice, sr, win_samples, pad_choice, bins);
-		myCachedPadChoice = pad_choice;
-		myCachedEngine = engine_choice;
 	}
 
+	myExecStage = 3; // Channel resize
 	// Resize channel state array if channel count changed
-	int num_channels = output->numChannels;
+	int num_channels = std::max(0, std::min(64, output->numChannels));
 	if (static_cast<int>(myChannels.size()) != num_channels) {
 		myChannels.resize(num_channels, ChannelState());
 		for (auto& ch : myChannels) {
-			ch.fifo.resize(myBufferCapacity);
-			ch.padded_frame.assign(myFFTSize, 0.0f);
+			ch.initBuffers(myBufferCapacity, myFFTSize, static_cast<size_t>(bins));
 			ch.eq.setSampleRate(mySampleRate);
 		}
 	}
 
+	myExecStage = 4; // Warping & windowing update
 	// Recalculate warping lookup tables and window buffers if UI parameters changed
 	if (myCachedScale != scale || std::abs(myCachedDisplayMax - display_max) > 1e-3 ||
 		myCachedBins != bins || std::abs(myCachedWarp - warp) > 1e-5 ||
@@ -359,6 +453,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	// Calculate zero-padding start offset to center windowed audio in FFT frame
 	size_t pad_start = (myFFTSize > myBufferCapacity) ? ((myFFTSize - myBufferCapacity) / 2) : 0;
 
+	myExecStage = 5; // Per-channel processing
 	// Iterate through each audio channel independently
 	for (int ch = 0; ch < num_channels; ++ch) {
 		ChannelState& st = myChannels[ch];
@@ -386,27 +481,8 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 		float* pad_data = st.padded_frame.data() + pad_start;
 		size_t win_len = std::min(myBufferCapacity, myWindowBuffer.size());
 
-		// 5. 2x Unrolled AVX2 SIMD Windowing Loop (Multiplies 16 floats per loop iteration)
-		size_t wi = 0;
-#if defined(__AVX2__)
-		for (; wi + 15 < win_len; wi += 16) {
-			__m256 p0 = _mm256_loadu_ps(proc_data + wi);
-			__m256 w0 = _mm256_loadu_ps(win_data + wi);
-			_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p0, w0));
-
-			__m256 p1 = _mm256_loadu_ps(proc_data + wi + 8);
-			__m256 w1 = _mm256_loadu_ps(win_data + wi + 8);
-			_mm256_storeu_ps(pad_data + wi + 8, _mm256_mul_ps(p1, w1));
-		}
-		for (; wi + 7 < win_len; wi += 8) {
-			__m256 p = _mm256_loadu_ps(proc_data + wi);
-			__m256 w = _mm256_loadu_ps(win_data + wi);
-			_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p, w));
-		}
-#endif
-		for (; wi < win_len; ++wi) {
-			pad_data[wi] = proc_data[wi] * win_data[wi];
-		}
+		// 5. 2x Unrolled AVX2 SIMD Windowing (16 floats per loop iteration)
+		applyWindow(proc_data, win_data, pad_data, win_len);
 
 		// 6. Execute selected Real-to-Complex FFT Transform (CPU or GPU)
 		if (myFFTEngine) {
@@ -418,29 +494,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 
 		// 8. Apply Equal-Loudness Weighting Curve (2x Unrolled AVX2 SIMD)
 		if (weighting != 0 && myWeightingCurve.size() == st.warped_spectrum.size()) {
-			float* w_spec = st.warped_spectrum.data();
-			const float* w_curve = myWeightingCurve.data();
-			size_t w_len = st.warped_spectrum.size();
-			size_t wk = 0;
-#if defined(__AVX2__)
-			for (; wk + 15 < w_len; wk += 16) {
-				__m256 s0 = _mm256_loadu_ps(w_spec + wk);
-				__m256 c0 = _mm256_loadu_ps(w_curve + wk);
-				_mm256_storeu_ps(w_spec + wk, _mm256_mul_ps(s0, c0));
-
-				__m256 s1 = _mm256_loadu_ps(w_spec + wk + 8);
-				__m256 c1 = _mm256_loadu_ps(w_curve + wk + 8);
-				_mm256_storeu_ps(w_spec + wk + 8, _mm256_mul_ps(s1, c1));
-			}
-			for (; wk + 7 < w_len; wk += 8) {
-				__m256 s = _mm256_loadu_ps(w_spec + wk);
-				__m256 c = _mm256_loadu_ps(w_curve + wk);
-				_mm256_storeu_ps(w_spec + wk, _mm256_mul_ps(s, c));
-			}
-#endif
-			for (; wk < w_len; ++wk) {
-				w_spec[wk] *= w_curve[wk];
-			}
+			applyWeightingCurve(st.warped_spectrum.data(), myWeightingCurve.data(), st.warped_spectrum.size());
 		}
 
 		// 9. Convert spectrum magnitudes to Decibels (dB) with parallel peak search & pre-computed db_offset
@@ -481,6 +535,26 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 				myPeakFrequencyHz = static_cast<float>(target_hz[max_idx]);
 			}
 		}
+	}
+
+	myExecStage = 0; // Reset stage marker on successful completion
+}
+
+/**
+ * @brief Exception-safe entry point for TouchDesigner. Wraps executeImpl() in a
+ *        try/catch so a single bad frame zeros output instead of crashing.
+ */
+void
+FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
+{
+	try {
+		executeImpl(output, inputs);
+	} catch (const std::exception& e) {
+		FFTDSP::logPlanEvent("[FFT Plugin] ERROR: Caught exception in execute() at stage " + std::to_string(myExecStage) + ": " + std::string(e.what()) + " — zeroing output channels");
+		zeroOutputSafe(output);
+	} catch (...) {
+		FFTDSP::logPlanEvent("[FFT Plugin] ERROR: Caught unknown exception in execute() at stage " + std::to_string(myExecStage) + " — zeroing output channels");
+		zeroOutputSafe(output);
 	}
 }
 

@@ -7,6 +7,9 @@ lib/
 *.ilk
 *.exp
 
+# Plugin deploy artifacts (previous DLL kept briefly by the post-build script)
+*.dll.old
+
 # Visual Studio & IDE temporary files
 .vs/
 launch.vs.json.user

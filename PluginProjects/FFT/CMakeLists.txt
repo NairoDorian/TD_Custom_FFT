@@ -41,8 +41,8 @@ endif()
 
 project (FFT LANGUAGES CXX)
 
-# PluginBuilder SDK paths
-set(PLUGIN_BUILDER_DIR "C:\\Users\\Z\\Downloads\\PROJECTS\\TD_PROJECTS\\PluginBuilder\\PluginBuilder_V2" CACHE PATH "Path to PluginBuilder directory" FORCE)
+# PluginBuilder SDK paths (resolved relative to this project so the repo is relocatable)
+set(PLUGIN_BUILDER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../PluginBuilder_V2" CACHE PATH "Path to PluginBuilder directory" FORCE)
 set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../__Plugins__/FFT")
 set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/source)
 
@@ -131,6 +131,16 @@ endif()
 # MSVC Compiler & Linker Optimization Flags for Ultra Real-Time Performance
 if(DEFINED ENV{PLUGINBUILDER_BUILD})
   message(STATUS "PluginBuilder is building FFT")
+  if(MSVC)
+    # /O2: Maximize speed optimization
+    # /Oi: Enable intrinsic functions
+    # /Ot: Favor fast code over small code
+    # /fp:fast: Enable fast floating-point math optimizations
+    # /arch:AVX2: Generate 256-bit AVX2 & FMA vector instructions
+    target_compile_options(FFT PRIVATE /O2 /Oi /Ot /fp:fast /arch:AVX2)
+    target_compile_options(FFT PUBLIC "/Zi")
+    target_link_options(FFT PUBLIC "/INCREMENTAL")
+  endif()
 else()  
   if(MSVC)
     # /O2: Maximize speed optimization

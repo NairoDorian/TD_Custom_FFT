@@ -31,6 +31,7 @@ Processing Pipeline Overview:
 #include <complex>
 #include <algorithm>
 #include <tuple>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -45,52 +46,77 @@ Processing Pipeline Overview:
 
 namespace FFTDSP {
 
+// Maximum number of plan events retained for Info DAT export / Info popup (prevents unbounded growth)
+constexpr size_t kMaxPlanLogEntries = 256;
+
 inline std::vector<std::string>& getPlanLogHistory() {
     static std::vector<std::string> history;
     return history;
 }
 
-inline void logPlanEvent(const std::string& msg) {
-    getPlanLogHistory().push_back(msg);
-
 #ifdef _WIN32
+namespace python_logger {
+
+// Minimal subset of the CPython C API resolved dynamically at runtime (no Python dev headers required)
+enum class GILState { Locked, Unlocked };
+using EnsureFn = GILState(*)(void);
+using ReleaseFn = void(*)(GILState);
+using RunFn = int(*)(const char*);
+
+inline HMODULE resolvePythonModule() {
     HMODULE hPy = GetModuleHandleA("python311.dll");
     if (!hPy) hPy = GetModuleHandleA("python3.dll");
     if (!hPy) hPy = GetModuleHandleA("python312.dll");
     if (!hPy) hPy = GetModuleHandleA("python310.dll");
     if (!hPy) hPy = GetModuleHandleA(NULL);
+    return hPy;
+}
 
-    if (hPy) {
-        typedef enum { PyGILState_LOCKED, PyGILState_UNLOCKED } PyGILState_STATE;
-        typedef PyGILState_STATE (*PyGILState_Ensure_t)(void);
-        typedef void (*PyGILState_Release_t)(PyGILState_STATE);
-        typedef int (*PyRun_SimpleString_t)(const char*);
-
-        auto pyEnsure = reinterpret_cast<PyGILState_Ensure_t>(GetProcAddress(hPy, "PyGILState_Ensure"));
-        auto pyRelease = reinterpret_cast<PyGILState_Release_t>(GetProcAddress(hPy, "PyGILState_Release"));
-        auto pyRun = reinterpret_cast<PyRun_SimpleString_t>(GetProcAddress(hPy, "PyRun_SimpleString"));
-
-        if (pyRun) {
-            PyGILState_STATE gstate = PyGILState_UNLOCKED;
-            if (pyEnsure) gstate = pyEnsure();
-
-            std::string cleanMsg = msg;
-            for (char& c : cleanMsg) {
-                if (c == '"' || c == '\\' || c == '\n' || c == '\r') c = ' ';
-            }
-
-            std::string pyScript = "import sys\n"
-                                 "try:\n"
-                                 "    sys.stdout.write('[FFT Plugin] " + cleanMsg + "\\n')\n"
-                                 "    sys.stdout.flush()\n"
-                                 "except:\n"
-                                 "    print('[FFT Plugin] " + cleanMsg + "')\n";
-
-            pyRun(pyScript.c_str());
-
-            if (pyRelease) pyRelease(gstate);
-        }
+// Escapes characters that would break out of the Python string literal passed to sys.stdout.write
+inline std::string sanitizeForPython(const std::string& msg) {
+    std::string clean = msg;
+    for (char& c : clean) {
+        if (c == '"' || c == '\\' || c == '\n' || c == '\r') c = ' ';
     }
+    return clean;
+}
+
+inline void writeToPythonConsole(const std::string& msg) {
+    HMODULE hPy = resolvePythonModule();
+    if (!hPy) return;
+
+    auto pyEnsure = reinterpret_cast<EnsureFn>(GetProcAddress(hPy, "PyGILState_Ensure"));
+    auto pyRelease = reinterpret_cast<ReleaseFn>(GetProcAddress(hPy, "PyGILState_Release"));
+    auto pyRun = reinterpret_cast<RunFn>(GetProcAddress(hPy, "PyRun_SimpleString"));
+    if (!pyRun) return;
+
+    GILState gstate = GILState::Unlocked;
+    if (pyEnsure) gstate = pyEnsure();
+
+    std::string pyScript = "import sys\n"
+                         "try:\n"
+                         "    sys.stdout.write('[FFT Plugin] " + sanitizeForPython(msg) + "\\n')\n"
+                         "    sys.stdout.flush()\n"
+                         "except:\n"
+                         "    print('[FFT Plugin] " + sanitizeForPython(msg) + "')\n";
+
+    pyRun(pyScript.c_str());
+
+    if (pyRelease) pyRelease(gstate);
+}
+
+} // namespace python_logger
+#endif
+
+inline void logPlanEvent(const std::string& msg) {
+    auto& history = getPlanLogHistory();
+    if (history.size() >= kMaxPlanLogEntries) {
+        history.erase(history.begin(), history.begin() + static_cast<std::ptrdiff_t>(history.size() / 2));
+    }
+    history.push_back(msg);
+
+#ifdef _WIN32
+    python_logger::writeToPythonConsole(msg);
 #endif
 }
 
@@ -300,10 +326,6 @@ public:
         }
     }
 
-    bool hasActiveFilter(double amount) const noexcept {
-        return (m_high_shelf.active || m_low_shelf.active) && (amount > 0.0);
-    }
-
 private:
     double m_sample_rate{ 44100.0 };
     BiquadSection m_high_shelf;
@@ -441,7 +463,7 @@ public:
         std::vector<double> perceptual(n_out);
 
         switch (scale_code) {
-            case 1: { // Logarithmic Scale
+            case 0: { // Logarithmic Scale
                 double floor_hz = std::max(1.0, log_floor_hz);
                 double fmin = std::min(floor_hz, std::min(0.5 * fmax, std::max(1.0, fmax * 0.1)));
                 double log_min = std::log(fmin);
@@ -452,7 +474,7 @@ public:
                 }
                 break;
             }
-            case 2: { // Mel Scale
+            case 1: { // Mel Scale
                 double m_min = htkHzToMel(0.0);
                 double m_max = htkHzToMel(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
@@ -461,7 +483,7 @@ public:
                 }
                 break;
             }
-            case 3: { // ERB Scale
+            case 2: { // ERB Scale
                 double e_min = erbRateGlasberg(0.0);
                 double e_max = erbRateGlasberg(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
@@ -470,7 +492,7 @@ public:
                 }
                 break;
             }
-            case 4: { // Bark Scale
+            case 3: { // Bark Scale
                 double b_min = hzToBark(0.0);
                 double b_max = hzToBark(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
@@ -479,7 +501,7 @@ public:
                 }
                 break;
             }
-            case 5: { // Chroma Scale
+            case 4: { // Chroma Scale
                 double c_min = hzToChroma(20.0);
                 double c_max = hzToChroma(fmax);
                 for (size_t i = 0; i < n_out; ++i) {
@@ -503,7 +525,7 @@ public:
                 }
                 break;
             }
-            case 0: // Linear Scale
+            case 5: // Linear Scale
             default: {
                 for (size_t i = 0; i < n_out; ++i) {
                     perceptual[i] = i * inv_denom * fmax;
@@ -704,35 +726,9 @@ public:
         float floor_val = static_cast<float>(-top_db);
         float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
 
-        // Vectorized SIMD Decibel Conversion & Clamping
-        size_t k = 0;
-#if defined(__AVX2__)
-        __m256 v_min_val = _mm256_set1_ps(1e-12f);
-        __m256 v_floor = _mm256_set1_ps(floor_val);
-        __m256 v_inv_top = _mm256_set1_ps(inv_top_db);
-        __m256 v_zero = _mm256_setzero_ps();
-        __m256 v_one = _mm256_set1_ps(1.0f);
-
-        for (; k + 7 < n; k += 8) {
-            __m256 v_raw = _mm256_max_ps(v_min_val, _mm256_loadu_ps(data + k));
-
-            alignas(32) float tmp[8];
-            _mm256_store_ps(tmp, v_raw);
-            alignas(32) float res[8];
-            for (int j = 0; j < 8; ++j) {
-                float db = 20.0f * std::log10(tmp[j]) + db_offset;
-                res[j] = std::max(db, floor_val);
-            }
-            __m256 v_db = _mm256_load_ps(res);
-
-            if (mode == 2) { // Normalized dB (0.0 to 1.0)
-                v_db = _mm256_mul_ps(_mm256_sub_ps(v_db, v_floor), v_inv_top);
-                v_db = _mm256_max_ps(v_zero, _mm256_min_ps(v_one, v_db));
-            }
-            _mm256_storeu_ps(data + k, v_db);
-        }
-#endif
-        for (; k < n; ++k) {
+        // Scalar Decibel Conversion & Clamping (log10 has no SIMD instruction;
+        // peak search above is vectorized, this pass is compute-bound on log10)
+        for (size_t k = 0; k < n; ++k) {
             float raw_v = std::max(1e-12f, data[k]);
             float db = static_cast<float>(20.0f * std::log10(raw_v)) + db_offset;
             db = std::max(db, floor_val);
@@ -853,6 +849,13 @@ public:
 inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_complex) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
+    // Reorders the de-interleaved magnitude lanes into bin order via a 64-bit chunk swap
+    // (vpermq). There is no _mm256_permute4x64_ps intrinsic; the pd/epi64 variants are
+    // the same instruction and the bit-pattern casts below are free.
+    auto reorderLanes = [](__m256 mag) noexcept -> __m256 {
+        return _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(mag), _MM_SHUFFLE(3, 1, 2, 0)));
+    };
+
     size_t n_vec16 = n_complex / 16;
     for (; i < n_vec16 * 16; i += 16) {
         // Block 1 (bins 0..7)
@@ -862,7 +865,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 im0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum0 = _mm256_fmadd_ps(re0, re0, _mm256_mul_ps(im0, im0));
         __m256 mag0 = _mm256_sqrt_ps(sum0);
-        __m256 ord0 = _mm256_permute4x64_ps(mag0, _MM_SHUFFLE(3, 1, 2, 0));
+        __m256 ord0 = reorderLanes(mag0);
         _mm256_storeu_ps(mptr + i, ord0);
 
         // Block 2 (bins 8..15)
@@ -872,7 +875,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 im1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum1 = _mm256_fmadd_ps(re1, re1, _mm256_mul_ps(im1, im1));
         __m256 mag1 = _mm256_sqrt_ps(sum1);
-        __m256 ord1 = _mm256_permute4x64_ps(mag1, _MM_SHUFFLE(3, 1, 2, 0));
+        __m256 ord1 = reorderLanes(mag1);
         _mm256_storeu_ps(mptr + i + 8, ord1);
     }
     for (; i + 7 < n_complex; i += 8) {
@@ -882,7 +885,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
         __m256 mag = _mm256_sqrt_ps(sum);
-        __m256 ord = _mm256_permute4x64_ps(mag, _MM_SHUFFLE(3, 1, 2, 0));
+        __m256 ord = reorderLanes(mag);
         _mm256_storeu_ps(mptr + i, ord);
     }
 #endif
@@ -899,7 +902,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
 ===========================================================================
 High-performance wrapper around FFTW3 (single precision fftwf_* API) and AVX2 vector SIMD.
 - Single Precision (fftwf_*): TouchDesigner CHOP channels use IEEE 754 32-bit floats.
-- FFTW_MEASURE Fast Hardware Benchmarking: Sub-millisecond benchmarking of assembly kernels on target CPU.
+- FFTW_ESTIMATE Instant Plan Generation: Zero benchmark overhead, no transient planner allocations, no CPU benchmarking stalls.
 - Zero Allocation Execution: Executes fftwf_execute_dft_r2c in real-time with pre-sized buffers.
 - FMA SIMD Parallel Magnitude Spectrum: Evaluates 16 complex magnitude values per loop iteration.
 */
@@ -960,25 +963,25 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
-            logPlanEvent("[FFT Plugin] [FFTW3] Benchmarking & generating FFT plan for size N = " + std::to_string(fft_size) + "...");
+            logPlanEvent("[FFT Plugin] [FFTW3] Creating FFT plan for size N = " + std::to_string(fft_size) + "...");
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             if (m_plan) {
-                m_planStatus = "FFTW3 (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                m_planStatus = "FFTW3 (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
             } else {
-                logPlanEvent("[FFT Plugin] [FFTW3] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
+                logPlanEvent("[FFT Plugin] [FFTW3] FFTW_ESTIMATE returned null, falling back to FFTW_MEASURE...");
                 t0 = std::chrono::high_resolution_clock::now();
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                 t1 = std::chrono::high_resolution_clock::now();
                 ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (m_plan) {
-                    m_planStatus = "FFTW3 (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                    logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                    m_planStatus = "FFTW3 (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                    logPlanEvent("[FFT Plugin] [FFTW3] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                 }
             }
         }
@@ -1074,25 +1077,25 @@ public:
         fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
 
         if (dummy_in && dummy_out) {
-            logPlanEvent("[FFT Plugin] [Intel MKL / IPP] Benchmarking & generating FFT plan for size N = " + std::to_string(fft_size) + "...");
+            logPlanEvent("[FFT Plugin] [Intel MKL / IPP] Creating FFT plan for size N = " + std::to_string(fft_size) + "...");
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
+            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
             if (m_plan) {
-                m_planStatus = "Intel MKL / IPP (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                m_planStatus = "Intel MKL / IPP (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
             } else {
-                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_MEASURE returned null, falling back to FFTW_ESTIMATE...");
+                logPlanEvent("[FFT Plugin] [Intel MKL / IPP] FFTW_ESTIMATE returned null, falling back to FFTW_MEASURE...");
                 t0 = std::chrono::high_resolution_clock::now();
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_MEASURE);
                 t1 = std::chrono::high_resolution_clock::now();
                 ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (m_plan) {
-                    m_planStatus = "Intel MKL / IPP (FFTW_ESTIMATE - " + std::to_string(static_cast<int>(ms)) + " ms)";
-                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_ESTIMATE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
+                    m_planStatus = "Intel MKL / IPP (FFTW_MEASURE - " + std::to_string(static_cast<int>(ms)) + " ms)";
+                    logPlanEvent("[FFT Plugin] [Intel MKL / IPP] SUCCESS: Created FFTW_MEASURE plan for N = " + std::to_string(fft_size) + " in " + std::to_string(ms) + " ms");
                 }
             }
         }
