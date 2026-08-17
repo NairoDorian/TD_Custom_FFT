@@ -22,6 +22,9 @@ Plugin_FFT.[0-9]*.toe
 *.[0-9]*.toe
 
 
+# Command Code tool configuration
+.commandcode/
+
 # OS metadata
 Thumbs.db
 Desktop.ini
