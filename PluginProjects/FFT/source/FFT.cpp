@@ -112,7 +112,7 @@ DestroyCHOPInstance(CHOP_CPlusPlusBase* instance)
 namespace {
 
 // Applies the tapering window into the active slice of the zero-padded frame (2x unrolled AVX2)
-inline void applyWindow(const float* proc_data, const float* win_data, float* pad_data, size_t len) {
+inline void applyWindow(const float* __restrict proc_data, const float* __restrict win_data, float* __restrict pad_data, size_t len) {
 	size_t wi = 0;
 #if defined(__AVX2__)
 	for (; wi + 15 < len; wi += 16) {
@@ -136,7 +136,7 @@ inline void applyWindow(const float* proc_data, const float* win_data, float* pa
 }
 
 // Multiplies the spectrum by the equal-loudness weighting curve in place (2x unrolled AVX2)
-inline void applyWeightingCurve(float* spectrum, const float* curve, size_t len) {
+inline void applyWeightingCurve(float* __restrict spectrum, const float* __restrict curve, size_t len) {
 	size_t wk = 0;
 #if defined(__AVX2__)
 	for (; wk + 15 < len; wk += 16) {
@@ -163,7 +163,7 @@ inline void applyWeightingCurve(float* spectrum, const float* curve, size_t len)
 // Processes 8 elements at a time, skipping chunks where no lane exceeds
 // the current max (checked via sign-bit movemask on the difference).
 // Falls back to scalar when n < 9 or AVX2 is unavailable.
-inline float findPeakWithIndex(const float* data, size_t n, size_t& peak_idx) noexcept {
+inline float findPeakWithIndex(const float* __restrict data, size_t n, size_t& peak_idx) noexcept {
 	peak_idx = 0;
 	if (n == 0) return 0.0f;
 

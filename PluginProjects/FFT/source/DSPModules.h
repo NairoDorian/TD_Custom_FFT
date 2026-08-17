@@ -1009,7 +1009,7 @@ public:
  * @brief Ultra-Fast 256-Bit AVX2 FMA Vectorized Magnitude Spectrum Calculation.
  * Evaluates 8 complex magnitude bins simultaneously without horizontal addition latency.
  */
-inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_complex) noexcept {
+inline void computeMagnitudeAVX2_FMA(const float* __restrict raw_c, float* __restrict mptr, size_t n_complex) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
     // Reorders the de-interleaved magnitude lanes into bin order via a 64-bit chunk swap
