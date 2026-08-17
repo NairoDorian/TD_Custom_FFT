@@ -159,6 +159,59 @@ inline void applyWeightingCurve(float* spectrum, const float* curve, size_t len)
 	}
 }
 
+// Finds the peak magnitude and its index in a spectrum buffer using AVX2.
+// Processes 8 elements at a time, skipping chunks where no lane exceeds
+// the current max (checked via sign-bit movemask on the difference).
+// Falls back to scalar when n < 9 or AVX2 is unavailable.
+inline float findPeakWithIndex(const float* data, size_t n, size_t& peak_idx) noexcept {
+	peak_idx = 0;
+	if (n == 0) return 0.0f;
+
+	float max_val = data[0];
+
+#if defined(__AVX2__)
+	if (n >= 9) {
+		size_t i = 1;
+		for (; i + 7 < n; i += 8) {
+			__m256 v = _mm256_loadu_ps(data + i);
+			__m256 v_diff = _mm256_sub_ps(v, _mm256_set1_ps(max_val));
+			if (_mm256_movemask_ps(v_diff) != 0xFF) {
+				alignas(32) float tmp[8];
+				_mm256_storeu_ps(tmp, v);
+				for (int j = 0; j < 8; ++j) {
+					if (tmp[j] > max_val) {
+						max_val = tmp[j];
+						peak_idx = i + j;
+					}
+				}
+			}
+		}
+		for (; i < n; ++i) {
+			if (data[i] > max_val) {
+				max_val = data[i];
+				peak_idx = i;
+			}
+		}
+	} else {
+		for (size_t i = 1; i < n; ++i) {
+			if (data[i] > max_val) {
+				max_val = data[i];
+				peak_idx = i;
+			}
+		}
+	}
+#else
+	for (size_t i = 1; i < n; ++i) {
+		if (data[i] > max_val) {
+			max_val = data[i];
+			peak_idx = i;
+		}
+	}
+#endif
+
+	return max_val;
+}
+
 } // anonymous namespace
 
 /**
@@ -299,7 +352,7 @@ FFT::rebuildDSP(int engineChoice, double sr, int winSamples, int padChoice, int 
 		FFTDSP::logPlanEvent("[FFT Plugin] ERROR: Caught exception in rebuildDSP: " + std::string(e.what()) + " — retaining previous DSP state");
 		if (!myFFTEngine) {
 			myFFTEngine = std::make_unique<FFTDSP::FFTWEngine>();
-			myFFTEngine->prepare(myFFTSize);
+			myFFTEngine->prepare(myFFTSize, FFTW_ESTIMATE); // Force safe flag
 		}
 	}
 }
@@ -527,9 +580,8 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 
 		// 12. Real-Time Telemetry: Track primary spectral peak frequency (Hz) and magnitude for Info CHOP/DAT
 		if (ch == 0 && !st.warped_spectrum.empty()) {
-			auto max_it = std::max_element(st.warped_spectrum.begin(), st.warped_spectrum.end());
-			size_t max_idx = std::distance(st.warped_spectrum.begin(), max_it);
-			myPeakMagnitude = *max_it;
+			size_t max_idx = 0;
+			myPeakMagnitude = findPeakWithIndex(st.warped_spectrum.data(), st.warped_spectrum.size(), max_idx);
 			const auto& target_hz = myWarping.targetHz();
 			if (max_idx < target_hz.size()) {
 				myPeakFrequencyHz = static_cast<float>(target_hz[max_idx]);
