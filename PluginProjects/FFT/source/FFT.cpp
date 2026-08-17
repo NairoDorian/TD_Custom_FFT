@@ -116,18 +116,18 @@ inline void applyWindow(const float* proc_data, const float* win_data, float* pa
 	size_t wi = 0;
 #if defined(__AVX2__)
 	for (; wi + 15 < len; wi += 16) {
-		__m256 p0 = _mm256_loadu_ps(proc_data + wi);
-		__m256 w0 = _mm256_loadu_ps(win_data + wi);
-		_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p0, w0));
+		__m256 p0 = _mm256_load_ps(proc_data + wi);
+		__m256 w0 = _mm256_load_ps(win_data + wi);
+		_mm256_store_ps(pad_data + wi, _mm256_mul_ps(p0, w0));
 
-		__m256 p1 = _mm256_loadu_ps(proc_data + wi + 8);
-		__m256 w1 = _mm256_loadu_ps(win_data + wi + 8);
-		_mm256_storeu_ps(pad_data + wi + 8, _mm256_mul_ps(p1, w1));
+		__m256 p1 = _mm256_load_ps(proc_data + wi + 8);
+		__m256 w1 = _mm256_load_ps(win_data + wi + 8);
+		_mm256_store_ps(pad_data + wi + 8, _mm256_mul_ps(p1, w1));
 	}
 	for (; wi + 7 < len; wi += 8) {
-		__m256 p = _mm256_loadu_ps(proc_data + wi);
-		__m256 w = _mm256_loadu_ps(win_data + wi);
-		_mm256_storeu_ps(pad_data + wi, _mm256_mul_ps(p, w));
+		__m256 p = _mm256_load_ps(proc_data + wi);
+		__m256 w = _mm256_load_ps(win_data + wi);
+		_mm256_store_ps(pad_data + wi, _mm256_mul_ps(p, w));
 	}
 #endif
 	for (; wi < len; ++wi) {
@@ -140,18 +140,18 @@ inline void applyWeightingCurve(float* spectrum, const float* curve, size_t len)
 	size_t wk = 0;
 #if defined(__AVX2__)
 	for (; wk + 15 < len; wk += 16) {
-		__m256 s0 = _mm256_loadu_ps(spectrum + wk);
-		__m256 c0 = _mm256_loadu_ps(curve + wk);
-		_mm256_storeu_ps(spectrum + wk, _mm256_mul_ps(s0, c0));
+		__m256 s0 = _mm256_load_ps(spectrum + wk);
+		__m256 c0 = _mm256_load_ps(curve + wk);
+		_mm256_store_ps(spectrum + wk, _mm256_mul_ps(s0, c0));
 
-		__m256 s1 = _mm256_loadu_ps(spectrum + wk + 8);
-		__m256 c1 = _mm256_loadu_ps(curve + wk + 8);
-		_mm256_storeu_ps(spectrum + wk + 8, _mm256_mul_ps(s1, c1));
+		__m256 s1 = _mm256_load_ps(spectrum + wk + 8);
+		__m256 c1 = _mm256_load_ps(curve + wk + 8);
+		_mm256_store_ps(spectrum + wk + 8, _mm256_mul_ps(s1, c1));
 	}
 	for (; wk + 7 < len; wk += 8) {
-		__m256 s = _mm256_loadu_ps(spectrum + wk);
-		__m256 c = _mm256_loadu_ps(curve + wk);
-		_mm256_storeu_ps(spectrum + wk, _mm256_mul_ps(s, c));
+		__m256 s = _mm256_load_ps(spectrum + wk);
+		__m256 c = _mm256_load_ps(curve + wk);
+		_mm256_store_ps(spectrum + wk, _mm256_mul_ps(s, c));
 	}
 #endif
 	for (; wk < len; ++wk) {
@@ -173,11 +173,11 @@ inline float findPeakWithIndex(const float* data, size_t n, size_t& peak_idx) no
 	if (n >= 9) {
 		size_t i = 1;
 		for (; i + 7 < n; i += 8) {
-			__m256 v = _mm256_loadu_ps(data + i);
+			__m256 v = _mm256_load_ps(data + i);
 			__m256 v_diff = _mm256_sub_ps(v, _mm256_set1_ps(max_val));
 			if (_mm256_movemask_ps(v_diff) != 0xFF) {
 				alignas(32) float tmp[8];
-				_mm256_storeu_ps(tmp, v);
+				_mm256_store_ps(tmp, v);
 				for (int j = 0; j < 8; ++j) {
 					if (tmp[j] > max_val) {
 						max_val = tmp[j];

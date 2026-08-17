@@ -37,6 +37,52 @@ Processing Pipeline Overview:
 #include <string>
 #include <chrono>
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
+#include <cstdlib>    // _aligned_malloc / _aligned_free for 32-byte SIMD alignment
+
+/*
+===========================================================================
+  0. 32-BYTE ALIGNED ALLOCATOR (for AVX2 SIMD load/store alignment)
+===========================================================================
+Aligns std::vector data to 32-byte boundaries so that _mm256_load_ps /
+_mm256_store_ps (aligned) can be used instead of _mm256_loadu_ps /
+_mm256_storeu_ps (unaligned), eliminating potential cache-line split
+penalties on AVX2 gather/scatter boundaries.
+*/
+template<typename T, std::size_t Align = 32>
+struct AlignedAllocator {
+    using value_type = T;
+
+    template<typename U> struct rebind { using other = AlignedAllocator<U, Align>; };
+
+    AlignedAllocator() noexcept = default;
+    template<typename U> AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        if (n == 0) return nullptr;
+#ifdef _MSC_VER
+        void* ptr = _aligned_malloc(n * sizeof(T), Align);
+#else
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, Align, n * sizeof(T)) != 0) ptr = nullptr;
+#endif
+        if (!ptr) throw std::bad_alloc();
+        return static_cast<T*>(ptr);
+    }
+    void deallocate(T* p, std::size_t) noexcept {
+        if (!p) return;
+#ifdef _MSC_VER
+        _aligned_free(p);
+#else
+        free(p);
+#endif
+    }
+    template<typename U, typename... Args>
+    void construct(U* p, Args&&... args) { new (static_cast<void*>(p)) U(std::forward<Args>(args)...); }
+    template<typename U>
+    void destroy(U* p) noexcept { p->~U(); }
+    bool operator==(const AlignedAllocator&) const noexcept { return true; }
+    bool operator!=(const AlignedAllocator&) const noexcept { return false; }
+};
 
 #include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
 
@@ -45,6 +91,10 @@ Processing Pipeline Overview:
 #endif
 
 namespace FFTDSP {
+
+// 32-byte aligned vector type aliases for AVX2 SIMD load/store alignment
+using AlignedVector = std::vector<float, AlignedAllocator<float, 32>>;
+using AlignedComplexVector = std::vector<std::complex<float>, AlignedAllocator<std::complex<float>, 32>>;
 
 // Maximum number of plan events retained for Info DAT export / Info popup (prevents unbounded growth)
 constexpr size_t kMaxPlanLogEntries = 256;
@@ -186,7 +236,7 @@ public:
         }
     }
 
-    inline void get(std::vector<float>& out) const noexcept {
+    inline void get(AlignedVector& out) const noexcept {
         if (out.size() != m_capacity) {
             out.resize(m_capacity);
         }
@@ -310,9 +360,9 @@ public:
         return (m_high_shelf.active || m_low_shelf.active) && (amount > 0.0);
     }
 
-    inline void processAudio(const std::vector<float>& original_audio,
+    inline void processAudio(const AlignedVector& original_audio,
                              double amount,
-                             std::vector<float>& processed_output) noexcept {
+                             AlignedVector& processed_output) noexcept {
         if (original_audio.empty()) {
             processed_output.clear();
             return;
@@ -364,7 +414,7 @@ public:
         }
     }
 
-    static void generateWindow(int window_type, int kaiser_beta, size_t length, std::vector<float>& window) {
+    static void generateWindow(int window_type, int kaiser_beta, size_t length, AlignedVector& window) {
         window.resize(length);
         if (length == 0) return;
 
@@ -573,7 +623,7 @@ public:
         m_is_identity = is_id;
     }
 
-    inline void applyWarp(const std::vector<float>& linear_magnitude, std::vector<float>& output_spectrum) const noexcept {
+    inline void applyWarp(const AlignedVector& linear_magnitude, AlignedVector& output_spectrum) const noexcept {
         size_t n_out = m_i0.size();
         if (output_spectrum.size() != n_out) {
             output_spectrum.resize(n_out);
@@ -650,7 +700,7 @@ Computes acoustic weighting curves modeling human ear frequency sensitivity.
 */
 class EqualLoudness {
 public:
-    static void computeCurve(int weighting_code, const std::vector<double>& freqs_hz, std::vector<float>& weights) {
+    static void computeCurve(int weighting_code, const std::vector<double>& freqs_hz, AlignedVector& weights) {
         weights.resize(freqs_hz.size());
         if (weighting_code == 0) {
             std::fill(weights.begin(), weights.end(), 1.0f);
@@ -760,7 +810,7 @@ FastLog10 lookup-table replaces scalar std::log10 in the per-bin conversion loop
 */
 class DecibelConverter {
 public:
-    static inline void convertToDB(int mode, double top_db, std::vector<float>& spectrum) noexcept {
+    static inline void convertToDB(int mode, double top_db, AlignedVector& spectrum) noexcept {
         if (mode == 0 || spectrum.empty()) return;
 
         size_t n = spectrum.size();
@@ -772,12 +822,12 @@ public:
 #if defined(__AVX2__)
         __m256 v_max = _mm256_setzero_ps();
         for (; i + 15 < n; i += 16) {
-            __m256 v0 = _mm256_loadu_ps(data + i);
-            __m256 v1 = _mm256_loadu_ps(data + i + 8);
+            __m256 v0 = _mm256_load_ps(data + i);
+            __m256 v1 = _mm256_load_ps(data + i + 8);
             v_max = _mm256_max_ps(v_max, _mm256_max_ps(v0, v1));
         }
         for (; i + 7 < n; i += 8) {
-            __m256 v = _mm256_loadu_ps(data + i);
+            __m256 v = _mm256_load_ps(data + i);
             v_max = _mm256_max_ps(v_max, v);
         }
         alignas(32) float max_arr[8];
@@ -809,34 +859,34 @@ public:
             const __m256 one_v = _mm256_set1_ps(1.0f);
             const __m256 inv_top_db_v = _mm256_set1_ps(inv_top_db);
             for (; k + 15 < n; k += 16) {
-                __m256 v0 = _mm256_max_ps(_mm256_loadu_ps(data + k), min_v);
-                __m256 v1 = _mm256_max_ps(_mm256_loadu_ps(data + k + 8), min_v);
+                __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
+                __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
                 __m256 db0 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0), db_off_v), floor_v);
                 __m256 db1 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1), db_off_v), floor_v);
                 __m256 norm0 = _mm256_mul_ps(_mm256_sub_ps(db0, floor_v), inv_top_db_v);
                 __m256 norm1 = _mm256_mul_ps(_mm256_sub_ps(db1, floor_v), inv_top_db_v);
-                _mm256_storeu_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, norm0), one_v));
-                _mm256_storeu_ps(data + k + 8, _mm256_min_ps(_mm256_max_ps(zero_v, norm1), one_v));
+                _mm256_store_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, norm0), one_v));
+                _mm256_store_ps(data + k + 8, _mm256_min_ps(_mm256_max_ps(zero_v, norm1), one_v));
             }
             for (; k + 7 < n; k += 8) {
-                __m256 v = _mm256_max_ps(_mm256_loadu_ps(data + k), min_v);
+                __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
                 __m256 db = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v), db_off_v), floor_v);
                 __m256 norm = _mm256_mul_ps(_mm256_sub_ps(db, floor_v), inv_top_db_v);
-                _mm256_storeu_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, norm), one_v));
+                _mm256_store_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, norm), one_v));
             }
         } else {
             for (; k + 15 < n; k += 16) {
-                __m256 v0 = _mm256_max_ps(_mm256_loadu_ps(data + k), min_v);
-                __m256 v1 = _mm256_max_ps(_mm256_loadu_ps(data + k + 8), min_v);
+                __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
+                __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
                 __m256 db0 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0), db_off_v), floor_v);
                 __m256 db1 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1), db_off_v), floor_v);
-                _mm256_storeu_ps(data + k, db0);
-                _mm256_storeu_ps(data + k + 8, db1);
+                _mm256_store_ps(data + k, db0);
+                _mm256_store_ps(data + k + 8, db1);
             }
             for (; k + 7 < n; k += 8) {
-                __m256 v = _mm256_max_ps(_mm256_loadu_ps(data + k), min_v);
+                __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
                 __m256 db = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v), db_off_v), floor_v);
-                _mm256_storeu_ps(data + k, db);
+                _mm256_store_ps(data + k, db);
             }
         }
 #endif
@@ -864,7 +914,7 @@ mispredictions across 16 bins per CPU loop iteration.
 */
 class BallisticsFilter {
 public:
-    inline void apply(float attack, float release, const std::vector<float>& current, std::vector<float>& prev_out) noexcept {
+    inline void apply(float attack, float release, const AlignedVector& current, AlignedVector& prev_out) noexcept {
         size_t n = current.size();
         if (prev_out.size() != n || (attack <= 0.0f && release <= 0.0f)) {
             prev_out = current;
@@ -887,30 +937,30 @@ public:
         __m256 v_zero = _mm256_setzero_ps();
 
         for (; i + 15 < n; i += 16) {
-            __m256 s0 = _mm256_loadu_ps(src + i);
-            __m256 d0 = _mm256_loadu_ps(dst + i);
+            __m256 s0 = _mm256_load_ps(src + i);
+            __m256 d0 = _mm256_load_ps(dst + i);
             __m256 diff0 = _mm256_sub_ps(s0, d0);
             __m256 mask0 = _mm256_cmp_ps(diff0, v_zero, _CMP_GT_OQ);
             __m256 factor0 = _mm256_blendv_ps(v_rel, v_att, mask0);
             __m256 res0 = _mm256_fmadd_ps(factor0, diff0, d0);
-            _mm256_storeu_ps(dst + i, res0);
+            _mm256_store_ps(dst + i, res0);
 
-            __m256 s1 = _mm256_loadu_ps(src + i + 8);
-            __m256 d1 = _mm256_loadu_ps(dst + i + 8);
+            __m256 s1 = _mm256_load_ps(src + i + 8);
+            __m256 d1 = _mm256_load_ps(dst + i + 8);
             __m256 diff1 = _mm256_sub_ps(s1, d1);
             __m256 mask1 = _mm256_cmp_ps(diff1, v_zero, _CMP_GT_OQ);
             __m256 factor1 = _mm256_blendv_ps(v_rel, v_att, mask1);
             __m256 res1 = _mm256_fmadd_ps(factor1, diff1, d1);
-            _mm256_storeu_ps(dst + i + 8, res1);
+            _mm256_store_ps(dst + i + 8, res1);
         }
         for (; i + 7 < n; i += 8) {
-            __m256 s = _mm256_loadu_ps(src + i);
-            __m256 d = _mm256_loadu_ps(dst + i);
+            __m256 s = _mm256_load_ps(src + i);
+            __m256 d = _mm256_load_ps(dst + i);
             __m256 diff = _mm256_sub_ps(s, d);
             __m256 mask = _mm256_cmp_ps(diff, v_zero, _CMP_GT_OQ);
             __m256 factor = _mm256_blendv_ps(v_rel, v_att, mask);
             __m256 res = _mm256_fmadd_ps(factor, diff, d);
-            _mm256_storeu_ps(dst + i, res);
+            _mm256_store_ps(dst + i, res);
         }
 #endif
         for (; i < n; ++i) {
@@ -945,9 +995,9 @@ public:
     /**
      * @brief Executes Real-to-Complex 1D FFT and calculates linear magnitude spectrum.
      */
-    virtual void executeRFFT(const std::vector<float>& padded_signal,
-                             std::vector<float>& magnitude_spectrum,
-                             std::vector<std::complex<float>>& scratch_complex) const noexcept = 0;
+    virtual void executeRFFT(const AlignedVector& padded_signal,
+                             AlignedVector& magnitude_spectrum,
+                             AlignedComplexVector& scratch_complex) const noexcept = 0;
 
     /**
      * @brief Returns a descriptive status string of the engine and active FFT plan level.
@@ -972,34 +1022,34 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
     size_t n_vec16 = n_complex / 16;
     for (; i < n_vec16 * 16; i += 16) {
         // Block 1 (bins 0..7)
-        __m256 cA0 = _mm256_loadu_ps(raw_c + 2 * i);
-        __m256 cB0 = _mm256_loadu_ps(raw_c + 2 * i + 8);
+        __m256 cA0 = _mm256_load_ps(raw_c + 2 * i);
+        __m256 cB0 = _mm256_load_ps(raw_c + 2 * i + 8);
         __m256 re0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum0 = _mm256_fmadd_ps(re0, re0, _mm256_mul_ps(im0, im0));
         __m256 mag0 = _mm256_sqrt_ps(sum0);
         __m256 ord0 = reorderLanes(mag0);
-        _mm256_storeu_ps(mptr + i, ord0);
+        _mm256_store_ps(mptr + i, ord0);
 
         // Block 2 (bins 8..15)
-        __m256 cA1 = _mm256_loadu_ps(raw_c + 2 * i + 16);
-        __m256 cB1 = _mm256_loadu_ps(raw_c + 2 * i + 24);
+        __m256 cA1 = _mm256_load_ps(raw_c + 2 * i + 16);
+        __m256 cB1 = _mm256_load_ps(raw_c + 2 * i + 24);
         __m256 re1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum1 = _mm256_fmadd_ps(re1, re1, _mm256_mul_ps(im1, im1));
         __m256 mag1 = _mm256_sqrt_ps(sum1);
         __m256 ord1 = reorderLanes(mag1);
-        _mm256_storeu_ps(mptr + i + 8, ord1);
+        _mm256_store_ps(mptr + i + 8, ord1);
     }
     for (; i + 7 < n_complex; i += 8) {
-        __m256 cA = _mm256_loadu_ps(raw_c + 2 * i);
-        __m256 cB = _mm256_loadu_ps(raw_c + 2 * i + 8);
+        __m256 cA = _mm256_load_ps(raw_c + 2 * i);
+        __m256 cB = _mm256_load_ps(raw_c + 2 * i + 8);
         __m256 re = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
         __m256 mag = _mm256_sqrt_ps(sum);
         __m256 ord = reorderLanes(mag);
-        _mm256_storeu_ps(mptr + i, ord);
+        _mm256_store_ps(mptr + i, ord);
     }
 #endif
     for (; i < n_complex; ++i) {
@@ -1121,9 +1171,9 @@ public:
         if (dummy_out) fftwf_free(dummy_out);
     }
 
-    void executeRFFT(const std::vector<float>& padded_signal,
-                     std::vector<float>& magnitude_spectrum,
-                     std::vector<std::complex<float>>& scratch_complex) const noexcept override {
+    void executeRFFT(const AlignedVector& padded_signal,
+                     AlignedVector& magnitude_spectrum,
+                     AlignedComplexVector& scratch_complex) const noexcept override {
         size_t n = padded_signal.size();
         size_t n_complex = n / 2 + 1;
 
@@ -1249,9 +1299,9 @@ public:
         if (dummy_out) fftwf_free(dummy_out);
     }
 
-    void executeRFFT(const std::vector<float>& padded_signal,
-                     std::vector<float>& magnitude_spectrum,
-                     std::vector<std::complex<float>>& scratch_complex) const noexcept override {
+    void executeRFFT(const AlignedVector& padded_signal,
+                     AlignedVector& magnitude_spectrum,
+                     AlignedComplexVector& scratch_complex) const noexcept override {
         size_t n = padded_signal.size();
         size_t n_complex = n / 2 + 1;
 
