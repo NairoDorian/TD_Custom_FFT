@@ -1019,6 +1019,13 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         return _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(mag), _MM_SHUFFLE(3, 1, 2, 0)));
     };
 
+    // Fast approximate sqrt via rsqrt + multiply (latency ~5 vs ~10 for _mm256_sqrt_ps).
+    // ~12-bit mantissa accuracy (~0.02% error) — negligible for display magnitudes.
+    auto fast_sqrt_ps = [](__m256 x) noexcept -> __m256 {
+        __m256 x_clamped = _mm256_max_ps(x, _mm256_set1_ps(1e-10f));
+        return _mm256_mul_ps(x_clamped, _mm256_rsqrt_ps(x_clamped));
+    };
+
     size_t n_vec16 = n_complex / 16;
     for (; i < n_vec16 * 16; i += 16) {
         // Block 1 (bins 0..7)
@@ -1027,7 +1034,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 re0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im0 = _mm256_shuffle_ps(cA0, cB0, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum0 = _mm256_fmadd_ps(re0, re0, _mm256_mul_ps(im0, im0));
-        __m256 mag0 = _mm256_sqrt_ps(sum0);
+        __m256 mag0 = fast_sqrt_ps(sum0);
         __m256 ord0 = reorderLanes(mag0);
         _mm256_store_ps(mptr + i, ord0);
 
@@ -1037,7 +1044,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 re1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im1 = _mm256_shuffle_ps(cA1, cB1, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum1 = _mm256_fmadd_ps(re1, re1, _mm256_mul_ps(im1, im1));
-        __m256 mag1 = _mm256_sqrt_ps(sum1);
+        __m256 mag1 = fast_sqrt_ps(sum1);
         __m256 ord1 = reorderLanes(mag1);
         _mm256_store_ps(mptr + i + 8, ord1);
     }
@@ -1047,7 +1054,7 @@ inline void computeMagnitudeAVX2_FMA(const float* raw_c, float* mptr, size_t n_c
         __m256 re = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(2, 0, 2, 0));
         __m256 im = _mm256_shuffle_ps(cA, cB, _MM_SHUFFLE(3, 1, 3, 1));
         __m256 sum = _mm256_fmadd_ps(re, re, _mm256_mul_ps(im, im));
-        __m256 mag = _mm256_sqrt_ps(sum);
+        __m256 mag = fast_sqrt_ps(sum);
         __m256 ord = reorderLanes(mag);
         _mm256_store_ps(mptr + i, ord);
     }
