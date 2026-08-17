@@ -52,13 +52,13 @@ struct ChannelState {
     FFTDSP::FIFOBuffer fifo;                             // Pre-allocated circular sample buffer
     FFTDSP::BiquadEQ eq;                                 // Parametric High/Low shelving equalizer
     FFTDSP::BallisticsFilter ballistics;                 // Envelope follower with independent attack/release
-    std::vector<float> prev_spectrum;                    // Stored spectrum frame for temporal ballistics smoothing
-    std::vector<float> captured_signal;                  // Unrolled sample frame extracted from FIFO
-    std::vector<float> processed_signal;                 // Audio output from Biquad EQ stage
-    std::vector<float> padded_frame;                     // Zero-padded audio frame ready for FFT transform
-    std::vector<float> rfft_magnitude;                   // Linear RFFT magnitude spectrum output
-    std::vector<float> warped_spectrum;                  // Re-mapped psychoacoustic frequency spectrum
-    std::vector<std::complex<float>> scratch_complex;    // FFTW3 complex output buffer (size: N/2 + 1)
+    FFTDSP::AlignedVector prev_spectrum;                 // Stored spectrum frame for temporal ballistics smoothing
+    FFTDSP::AlignedVector captured_signal;               // Unrolled sample frame extracted from FIFO
+    FFTDSP::AlignedVector processed_signal;              // Audio output from Biquad EQ stage
+    FFTDSP::AlignedVector padded_frame;                  // Zero-padded audio frame ready for FFT transform
+    FFTDSP::AlignedVector rfft_magnitude;                // Linear RFFT magnitude spectrum output
+    FFTDSP::AlignedVector warped_spectrum;              // Re-mapped psychoacoustic frequency spectrum
+    FFTDSP::AlignedComplexVector scratch_complex;        // FFTW3 complex output buffer (size: N/2 + 1)
     int prev_loudness_mode{ -1 };                        // Mode history tracker to reset dynamic ranges cleanly
 
     void initBuffers(size_t windowCapacity, size_t fftSize, size_t numBins) {
@@ -155,8 +155,8 @@ private:
 
 	FFTDSP::PerceptualWarping myWarping;    // Psychoacoustic frequency warping manager
 	std::unique_ptr<FFTDSP::IFFTEngine> myFFTEngine; // Polymorphic CPU/GPU FFT execution engine
-	std::vector<float>       myWeightingCurve; // Pre-calculated equal-loudness weighting curve
-	std::vector<float>       myWindowBuffer;   // Pre-calculated audio tapering window shape
+	FFTDSP::AlignedVector    myWeightingCurve; // Pre-calculated equal-loudness weighting curve
+	FFTDSP::AlignedVector    myWindowBuffer;   // Pre-calculated audio tapering window shape
 
 	std::vector<ChannelState> myChannels;  // Per-channel state vector
 
