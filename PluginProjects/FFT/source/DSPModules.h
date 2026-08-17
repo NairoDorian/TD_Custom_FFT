@@ -82,23 +82,33 @@ inline std::string sanitizeForPython(const std::string& msg) {
 }
 
 inline void writeToPythonConsole(const std::string& msg) {
-    HMODULE hPy = resolvePythonModule();
-    if (!hPy) return;
+    static HMODULE hPy = nullptr;
+    static EnsureFn pyEnsure = nullptr;
+    static ReleaseFn pyRelease = nullptr;
+    static RunFn pyRun = nullptr;
+    static bool resolved = false;
 
-    auto pyEnsure = reinterpret_cast<EnsureFn>(GetProcAddress(hPy, "PyGILState_Ensure"));
-    auto pyRelease = reinterpret_cast<ReleaseFn>(GetProcAddress(hPy, "PyGILState_Release"));
-    auto pyRun = reinterpret_cast<RunFn>(GetProcAddress(hPy, "PyRun_SimpleString"));
-    if (!pyRun) return;
+    if (!resolved) {
+        hPy = resolvePythonModule();
+        if (hPy) {
+            pyEnsure = reinterpret_cast<EnsureFn>(GetProcAddress(hPy, "PyGILState_Ensure"));
+            pyRelease = reinterpret_cast<ReleaseFn>(GetProcAddress(hPy, "PyGILState_Release"));
+            pyRun = reinterpret_cast<RunFn>(GetProcAddress(hPy, "PyRun_SimpleString"));
+        }
+        resolved = true;
+    }
+    if (!hPy || !pyRun) return;
 
     GILState gstate = GILState::Unlocked;
     if (pyEnsure) gstate = pyEnsure();
 
+    std::string clean_msg = sanitizeForPython(msg);
     std::string pyScript = "import sys\n"
                          "try:\n"
-                         "    sys.stdout.write('[FFT Plugin] " + sanitizeForPython(msg) + "\\n')\n"
+                         "    sys.stdout.write('[FFT Plugin] " + clean_msg + "\\n')\n"
                          "    sys.stdout.flush()\n"
                          "except:\n"
-                         "    print('[FFT Plugin] " + sanitizeForPython(msg) + "')\n";
+                         "    print('[FFT Plugin] " + clean_msg + "')\n";
 
     pyRun(pyScript.c_str());
 
