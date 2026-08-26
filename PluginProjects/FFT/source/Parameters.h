@@ -63,7 +63,10 @@ constexpr char WinmsName[]        = "Winms";        constexpr char WinmsLabel[] 
 constexpr char PadName[]          = "Pad";          constexpr char PadLabel[]          = "Zero-Pad Len";
 constexpr char PlannerName[]      = "Planner";      constexpr char PlannerLabel[]      = "FFT Planner";
 
-// Page 2: EQ
+// Page 2: EQ  (Eqenable off = EQ code AND its parameter reads are skipped entirely)
+constexpr char EqenableName[]     = "Eqenable";     constexpr char EqenableLabel[]     = "EQ Enable";
+constexpr char HighshelfName[]    = "Highshelf";    constexpr char HighshelfLabel[]    = "High Shelf";
+constexpr char LowshelfName[]     = "Lowshelf";     constexpr char LowshelfLabel[]     = "Low Shelf";
 constexpr char GaindbName[]       = "Gaindb";       constexpr char GaindbLabel[]       = "High Boost dB";
 constexpr char CutoffhzName[]     = "Cutoffhz";     constexpr char CutoffhzLabel[]     = "High Cutoff Hz";
 constexpr char LowgaindbName[]    = "Lowgaindb";    constexpr char LowgaindbLabel[]    = "Low Boost dB";
@@ -81,6 +84,7 @@ constexpr char MagnormName[]      = "Magnorm";      constexpr char MagnormLabel[
 constexpr char LoudnessName[]     = "Loudness";     constexpr char LoudnessLabel[]     = "Loudness Mode";
 constexpr char DbrefName[]        = "Dbref";        constexpr char DbrefLabel[]        = "dB Reference";
 constexpr char DbrangeName[]      = "Dbrange";      constexpr char DbrangeLabel[]      = "dB Range Floor";
+constexpr char BallenableName[]   = "Ballenable";   constexpr char BallenableLabel[]   = "Ballistics Enable";
 constexpr char BallmodeName[]     = "Ballmode";     constexpr char BallmodeLabel[]     = "Ballistics Mode";
 constexpr char AttackName[]       = "Attack";       constexpr char AttackLabel[]       = "Attack Speed";
 constexpr char ReleaseName[]      = "Release";      constexpr char ReleaseLabel[]      = "Release Speed";
@@ -109,6 +113,9 @@ struct Values {
     int        padSize      = kPadDefault;
     Planner    planner      = Planner::Auto;
     // EQ
+    bool       eqEnable     = false;      // off: no EQ code, no EQ parameter reads
+    bool       highShelf    = true;
+    bool       lowShelf     = true;
     double     gainDb       = 6.0;
     double     cutoffHz     = 1000.0;
     double     lowGainDb    = 0.0;
@@ -124,6 +131,7 @@ struct Values {
     Loudness   loudness     = Loudness::Off;
     DbRef      dbRef        = DbRef::FramePeak;
     double     dbRange      = 80.0;
+    bool       ballEnable   = false;      // off: no ballistics code, no attack/release parameter reads
     BallisticsMode ballMode = BallisticsMode::Coefficient;
     double     attack       = 0.0;
     double     release      = 0.0;
@@ -134,8 +142,10 @@ struct Values {
     int        parallelMin  = 8;
 };
 
-// Fetch all parameters once (clamps every value into its valid range)
-Values eval(const TD::OP_Inputs* inputs);
+// Fetch parameters once per cook. Optional sections are only read when enabled, so a
+// disabled section costs zero TouchDesigner parameter fetches (they are not free).
+// 'reads' receives the number of getPar* calls performed (telemetry).
+Values eval(const TD::OP_Inputs* inputs, int* reads = nullptr);
 
 // Registers custom parameters and UI controls with TouchDesigner's parameter manager
 void setup(TD::OP_ParameterManager* manager);

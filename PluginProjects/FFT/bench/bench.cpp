@@ -19,7 +19,7 @@ using namespace FFTDSP;
 using clk = std::chrono::steady_clock;
 
 struct Args {
-    int channels = 2, fft = 32768, win = 3175, bins = 16384, scale = 0, iters = 200, db = 1;
+    int channels = 2, fft = 32768, win = 3175, bins = 16384, scale = 0, iters = 200, db = 1, eq = 0, weight = 1, ball = 1;
     PlannerPolicy planner = PlannerPolicy::Auto;
 };
 
@@ -36,6 +36,9 @@ static Args parse(int argc, char** argv)
         else if (k == "--scale") a.scale = std::atoi(v);
         else if (k == "--iters") a.iters = std::atoi(v);
         else if (k == "--db") a.db = std::atoi(v);
+        else if (k == "--eq") a.eq = std::atoi(v);
+        else if (k == "--weight") a.weight = std::atoi(v);
+        else if (k == "--ball") a.ball = std::atoi(v);
         else if (k == "--planner") {
             std::string p = v;
             a.planner = (p == "fast") ? PlannerPolicy::Fast : (p == "measured") ? PlannerPolicy::Measured : PlannerPolicy::Auto;
@@ -89,7 +92,7 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < block.size(); ++i) block[i] = static_cast<float>(0.3 * std::sin(i * 0.1) + 0.1 * std::sin(i * 1.7));
     size_t pad_start = ((N > win) ? (N - win) / 2 : 0) & ~static_cast<size_t>(7);
 
-    Stage stages[] = { {"fifo"}, {"window"}, {"fft+mag"}, {"warp"}, {"weighting"}, {"dB"}, {"ballistics"}, {"peak"} };
+    Stage stages[] = { {"fifo"}, {"eq"}, {"window"}, {"fft+mag"}, {"warp"}, {"weighting"}, {"dB"}, {"ballistics"}, {"peak"} };
     auto tick = [](clk::time_point& t, Stage& s) {
         auto n = clk::now();
         s.us += std::chrono::duration<double, std::micro>(n - t).count();
@@ -111,26 +114,42 @@ int main(int argc, char** argv)
     for (int it = 0; it < a.iters; ++it) {
         for (auto& c : chans) {
             auto t = clk::now();
-            c.fifo.add(block.data(), block.size());
+            if (a.eq == 1) {
+                // current: filter only the new block at ingest (stateful IIR, time order)
+                bool has = c.eq.updateAndCheckActive(6.0, 1000.0, 0.0, 200.0, 0.707, 1.0);
+                if (c.processed.size() < block.size()) c.processed.resize(block.size());
+                std::memcpy(c.processed.data(), block.data(), block.size() * sizeof(float));
+                if (has) c.eq.processBlockInPlace(c.processed.data(), block.size(), 1.0);
+                c.fifo.add(c.processed.data(), block.size());
+            } else {
+                c.fifo.add(block.data(), block.size());
+            }
             c.fifo.get(c.captured);
             tick(t, stages[0]);
-            multiplyInto(c.captured.data(), window.data(), c.frame.data() + pad_start, win);
+            const float* src = c.captured.data();
+            if (a.eq == 2) {
+                // legacy: re-filter the whole analysis window every frame
+                bool has = c.eq.updateAndCheckActive(6.0, 1000.0, 0.0, 200.0, 0.707, 1.0);   // plugin defaults: 6 dB high shelf
+                if (has) { c.eq.processAudio(c.captured, 1.0, c.processed); src = c.processed.data(); }
+            }
             tick(t, stages[1]);
-            engine.executeRFFT(c.frame, c.mag, c.scratch);
+            multiplyInto(src, window.data(), c.frame.data() + pad_start, win);
             tick(t, stages[2]);
-            warp.applyWarp(c.mag, c.warped);
+            engine.executeRFFT(c.frame, c.mag, c.scratch);
             tick(t, stages[3]);
-            multiplyInPlace(c.warped.data(), weighting.data(), c.warped.size());
+            warp.applyWarp(c.mag, c.warped);
             tick(t, stages[4]);
+            if (a.weight) multiplyInPlace(c.warped.data(), weighting.data(), c.warped.size());
+            tick(t, stages[5]);
             if (a.db) {
                 float pk = peakMagnitude(c.warped.data(), c.warped.size());
                 DecibelConverter::convertToDB(a.db, 80.0, 1.0f / (pk > 0 ? pk : 1.0f), c.warped);
             }
-            tick(t, stages[5]);
-            c.ball.apply(0.3f, 0.6f, c.warped, c.prev);
             tick(t, stages[6]);
-            size_t idx; findPeakWithIndex(c.warped.data(), c.warped.size(), idx);
+            if (a.ball) c.ball.apply(0.3f, 0.6f, c.warped, c.prev);
             tick(t, stages[7]);
+            size_t idx; findPeakWithIndex(c.warped.data(), c.warped.size(), idx);
+            tick(t, stages[8]);
         }
     }
     double total_us = std::chrono::duration<double, std::micro>(clk::now() - total0).count();

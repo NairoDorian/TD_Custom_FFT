@@ -89,14 +89,6 @@ void appendToggle(TD::OP_ParameterManager* manager, const char* page, const char
 	manager->appendToggle(np);
 }
 
-template <typename E>
-E menuValue(const TD::OP_Inputs* inputs, const char* name, E fallback)
-{
-	int v = inputs->getParInt(name);
-	if (v < 0 || v >= static_cast<int>(E::COUNT)) return fallback;
-	return static_cast<E>(v);
-}
-
 // Menu tables (order == enum order in Parameters.h)
 const char* kScaleNames[]      = { "Log", "Mel", "ERB", "Bark", "Chroma", "Linear", "Melog" };
 const char* kScaleLabels[]     = { "Logarithmic", "Mel Scale", "ERB Scale", "Bark Scale", "Chroma / Pitch", "Linear Scale", "Mel + Log Blend" };
@@ -109,7 +101,7 @@ const char* kLoudnessLabels[]  = { "Off (Linear Magnitude)", "dB (Decibels)", "d
 const char* kWinmodeNames[]    = { "Samples", "Milliseconds" };
 const char* kWinmodeLabels[]   = { "Samples (Window Sampling)", "Milliseconds (Window Length ms)" };
 const char* kPlannerNames[]    = { "Auto", "Fast", "Measured" };
-const char* kPlannerLabels[]   = { "Auto (Measure <= 16K, Estimate above)", "Fast (Estimate, never stalls)", "Measured (best plans, wisdom cached)" };
+const char* kPlannerLabels[]   = { "Auto (instant plan, measured plan upgraded in background)", "Fast (Estimate only, never stalls)", "Measured (blocking measure once per size, wisdom cached)" };
 const char* kMagnormNames[]    = { "Coherentgain", "Fullscale" };
 const char* kMagnormLabels[]   = { "Coherent Gain (mean(window) = 1)", "Full Scale (sine amplitude 1 -> 1.0)" };
 const char* kDbrefNames[]      = { "Framepeak", "Dbfs", "Agc" };
@@ -146,7 +138,10 @@ void setup(TD::OP_ParameterManager* manager)
 	appendMenu (manager, "Spectrum", PadName,        PadLabel,        kPadNames,     kPadLabels,     5 /* 32768 */);
 	appendMenu (manager, "Spectrum", PlannerName,    PlannerLabel,    kPlannerNames, kPlannerLabels, static_cast<int>(Planner::Auto));
 
-	// --- Page 2: EQ ---
+	// --- Page 2: EQ (off by default: the 6 dB default boost is a prototype leftover and costs real-time budget) ---
+	appendToggle(manager, "EQ", EqenableName,  EqenableLabel,  false);
+	appendToggle(manager, "EQ", HighshelfName, HighshelfLabel, true);
+	appendToggle(manager, "EQ", LowshelfName,  LowshelfLabel,  true);
 	appendFloat(manager, "EQ", GaindbName,      GaindbLabel,      6.0,   -24.0, 24.0);
 	appendFloat(manager, "EQ", CutoffhzName,    CutoffhzLabel,    1000.0, 20.0, 20000.0);
 	appendFloat(manager, "EQ", LowgaindbName,   LowgaindbLabel,   0.0,   -24.0, 24.0);
@@ -164,6 +159,7 @@ void setup(TD::OP_ParameterManager* manager)
 	appendMenu (manager, "Loudness & Ballistics", LoudnessName,  LoudnessLabel,  kLoudnessNames, kLoudnessLabels, static_cast<int>(Loudness::Off));
 	appendMenu (manager, "Loudness & Ballistics", DbrefName,     DbrefLabel,     kDbrefNames,    kDbrefLabels,    static_cast<int>(DbRef::FramePeak));
 	appendFloat(manager, "Loudness & Ballistics", DbrangeName,   DbrangeLabel,   80.0, 10.0, 160.0);
+	appendToggle(manager, "Loudness & Ballistics", BallenableName, BallenableLabel, false);
 	appendMenu (manager, "Loudness & Ballistics", BallmodeName,  BallmodeLabel,  kBallmodeNames, kBallmodeLabels, static_cast<int>(BallisticsMode::Coefficient));
 	appendFloat(manager, "Loudness & Ballistics", AttackName,    AttackLabel,    0.0, 0.0, 0.99);
 	appendFloat(manager, "Loudness & Ballistics", ReleaseName,   ReleaseLabel,   0.0, 0.0, 0.99);
@@ -184,53 +180,84 @@ void setup(TD::OP_ParameterManager* manager)
 	appendInt   (manager, "Performance", ParallelminName, ParallelminLabel, 8, 2, 64);
 }
 
-Values eval(const TD::OP_Inputs* inputs)
+Values eval(const TD::OP_Inputs* inputs, int* reads)
 {
 	Values v;
 	if (!inputs) return v;
+	int n = 0;
+	auto getI = [&](const char* name) { ++n; return inputs->getParInt(name); };
+	auto getD = [&](const char* name) { ++n; return inputs->getParDouble(name); };
+	auto menu = [&](auto fallback, const char* name) {
+		using E = decltype(fallback);
+		int m = getI(name);
+		return (m < 0 || m >= static_cast<int>(E::COUNT)) ? fallback : static_cast<E>(m);
+	};
 
-	// Spectrum
-	v.scale      = menuValue(inputs, ScaleName, Scale::Log);
-	v.displayMax = inputs->getParDouble(DisplaymaxName);
+	// --- Spectrum (always) ---
+	v.scale      = menu(Scale::Log, ScaleName);
+	v.displayMax = getD(DisplaymaxName);
 	if (!(v.displayMax > 0.0)) v.displayMax = 24000.0;
-	v.bins       = std::clamp(inputs->getParInt(BinsName), kMinBins, kMaxBins);
-	v.warp       = std::clamp(inputs->getParDouble(WarpName), 0.0, 1.0);
-	v.logFloor   = std::max(1.0, inputs->getParDouble(LogfloorName));
-	v.winMode    = menuValue(inputs, WinmodeName, WinMode::Samples);
-	v.winSamples = std::clamp(inputs->getParInt(WinsamplesName), 1, kMaxWinSamples);
-	if (inputs->getParInt(WinsamplesName) <= 0) v.winSamples = 3175;
-	v.winMs      = std::clamp(inputs->getParDouble(WinmsName), 0.1, 5000.0);
-	v.padIndex   = inputs->getParInt(PadName);
+	{
+		int bins = getI(BinsName);
+		v.bins = (bins <= 0) ? 16384 : std::clamp(bins, kMinBins, kMaxBins);
+	}
+	v.warp       = std::clamp(getD(WarpName), 0.0, 1.0);
+	v.logFloor   = std::max(1.0, getD(LogfloorName));
+	v.winMode    = menu(WinMode::Samples, WinmodeName);
+	if (v.winMode == WinMode::Milliseconds) {
+		v.winMs = std::clamp(getD(WinmsName), 0.1, 5000.0);
+	} else {
+		int ws = getI(WinsamplesName);
+		v.winSamples = (ws <= 0) ? 3175 : std::clamp(ws, 1, kMaxWinSamples);
+	}
+	v.padIndex   = getI(PadName);
 	v.padSize    = (v.padIndex >= 0 && v.padIndex < kPadCount) ? kPadValues[v.padIndex] : kPadDefault;
-	v.planner    = menuValue(inputs, PlannerName, Planner::Auto);
+	v.planner    = menu(Planner::Auto, PlannerName);
 
-	// EQ
-	v.gainDb      = inputs->getParDouble(GaindbName);
-	v.cutoffHz    = inputs->getParDouble(CutoffhzName);
-	v.lowGainDb   = inputs->getParDouble(LowgaindbName);
-	v.lowCutoffHz = inputs->getParDouble(LowcutoffhzName);
-	v.q           = inputs->getParDouble(QName);
-	v.amount      = inputs->getParDouble(AmountName);
+	// --- EQ (only when enabled) ---
+	v.eqEnable = getI(EqenableName) != 0;
+	if (v.eqEnable) {
+		v.highShelf   = getI(HighshelfName) != 0;
+		v.lowShelf    = getI(LowshelfName) != 0;
+		v.gainDb      = v.highShelf ? getD(GaindbName) : 0.0;
+		v.cutoffHz    = v.highShelf ? getD(CutoffhzName) : 1000.0;
+		v.lowGainDb   = v.lowShelf ? getD(LowgaindbName) : 0.0;
+		v.lowCutoffHz = v.lowShelf ? getD(LowcutoffhzName) : 200.0;
+		v.q           = getD(QName);
+		v.amount      = getD(AmountName);
+	}
 
-	// Window & weighting
-	v.window     = menuValue(inputs, WindowName, WindowType::Kaiser);
-	v.kaiserBeta = std::clamp(inputs->getParDouble(KaiserName), 0.0, 100.0);
-	v.weighting  = menuValue(inputs, WeightingName, Weighting::Off);
-	v.magNorm    = menuValue(inputs, MagnormName, MagNorm::CoherentGain);
+	// --- Window & weighting ---
+	v.window     = menu(WindowType::Kaiser, WindowName);
+	if (v.window == WindowType::Kaiser) v.kaiserBeta = std::clamp(getD(KaiserName), 0.0, 100.0);
+	v.weighting  = menu(Weighting::Off, WeightingName);
+	v.magNorm    = menu(MagNorm::CoherentGain, MagnormName);
 
-	// Loudness & ballistics
-	v.loudness  = menuValue(inputs, LoudnessName, Loudness::Off);
-	v.dbRef     = menuValue(inputs, DbrefName, DbRef::FramePeak);
-	v.dbRange   = std::max(1e-3, inputs->getParDouble(DbrangeName));
-	v.ballMode  = menuValue(inputs, BallmodeName, BallisticsMode::Coefficient);
-	v.attack    = std::clamp(inputs->getParDouble(AttackName), 0.0, 0.99);
-	v.release   = std::clamp(inputs->getParDouble(ReleaseName), 0.0, 0.99);
-	v.attackMs  = std::max(0.0, inputs->getParDouble(AttackmsName));
-	v.releaseMs = std::max(0.0, inputs->getParDouble(ReleasemsName));
+	// --- Loudness (dB options only when a dB mode is active) ---
+	v.loudness = menu(Loudness::Off, LoudnessName);
+	if (v.loudness != Loudness::Off) {
+		v.dbRef   = menu(DbRef::FramePeak, DbrefName);
+		v.dbRange = std::max(1e-3, getD(DbrangeName));
+	}
 
-	// Performance
-	v.parallel    = inputs->getParInt(ParallelName) != 0;
-	v.parallelMin = std::clamp(inputs->getParInt(ParallelminName), 2, kMaxChannels);
+	// --- Ballistics (only when enabled) ---
+	v.ballEnable = getI(BallenableName) != 0;
+	if (v.ballEnable) {
+		v.ballMode = menu(BallisticsMode::Coefficient, BallmodeName);
+		if (v.ballMode == BallisticsMode::Milliseconds) {
+			v.attackMs  = std::max(0.0, getD(AttackmsName));
+			v.releaseMs = std::max(0.0, getD(ReleasemsName));
+		} else {
+			v.attack  = std::clamp(getD(AttackName), 0.0, 0.99);
+			v.release = std::clamp(getD(ReleaseName), 0.0, 0.99);
+		}
+	}
+
+	// --- Performance ---
+	v.parallel = getI(ParallelName) != 0;
+	if (v.parallel) v.parallelMin = std::clamp(getI(ParallelminName), 2, kMaxChannels);
+
+	if (reads) *reads = n;
 	return v;
 }
 

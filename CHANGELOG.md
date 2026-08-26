@@ -4,6 +4,30 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.2.2] - 2026-08-26 — "why is it slower than in July?"
+
+A per-stage benchmark of **every commit since the first one** (`bench/`, same flags, interleaved runs) answered it:
+the early builds (`0c529f7`…`b4dac6f`) ran the FFT with `FFTW_MEASURE` plans (≈36 µs instead of 54) **and their EQ was
+dead** (`hasActiveFilter` evaluated before the design call — fixed in `d60b7e3`, which silently switched the default
+6 dB high shelf ON: +16 µs per channel per cook). Later commits went back to `ESTIMATE` (+18 µs). Together that is the
+~2× you remembered. This release gets the fast configuration back without re-breaking anything:
+
+### Performance
+- **EQ runs at ingest** on the new samples only, with continuous IIR state: 16 µs → 3.6 µs per channel, and it is now
+  *correct* (the previous per-window re-filter restarted the filter from a stale state every frame; the new test shows
+  a 0.19 error vs the true filter output for the legacy path).
+- **Section enable toggles that bypass code AND parameter reads** (TouchDesigner `getPar*` calls are not free):
+  `EQ Enable` (+ `High Shelf` / `Low Shelf`), `Ballistics Enable`; dB options are read only when `Loudness ≠ Off`,
+  `Kaiser Beta` only for the Kaiser window, ms fields only in ms modes. Default configuration: 19 parameter reads
+  instead of 31. **Defaults: EQ off, ballistics off** (what the early builds effectively did).
+- **`FFT Planner = Auto` now means: instant plan now, measured plan upgraded in the background.** If wisdom already
+  holds a measured plan (`FFTW_MEASURE | FFTW_WISDOM_ONLY`) it is used immediately; otherwise an `ESTIMATE` plan is
+  used for the first cooks while a background thread measures the better one, which is swapped in atomically on the
+  next cook and saved to wisdom. No stall, ever; the FFT stage runs at the early builds' ~36 µs after the first run.
+- Info CHOP `param_reads`, Info DAT `cook_time` now shows `params N us / M reads`.
+
+Default TD configuration (Loudness/Weighting/EQ/Ballistics off), 1 channel: **67 µs → 44–51 µs**.
+
 ## [v2.2.1] - 2026-08-26
 
 ### Fixed (performance regression found by benchmarking old vs new head-to-head)

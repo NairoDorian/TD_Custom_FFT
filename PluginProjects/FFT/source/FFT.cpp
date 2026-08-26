@@ -264,19 +264,31 @@ void
 FFT::processChannel(ChannelState& st, const OP_CHOPInput* cinput, int ch, CHOP_Output* output,
                     const Parameters::Values& p, float attackCoef, float releaseCoef, float agcDecay) noexcept
 {
-	// 1. Ingest new audio samples into the FIFO
+	// 1. Ingest new audio samples into the FIFO. The EQ (when active) runs here, on the NEW samples only,
+	//    with continuous IIR state — each sample is filtered once, in time order. (Re-filtering the whole
+	//    3175-sample window every frame cost ~16 us/channel and restarted the filter from a stale state.)
 	if (cinput && cinput->numChannels > 0 && cinput->numSamples > 0) {
 		const float* cdata = cinput->getChannelData(std::min(ch, cinput->numChannels - 1));
-		if (cdata) st.fifo.add(cdata, static_cast<size_t>(cinput->numSamples));
+		const size_t n = static_cast<size_t>(cinput->numSamples);
+		if (cdata) {
+			const bool has_eq = p.eqEnable && st.eq.updateAndCheckActive(p.gainDb, p.cutoffHz, p.lowGainDb, p.lowCutoffHz, p.q, p.amount);
+			if (has_eq) {
+				// only the samples that will still be inside the window need filtering
+				const size_t keep = std::min(n, st.fifo.capacity());
+				const float* tail = cdata + (n - keep);
+				if (st.eq_block.size() < keep) st.eq_block.resize(keep);
+				std::memcpy(st.eq_block.data(), tail, keep * sizeof(float));
+				st.eq.processBlockInPlace(st.eq_block.data(), keep, p.amount);
+				st.fifo.add(st.eq_block.data(), keep);
+			} else {
+				st.fifo.add(cdata, n);
+			}
+		}
 	}
 
 	// 2. Linearize
 	st.fifo.get(st.captured_signal);
-
-	// 3. EQ (zero-copy bypass when inactive)
-	bool has_eq = st.eq.updateAndCheckActive(p.gainDb, p.cutoffHz, p.lowGainDb, p.lowCutoffHz, p.q, p.amount);
-	if (has_eq) st.eq.processAudio(st.captured_signal, p.amount, st.processed_signal);
-	const float* proc_data = has_eq ? st.processed_signal.data() : st.captured_signal.data();
+	const float* proc_data = st.captured_signal.data();
 
 	// 4. Window into the aligned centre of the persistent zero-padded frame
 	size_t win_len = std::min(myBufferCapacity, myWindowBuffer.size());
@@ -354,7 +366,9 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	const auto t_start = std::chrono::steady_clock::now();
 
 	myExecStage = 1; // parameters
-	const Parameters::Values p = Parameters::eval(inputs);
+	int param_reads = 0;
+	const Parameters::Values p = Parameters::eval(inputs, &param_reads);
+	myLastParamReads = param_reads;
 	myLastParamUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_start).count();
 
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
@@ -382,6 +396,8 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	                   || planner != myCachedPlanner
 	                   || !myFFTEngine;
 	if (rebuild_needed) rebuildDSP(sr, win_samples, p.padSize, planner, p.bins);
+	// Swap in a background-measured plan when one is ready (main thread, before any channel executes)
+	if (myFFTEngine) myFFTEngine->pollBackgroundPlan();
 
 	myExecStage = 3; // channels
 	int num_channels = std::clamp(output->numChannels, 0, Parameters::kMaxChannels);
@@ -399,9 +415,11 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	updateWarp(p);
 	updateWeighting(p);
 
-	// ballistics coefficients
-	float attackCoef, releaseCoef;
-	if (p.ballMode == Parameters::BallisticsMode::Milliseconds) {
+	// ballistics coefficients (0/0 = bypassed)
+	float attackCoef = 0.0f, releaseCoef = 0.0f;
+	if (!p.ballEnable) {
+		// section disabled: nothing to do
+	} else if (p.ballMode == Parameters::BallisticsMode::Milliseconds) {
 		attackCoef  = FFTDSP::BallisticsFilter::coefFromMs(p.attackMs, dt_ms);
 		releaseCoef = FFTDSP::BallisticsFilter::coefFromMs(p.releaseMs, dt_ms);
 	} else {
@@ -459,7 +477,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 int32_t
 FFT::getNumInfoCHOPChans(void* reserved1)
 {
-	return 11;
+	return 12;
 }
 
 void
@@ -483,6 +501,7 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 	case 8: chan->name->setString("cook_time_us");     chan->value = static_cast<float>(myLastCookUs); break;
 	case 9: chan->name->setString("linear_bins");      chan->value = static_cast<float>(myFFTSize / 2 + 1); break;
 	case 10: chan->name->setString("param_fetch_us");  chan->value = static_cast<float>(myLastParamUs); break;
+	case 11: chan->name->setString("param_reads");     chan->value = static_cast<float>(myLastParamReads); break;
 	}
 }
 
@@ -520,7 +539,7 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 #endif
 		return;
 	case 9: row("fft_engine", myFFTEngine ? myFFTEngine->getPlanStatus() : std::string("Uninitialized")); return;
-	case 10: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us (params %.1f us)%s", myLastCookUs, myLastParamUs, myParallelActive ? " (parallel)" : ""); row("cook_time", tempBuffer); return;
+	case 10: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us (params %.1f us / %d reads)%s", myLastCookUs, myLastParamUs, myLastParamReads, myParallelActive ? " (parallel)" : ""); row("cook_time", tempBuffer); return;
 	case 11: row("wisdom_file", FFTDSP::FFTWEngine::wisdomPath()); return;
 	default: break;
 	}

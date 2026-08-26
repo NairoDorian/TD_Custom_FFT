@@ -43,6 +43,8 @@ not a performance change.
 #include <string>
 #include <chrono>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
 #include <cstdlib>    // _aligned_malloc / _aligned_free for 32-byte SIMD alignment
 
@@ -384,6 +386,19 @@ public:
             float x = src[i];
             float filtered = m_low_shelf.process(m_high_shelf.process(x));
             dst[i] = x + amt * (filtered - x);
+        }
+    }
+
+    // Streaming (stateful) processing of a block of NEW samples in place: data[i] = x + amount*(eq(x) - x).
+    // Used at ingest so each sample is filtered exactly once, in time order, with continuous IIR state
+    // (re-filtering the whole analysis window every frame is 4x the work and restarts the filter
+    // from a stale state at every window start).
+    inline void processBlockInPlace(float* data, size_t n, double amount) noexcept {
+        const float amt = static_cast<float>(amount);
+        for (size_t i = 0; i < n; ++i) {
+            float x = data[i];
+            float filtered = m_low_shelf.process(m_high_shelf.process(x));
+            data[i] = x + amt * (filtered - x);
         }
     }
 
@@ -928,6 +943,8 @@ public:
                              AlignedComplexVector& scratch_complex) const noexcept = 0;
     virtual std::string getPlanStatus() const = 0;
     virtual size_t fftSize() const noexcept = 0;
+    // Called once per cook on the cooking thread; returns true if a better plan was swapped in.
+    virtual bool pollBackgroundPlan() { return false; }
 };
 
 // |X| for n_complex interleaved complex floats (raw_c and mptr 32-byte aligned).
@@ -983,13 +1000,20 @@ process-wide mutex; fftwf_execute_dft_r2c on distinct arrays is thread-safe.
 class FFTWEngine : public IFFTEngine {
 public:
     FFTWEngine() = default;
-    ~FFTWEngine() override { destroyPlan(); }
+    ~FFTWEngine() override {
+        joinBackground();
+        destroyPlan();
+    }
     FFTWEngine(const FFTWEngine&) = delete;
     FFTWEngine& operator=(const FFTWEngine&) = delete;
 
     static std::mutex& plannerMutex() { static std::mutex m; return m; }
 
+    // Optional override of the wisdom file location (tests, portable installs). Empty = default.
+    static std::string& wisdomPathOverride() { static std::string s; return s; }
+
     static std::string wisdomPath() {
+        if (!wisdomPathOverride().empty()) return wisdomPathOverride();
 #ifdef _WIN32
         char base[MAX_PATH] = { 0 };
         DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
@@ -1017,7 +1041,13 @@ public:
         return ok;
     }
 
+    static void exportWisdom() {
+        std::string path = wisdomPath();
+        if (!path.empty()) fftwf_export_wisdom_to_filename(path.c_str());
+    }
+
     void destroyPlan() noexcept {
+        joinBackground();
         if (m_plan) {
             std::lock_guard<std::mutex> lock(plannerMutex());
             fftwf_destroy_plan(m_plan);
@@ -1029,58 +1059,92 @@ public:
 
     std::string getPlanStatus() const override { return m_planStatus.empty() ? "FFTW3 (Uninitialized)" : m_planStatus; }
     size_t fftSize() const noexcept override { return m_fft_size; }
+    bool upgradeInProgress() const noexcept { return m_bg_running.load(); }
 
+    /*
+      Planner policies
+        Fast     : FFTW_ESTIMATE only (never stalls, generic plan).
+        Measured : FFTW_MEASURE synchronously (best plan; ~0.4 s once per size per machine, then cached in wisdom).
+        Auto     : if wisdom already holds a measured plan for this size (FFTW_MEASURE | FFTW_WISDOM_ONLY) use it
+                   instantly; otherwise use an ESTIMATE plan right away and measure a better one on a background
+                   thread, swap it in on the next cook (pollBackgroundPlan) and save it to wisdom. Real-time is never
+                   interrupted and the second run of any size is already optimal.
+    */
     void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) override {
         if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy) return;
         destroyPlan();
         if (fft_size == 0) return;
         m_fft_size = fft_size;
         m_policy = policy;
-        size_t n_complex = fft_size / 2 + 1;
+        m_log = log;
 
         importWisdomOnce(log);
 
-        int primary = FFTW_ESTIMATE;
-        const char* primary_name = "FFTW_ESTIMATE";
-        switch (policy) {
-            case PlannerPolicy::Measured: primary = FFTW_MEASURE; primary_name = "FFTW_MEASURE"; break;
-            case PlannerPolicy::Fast:     primary = FFTW_ESTIMATE; primary_name = "FFTW_ESTIMATE"; break;
-            case PlannerPolicy::Auto:
-            default:
-                if (fft_size <= 16384) { primary = FFTW_MEASURE; primary_name = "FFTW_MEASURE"; }
-                break;
-        }
-
-        float* dummy_in = static_cast<float*>(fftwf_malloc(sizeof(float) * fft_size));
-        fftwf_complex* dummy_out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * n_complex));
-        if (dummy_in && dummy_out) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        const char* used = "FFTW_ESTIMATE";
+        bool start_background = false;
+        {
             std::lock_guard<std::mutex> lock(plannerMutex());
-            auto t0 = std::chrono::high_resolution_clock::now();
-            m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, primary);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            const char* used = primary_name;
-            if (!m_plan && primary != FFTW_ESTIMATE) {
-                t0 = std::chrono::high_resolution_clock::now();
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), dummy_in, dummy_out, FFTW_ESTIMATE);
-                t1 = std::chrono::high_resolution_clock::now();
-                ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            Buffers b(fft_size);
+            if (!b.ok()) { m_planStatus = "FFTW3 (allocation failed)"; return; }
+            switch (policy) {
+                case PlannerPolicy::Measured:
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE);
+                    used = "FFTW_MEASURE";
+                    if (m_plan) exportWisdom();
+                    break;
+                case PlannerPolicy::Fast:
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                    break;
+                case PlannerPolicy::Auto:
+                default:
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE | FFTW_WISDOM_ONLY);
+                    if (m_plan) {
+                        used = "FFTW_MEASURE (from wisdom)";
+                    } else {
+                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                        used = "FFTW_ESTIMATE (measuring in background)";
+                        start_background = true;
+                    }
+                    break;
+            }
+            if (!m_plan && policy != PlannerPolicy::Fast) {
+                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
                 used = "FFTW_ESTIMATE (fallback)";
             }
-            if (m_plan) {
-                m_planStatus = "FFTW3 (" + std::string(used) + " - " + std::to_string(ms) + " ms, N=" + std::to_string(fft_size) + ")";
-                if (log) log->log("[FFT Plugin] [FFTW3] plan N=" + std::to_string(fft_size) + " " + used + " in " + std::to_string(ms) + " ms");
-                if (primary == FFTW_MEASURE) {
-                    std::string path = wisdomPath();
-                    if (!path.empty()) fftwf_export_wisdom_to_filename(path.c_str());
-                }
-            } else {
-                m_planStatus = "FFTW3 (plan creation FAILED)";
-                if (log) log->log("[FFT Plugin] [FFTW3] ERROR: plan creation failed for N=" + std::to_string(fft_size));
-            }
         }
-        if (dummy_in) fftwf_free(dummy_in);
-        if (dummy_out) fftwf_free(dummy_out);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+        if (m_plan) {
+            m_planStatus = "FFTW3 (" + std::string(used) + " - " + std::to_string(ms) + " ms, N=" + std::to_string(fft_size) + ")";
+            if (log) log->log("[FFT Plugin] [FFTW3] plan N=" + std::to_string(fft_size) + " " + used + " in " + std::to_string(ms) + " ms");
+        } else {
+            m_planStatus = "FFTW3 (plan creation FAILED)";
+            if (log) log->log("[FFT Plugin] [FFTW3] ERROR: plan creation failed for N=" + std::to_string(fft_size));
+            return;
+        }
+        if (start_background) startBackgroundMeasure(fft_size);
+    }
+
+    // Call once per cook from the cooking thread (before any channel executes). Swaps in a
+    // background-measured plan when one is ready. Returns true when the plan changed.
+    bool pollBackgroundPlan() override {
+        fftwf_plan ready = m_bg_plan.exchange(nullptr);
+        if (!ready) return false;
+        if (m_bg_size != m_fft_size) {                 // size changed meanwhile: discard
+            std::lock_guard<std::mutex> lock(plannerMutex());
+            fftwf_destroy_plan(ready);
+            joinBackground();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(plannerMutex());
+            if (m_plan) fftwf_destroy_plan(m_plan);
+            m_plan = ready;
+        }
+        joinBackground();
+        m_planStatus = "FFTW3 (FFTW_MEASURE upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
+        if (m_log) m_log->log("[FFT Plugin] [FFTW3] background FFTW_MEASURE plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in");
+        return true;
     }
 
     void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
@@ -1100,10 +1164,58 @@ public:
     }
 
 private:
+    struct Buffers {
+        float* in{ nullptr }; fftwf_complex* out{ nullptr };
+        explicit Buffers(size_t n) {
+            in = static_cast<float*>(fftwf_malloc(sizeof(float) * n));
+            out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n / 2 + 1)));
+        }
+        ~Buffers() { if (in) fftwf_free(in); if (out) fftwf_free(out); }
+        bool ok() const { return in && out; }
+    };
+
+    void startBackgroundMeasure(size_t fft_size) {
+        joinBackground();
+        m_bg_size = fft_size;
+        m_bg_running = true;
+        m_bg_thread = std::thread([this, fft_size]() {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            fftwf_plan p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
+                Buffers b(fft_size);
+                if (b.ok()) p = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE);
+                if (p) exportWisdom();
+            }
+            m_bg_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            m_bg_plan.store(p);
+            m_bg_running = false;
+        });
+    }
+
+    void joinBackground() noexcept {
+        if (m_bg_thread.joinable()) {
+            try { m_bg_thread.join(); } catch (...) {}
+        }
+        fftwf_plan leftover = m_bg_plan.exchange(nullptr);
+        if (leftover) {
+            std::lock_guard<std::mutex> lock(plannerMutex());
+            fftwf_destroy_plan(leftover);
+        }
+        m_bg_running = false;
+    }
+
     fftwf_plan m_plan{ nullptr };
     size_t m_fft_size{ 0 };
     PlannerPolicy m_policy{ PlannerPolicy::Auto };
     std::string m_planStatus{ "FFTW3 (Uninitialized)" };
+    PlanLog* m_log{ nullptr };
+
+    std::thread m_bg_thread;
+    std::atomic<fftwf_plan> m_bg_plan{ nullptr };
+    std::atomic<bool> m_bg_running{ false };
+    size_t m_bg_size{ 0 };
+    double m_bg_ms{ 0.0 };
 };
 
 } // namespace FFTDSP

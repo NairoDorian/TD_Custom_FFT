@@ -78,8 +78,10 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Spectrum | Window Sampling | Int | 3175 | analysis window in samples (= 72 ms @ 44.1 kHz) |
 | Spectrum | Window Length ms | Float | 72 | used when mode = Milliseconds |
 | Spectrum | Zero-Pad Len | Menu | 32768 | FFT size (auto-grown to ≥ next pow2 of the window) |
-| Spectrum | FFT Planner | Menu | Auto | Auto: MEASURE ≤ 16K / ESTIMATE above · Fast · Measured (wisdom-cached) |
-| EQ | High/Low Boost dB, Cutoff Hz, Q, Blend | Float | 6 / 1000 / 0 / 200 / 0.707 / 1 | RBJ shelving EQ, bypassed when gains are 0 |
+| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) |
+| EQ | EQ Enable | Toggle | **Off** | Off = no EQ code and no EQ parameter reads at all |
+| EQ | High Shelf / Low Shelf | Toggle | On / On | per-shelf bypass (only read when EQ Enable is on) |
+| EQ | High/Low Boost dB, Cutoff Hz, Q, Blend | Float | 6 / 1000 / 0 / 200 / 0.707 / 1 | RBJ shelving EQ applied at ingest to new samples (stateful, 3.6 µs/channel) |
 | Window & Weighting | Window Type | Menu | Kaiser | Kaiser / Hann / Hamming / Blackman / Blackman-Harris / Rectangular |
 | Window & Weighting | Kaiser Beta | Float | 15 | |
 | Window & Weighting | Loudness Weighting | Menu | Off | Off / A / C / ITU-R 468 |
@@ -87,6 +89,7 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Loudness & Ballistics | Loudness Mode | Menu | Off | Off (linear) / dB / dB normalized 0…1 |
 | Loudness & Ballistics | dB Reference | Menu | Frame Peak | Frame Peak / 0 dBFS / Slow AGC |
 | Loudness & Ballistics | dB Range Floor | Float | 80 | |
+| Loudness & Ballistics | Ballistics Enable | Toggle | **Off** | Off = no ballistics code and no attack/release parameter reads |
 | Loudness & Ballistics | Ballistics Mode | Menu | Coefficient | Coefficient (per frame) or Milliseconds |
 | Loudness & Ballistics | Attack / Release Speed | Float | 0 / 0 | per-frame coefficients 0…0.99 |
 | Loudness & Ballistics | Attack / Release ms | Float | 50 / 200 | used when mode = Milliseconds |
@@ -94,18 +97,23 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Performance | Parallel Channels | Toggle | Off | multithread channels (opt-in; worthwhile from ~8 channels) |
 | Performance | Parallel Min Channels | Int | 8 | threshold for parallel processing |
 
-Defaults reproduce the previous version's output exactly (Coherent Gain, Frame Peak, Samples, Coefficient).
+Defaults (Coherent Gain, Frame Peak, Samples, Coefficient; EQ and Ballistics **off**) reproduce the spectrum of the
+early builds, in which the EQ was inactive. Every optional section is bypassed entirely — code *and* parameter
+reads — when disabled: 19 `getPar*` calls per cook in the default configuration instead of 31.
 
-## Performance (fft_bench, i7-class desktop, 1 channel)
+## Performance (fft_bench, i7-class desktop, 1 channel, N = 32768, 16384 bins, Log)
 
-| Configuration | FFT+mag | warp | dB | total / channel |
-|---|---|---|---|---|
-| Defaults (N = 32768, 16384 bins, Log, dB, Auto planner) | 55 µs | 4.9 µs | 8.4 µs | **72 µs** |
-| Same, `FFT Planner = Measured` (after first run) | 32 µs | 4.9 µs | 8.4 µs | **48 µs** |
-| N = 8192 | 6.4 µs | 4.7 µs | 8.0 µs | **22 µs** |
-| Linear scale, 16385 bins (identity bypass) | 52 µs | 1.2 µs | 8.0 µs | 67 µs |
+| Configuration | FFT+mag | warp | EQ | dB | total / channel |
+|---|---|---|---|---|---|
+| **Default TD config** (Loudness/Weighting/EQ/Ballistics off), cold plan | 41–48 µs | 4.8 µs | – | – | **44–51 µs** |
+| Same after the background measured plan is in (or wisdom cached) | ~36 µs | 4.8 µs | – | – | **~42 µs** |
+| + EQ Enable (6 dB high shelf, applied at ingest) | | | 3.6 µs | | +4 µs |
+| Everything on (dB, A-weighting, ballistics, EQ) | 42–50 µs | 5 µs | 3.6 µs | 3.5 µs | **~60–70 µs** |
+| N = 8192 | 6.4 µs | 4.7 µs | – | – | **~15 µs** |
 
-The FFT is 70–77 % of the cost at the default size; `Zero-Pad Len` and `FFT Planner` are the levers that matter.
+The FFT is 75–85 % of the default cost; `Zero-Pad Len` is the lever that matters. History (same bench on every commit):
+the July builds measured 47 µs (measured plan, EQ dead), `d60b7e3` turned the EQ on (+16 µs), `2daf9f1` switched to
+ESTIMATE plans (+18 µs), `f1cb0d0`–`2daf9f1` had a scalar-log10 dB stage (+45 µs when dB was on).
 
 ## License / third party
 

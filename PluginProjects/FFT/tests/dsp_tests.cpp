@@ -207,6 +207,83 @@ static void test_ballistics()
 }
 
 // ------------------------------------------------------------------------------------------
+static void test_eq_streaming()
+{
+    section("BiquadEQ streaming (block ingest == one-shot)");
+    const size_t total = 3175 * 3;
+    std::vector<float> sig(total);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    for (auto& v : sig) v = d(rng);
+
+    BiquadEQ one(44100.0), blocks(44100.0);
+    CHECK(one.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0));
+    CHECK(blocks.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0));
+    AlignedVector whole(sig.begin(), sig.end()), out;
+    one.processAudio(whole, 1.0, out);                       // reference: whole signal in one pass
+
+    std::vector<float> streamed;
+    size_t pos = 0, sizes[] = { 735, 512, 1024, 735, 3 };
+    int k = 0;
+    while (pos < total) {
+        size_t n = std::min(sizes[k++ % 5], total - pos);
+        std::vector<float> blk(sig.begin() + pos, sig.begin() + pos + n);
+        blocks.processBlockInPlace(blk.data(), n, 1.0);
+        streamed.insert(streamed.end(), blk.begin(), blk.end());
+        pos += n;
+    }
+    double max_err = 0.0;
+    for (size_t i = 0; i < total; ++i) max_err = std::max(max_err, std::abs(static_cast<double>(streamed[i]) - out[i]));
+    std::printf("  streaming vs one-shot max error: %.2e\n", max_err);
+    CHECK(max_err < 1e-4);   // identical recurrence; only float rounding of the blend differs
+    // and a windowed-per-frame re-filter (the legacy behaviour) does NOT match the true filter output
+    BiquadEQ legacy(44100.0);
+    legacy.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0);
+    AlignedVector w1(sig.begin(), sig.begin() + 3175), w2(sig.begin() + 735, sig.begin() + 735 + 3175), o1, o2;
+    legacy.processAudio(w1, 1.0, o1);
+    legacy.processAudio(w2, 1.0, o2);
+    double legacy_err = 0.0;
+    for (size_t i = 0; i < 3175; ++i) legacy_err = std::max(legacy_err, std::abs(static_cast<double>(o2[i]) - out[735 + i]));
+    std::printf("  legacy per-window re-filter error vs true output: %.2e (expected > 0: stale state at window start)\n", legacy_err);
+    CHECK(legacy_err > 1e-4);
+
+    // inactive EQ is a pass-through in place
+    BiquadEQ off(44100.0);
+    CHECK(!off.updateAndCheckActive(0.0, 1000.0, 0.0, 200.0, 0.707, 1.0));
+    float x[4] = { 1, 2, 3, 4 };
+    off.processBlockInPlace(x, 4, 1.0);
+    CHECK(x[0] == 1 && x[3] == 4);
+}
+
+// ------------------------------------------------------------------------------------------
+static void test_background_plan()
+{
+    section("FFTWEngine Auto planner (instant + background measure)");
+    // private wisdom file so the test neither depends on nor modifies the user's cache
+    FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";
+    std::remove("fft_tests_wisdom.txt");
+    PlanLog log;
+    FFTWEngine e;
+    auto t0 = std::chrono::steady_clock::now();
+    e.prepare(65536, PlannerPolicy::Auto, &log);            // a size unlikely to be in wisdom on a fresh machine
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("  prepare(65536, Auto) returned in %.1f ms: %s\n", ms, e.getPlanStatus().c_str());
+    CHECK(ms < 250.0);                                       // never a MEASURE-length stall on the calling thread
+    AlignedVector frame(65536, 0.0f), mag; AlignedComplexVector scratch;
+    frame[100] = 1.0f;
+    e.executeRFFT(frame, mag, scratch);                      // executes while the background thread may be measuring
+    CHECK(mag.size() == 32769);
+    for (int i = 0; i < 400 && !e.pollBackgroundPlan(); ++i) {   // wait for the upgrade (or wisdom-only instant plan)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        e.executeRFFT(frame, mag, scratch);
+    }
+    std::printf("  final: %s\n", e.getPlanStatus().c_str());
+    CHECK(e.getPlanStatus().find("FFTW_MEASURE") != std::string::npos);
+    e.executeRFFT(frame, mag, scratch);
+    CHECK_NEAR(mag[0], 1.0, 1e-4);                           // impulse -> flat magnitude 1
+}
+
+// ------------------------------------------------------------------------------------------
 static void test_pipeline_sine()
 {
     section("FFTWEngine pipeline (1 kHz sine @ 44.1 kHz)");
@@ -265,6 +342,8 @@ int main()
     test_warp();
     test_decibel();
     test_ballistics();
+    test_eq_streaming();
+    test_background_plan();
     test_pipeline_sine();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

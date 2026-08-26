@@ -35,8 +35,8 @@ struct ChannelState {
     FFTDSP::BiquadEQ eq;                           // high/low shelving EQ
     FFTDSP::BallisticsFilter ballistics;           // attack/release envelope
     FFTDSP::AlignedVector prev_spectrum;           // ballistics state
-    FFTDSP::AlignedVector captured_signal;         // linearized FIFO
-    FFTDSP::AlignedVector processed_signal;        // EQ output
+    FFTDSP::AlignedVector captured_signal;         // linearized FIFO (already EQ'd at ingest when EQ is active)
+    FFTDSP::AlignedVector eq_block;                // scratch for the incoming block when EQ is active
     FFTDSP::AlignedVector padded_frame;            // zero-padded FFT input
     FFTDSP::AlignedVector rfft_magnitude;          // |X| (N/2+1)
     FFTDSP::AlignedVector warped_spectrum;         // psychoacoustic grid
@@ -47,7 +47,7 @@ struct ChannelState {
     void initBuffers(size_t windowCapacity, size_t fftSize, size_t numBins) {
         fifo.resize(windowCapacity);
         if (captured_signal.size() != windowCapacity) captured_signal.resize(windowCapacity);
-        if (processed_signal.size() != windowCapacity) processed_signal.resize(windowCapacity);
+        if (eq_block.size() < 4096) eq_block.resize(4096);   // grows on demand for larger input blocks
         padded_frame.assign(fftSize, 0.0f);                   // zero-fill ONCE
         size_t numComplexBins = fftSize / 2 + 1;
         if (rfft_magnitude.size() != numComplexBins) rfft_magnitude.resize(numComplexBins);
@@ -96,6 +96,7 @@ private:
 	bool				myParallelActive{ false };
 	double				myLastCookUs{ 0.0 };
 	double				myLastParamUs{ 0.0 };   // time spent in Parameters::eval() (TouchDesigner parameter fetches)
+	int					myLastParamReads{ 0 };  // number of getPar* calls in the last cook
 
 	double				mySampleRate{ 44100.0 };
 	size_t				myBufferCapacity{ 3175 };
