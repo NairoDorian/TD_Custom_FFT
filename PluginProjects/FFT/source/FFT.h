@@ -95,6 +95,7 @@ private:
 	bool				myCpuOk{ true };
 	bool				myParallelActive{ false };
 	double				myLastCookUs{ 0.0 };
+	double				myLastParamUs{ 0.0 };   // time spent in Parameters::eval() (TouchDesigner parameter fetches)
 
 	double				mySampleRate{ 44100.0 };
 	size_t				myBufferCapacity{ 3175 };

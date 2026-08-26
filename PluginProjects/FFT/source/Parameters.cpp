@@ -178,8 +178,10 @@ void setup(TD::OP_ParameterManager* manager)
 	}
 
 	// --- Page 5: Performance ---
-	appendToggle(manager, "Performance", ParallelName,    ParallelLabel,    true);
-	appendInt   (manager, "Performance", ParallelminName, ParallelminLabel, 4, 2, 64);
+	// Off by default: for a handful of channels the per-frame thread-pool wake-ups cost more
+	// than the ~60 us of work per channel they distribute, and they add frame-time jitter.
+	appendToggle(manager, "Performance", ParallelName,    ParallelLabel,    false);
+	appendInt   (manager, "Performance", ParallelminName, ParallelminLabel, 8, 2, 64);
 }
 
 Values eval(const TD::OP_Inputs* inputs)

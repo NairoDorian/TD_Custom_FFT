@@ -130,8 +130,8 @@ struct Values {
     double     attackMs     = 50.0;
     double     releaseMs    = 200.0;
     // Performance
-    bool       parallel     = true;
-    int        parallelMin  = 4;
+    bool       parallel     = false;   // opt-in: thread-pool wake-ups cost more than they save below ~8 channels
+    int        parallelMin  = 8;
 };
 
 // Fetch all parameters once (clamps every value into its valid range)

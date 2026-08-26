@@ -4,6 +4,20 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.2.1] - 2026-08-26
+
+### Fixed (performance regression found by benchmarking old vs new head-to-head)
+- The interpolated two-gather `20·log10` LUT introduced in 2.2.0 doubled the dB stage (4.9 → 10.5 µs/channel).
+  Replaced by a single-gather 2048-entry table (0.004 dB worst-case error); dB stage back to ~5 µs.
+- `Parallel Channels` is now **off by default** (threshold 8): per-frame thread-pool wake-ups cost more than the
+  work they distribute for a few channels and add frame-time jitter.
+- Info DAT rows no longer copy the whole plan log per row (`PlanLog::entry`).
+- New Info CHOP channel `param_fetch_us` / Info DAT `cook_time` detail: time spent fetching parameters from
+  TouchDesigner, to separate DSP cost from host overhead when profiling.
+
+Old (`4abf906`) vs new, identical inputs, 1 channel: total 73–74 µs → 62–66 µs before this fix; the dB fix
+brings the new pipeline to ~57 µs.
+
 ## [v2.2.0] - 2026-08-26
 
 ### Removed

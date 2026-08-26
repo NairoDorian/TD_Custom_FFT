@@ -17,7 +17,7 @@ standalone with CMake + Ninja and ships headless tests and a per-stage benchmark
   (`%LOCALAPPDATA%\TD_Custom_FFT\fftwf_wisdom.txt`): measured plans are ~40 % faster than estimated ones and
   only cost time the first time a size is used on the machine.
 - **AVX2 / FMA** everywhere it pays: windowing, magnitude (rsqrt + Newton step, 2.2e-7 rel. error),
-  warp interpolation (`vgatherdps`), weighting, interpolated-LUT `20·log10` (2e-5 dB error), ballistics, peak search.
+  warp interpolation (`vgatherdps`), weighting, single-gather 2048-entry LUT `20·log10` (0.004 dB error), ballistics, peak search.
 - **Psychoacoustic scales**: Logarithmic, Mel, ERB, Bark, Chroma, Linear, Mel+Log blend, with a `Warp Blend`
   slider and an identity (memcpy) bypass when the grid is exactly linear.
 - **Equal-loudness weighting**: A (IEC 61672), C, ITU-R 468.
@@ -91,8 +91,8 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Loudness & Ballistics | Attack / Release Speed | Float | 0 / 0 | per-frame coefficients 0…0.99 |
 | Loudness & Ballistics | Attack / Release ms | Float | 50 / 200 | used when mode = Milliseconds |
 | Loudness & Ballistics | Reset | Pulse | | clears ballistics, AGC and EQ state |
-| Performance | Parallel Channels | Toggle | On | multithread channels |
-| Performance | Parallel Min Channels | Int | 4 | threshold for parallel processing |
+| Performance | Parallel Channels | Toggle | Off | multithread channels (opt-in; worthwhile from ~8 channels) |
+| Performance | Parallel Min Channels | Int | 8 | threshold for parallel processing |
 
 Defaults reproduce the previous version's output exactly (Coherent Gain, Frame Peak, Samples, Coefficient).
 

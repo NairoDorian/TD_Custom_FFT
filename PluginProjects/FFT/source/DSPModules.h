@@ -220,6 +220,11 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_history;
     }
+    // Single entry (used per Info DAT row so the whole history is not copied for every row)
+    std::string entry(size_t i) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return i < m_history.size() ? m_history[i] : std::string();
+    }
     size_t size() const { std::lock_guard<std::mutex> lock(m_mutex); return m_history.size(); }
     void clear() { std::lock_guard<std::mutex> lock(m_mutex); m_history.clear(); }
 
@@ -660,54 +665,49 @@ public:
 
 /*
 ===========================================================================
- 6a. FAST 20*log10 (IEEE 754 exponent + interpolated 257-entry mantissa LUT)
+ 6a. FAST 20*log10 (IEEE 754 exponent + 2048-entry mantissa LUT, single gather)
 ===========================================================================
-Max error ~0.0002 dB (was 0.034 dB with the previous truncating 256-entry LUT).
+Max error 20*log10(1 + 1/2048) = 0.0042 dB (the earlier 256-entry table was 0.034 dB).
+One gather per 8 bins: an interpolated two-gather variant measured 2x slower in the
+dB stage for no visible benefit on a display spectrum. The 8 KB table stays L1-resident.
 Table is a function-local static -> thread-safe initialisation.
 */
 class FastLog10 {
 public:
     static constexpr float kLog10_2_Scaled = 6.020599913282299f; // 20 * log10(2)
-    static constexpr int kTableBits = 8;
-    static constexpr int kTableSize = 1 << kTableBits;             // 256 intervals, 257 entries
+    static constexpr int kTableBits = 11;
+    static constexpr int kTableSize = 1 << kTableBits;             // 2048 entries (8 KB)
 
     static const float* dbTable() noexcept {
         static const struct Table {
-            float v[kTableSize + 1];
+            float v[kTableSize];
             Table() {
-                for (int i = 0; i <= kTableSize; ++i)
-                    v[i] = 20.0f * std::log10(1.0f + static_cast<float>(i) / static_cast<float>(kTableSize));
+                for (int i = 0; i < kTableSize; ++i)
+                    v[i] = 20.0f * std::log10(1.0f + (static_cast<float>(i) + 0.5f) / static_cast<float>(kTableSize)); // mid-interval
             }
         } table;
         return table.v;
     }
 
-    // Scalar 20*log10(x) for positive normal x
-    static float scaled(float x) noexcept {
+    // Scalar 20*log10(x) for positive normal x. Pass the table pointer from dbTable() when calling in a loop.
+    static float scaled(float x, const float* t) noexcept {
         uint32_t bits;
         std::memcpy(&bits, &x, sizeof(bits));
         int exp = static_cast<int>((bits >> 23) & 0xFF) - 127;
-        uint32_t mant = bits & 0x7FFFFFu;
-        int idx = static_cast<int>(mant >> (23 - kTableBits));
-        float frac = static_cast<float>(mant & ((1u << (23 - kTableBits)) - 1)) * (1.0f / static_cast<float>(1u << (23 - kTableBits)));
-        const float* t = dbTable();
-        return exp * kLog10_2_Scaled + t[idx] + frac * (t[idx + 1] - t[idx]);
+        int idx = static_cast<int>((bits >> (23 - kTableBits)) & (kTableSize - 1));
+        return exp * kLog10_2_Scaled + t[idx];
     }
+    static float scaled(float x) noexcept { return scaled(x, dbTable()); }
 
 #if defined(__AVX2__)
-    static inline __m256 scaledVec(__m256 v) noexcept {
+    static inline __m256 scaledVec(__m256 v, const float* t) noexcept {
         const __m256i bits = _mm256_castps_si256(v);
         const __m256i exp = _mm256_sub_epi32(_mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF)), _mm256_set1_epi32(127));
-        const __m256i mant = _mm256_and_si256(bits, _mm256_set1_epi32(0x7FFFFF));
-        const __m256i idx = _mm256_srli_epi32(mant, 23 - kTableBits);
-        const __m256i rem = _mm256_and_si256(mant, _mm256_set1_epi32((1 << (23 - kTableBits)) - 1));
-        const __m256 frac = _mm256_mul_ps(_mm256_cvtepi32_ps(rem), _mm256_set1_ps(1.0f / static_cast<float>(1u << (23 - kTableBits))));
-        const float* t = dbTable();
-        const __m256 t0 = _mm256_i32gather_ps(t, idx, 4);
-        const __m256 t1 = _mm256_i32gather_ps(t + 1, idx, 4);
-        const __m256 lut = _mm256_fmadd_ps(frac, _mm256_sub_ps(t1, t0), t0);
+        const __m256i idx = _mm256_and_si256(_mm256_srli_epi32(bits, 23 - kTableBits), _mm256_set1_epi32(kTableSize - 1));
+        const __m256 lut = _mm256_i32gather_ps(t, idx, 4);
         return _mm256_fmadd_ps(_mm256_cvtepi32_ps(exp), _mm256_set1_ps(kLog10_2_Scaled), lut);
     }
+    static inline __m256 scaledVec(__m256 v) noexcept { return scaledVec(v, dbTable()); }
 #endif
 };
 
@@ -807,7 +807,8 @@ public:
         float* data = spectrum.data();
         if (!(inv_ref > 0.0f) || !std::isfinite(inv_ref)) inv_ref = 1.0f;
 
-        const float db_offset = FastLog10::scaled(inv_ref);
+        const float* lut = FastLog10::dbTable();   // hoisted: one static-init guard check per call, not per 8 bins
+        const float db_offset = FastLog10::scaled(inv_ref, lut);
         const float floor_val = static_cast<float>(-top_db);
         const float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
         const float kMinMag = 1e-12f;
@@ -824,8 +825,8 @@ public:
             for (; k + 15 < n; k += 16) {
                 __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
                 __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
-                __m256 db0 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0), db_off_v), floor_v);
-                __m256 db1 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1), db_off_v), floor_v);
+                __m256 db0 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0, lut), db_off_v), floor_v);
+                __m256 db1 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1, lut), db_off_v), floor_v);
                 __m256 n0 = _mm256_mul_ps(_mm256_sub_ps(db0, floor_v), inv_top_db_v);
                 __m256 n1 = _mm256_mul_ps(_mm256_sub_ps(db1, floor_v), inv_top_db_v);
                 _mm256_store_ps(data + k,     _mm256_min_ps(_mm256_max_ps(zero_v, n0), one_v));
@@ -833,7 +834,7 @@ public:
             }
             for (; k + 7 < n; k += 8) {
                 __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                __m256 db = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v), db_off_v), floor_v);
+                __m256 db = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v, lut), db_off_v), floor_v);
                 __m256 nn = _mm256_mul_ps(_mm256_sub_ps(db, floor_v), inv_top_db_v);
                 _mm256_store_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, nn), one_v));
             }
@@ -841,18 +842,18 @@ public:
             for (; k + 15 < n; k += 16) {
                 __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
                 __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
-                _mm256_store_ps(data + k,     _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0), db_off_v), floor_v));
-                _mm256_store_ps(data + k + 8, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1), db_off_v), floor_v));
+                _mm256_store_ps(data + k,     _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0, lut), db_off_v), floor_v));
+                _mm256_store_ps(data + k + 8, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1, lut), db_off_v), floor_v));
             }
             for (; k + 7 < n; k += 8) {
                 __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                _mm256_store_ps(data + k, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v), db_off_v), floor_v));
+                _mm256_store_ps(data + k, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v, lut), db_off_v), floor_v));
             }
         }
 #endif
         for (; k < n; ++k) {
             float raw_v = std::max(kMinMag, data[k]);
-            float db = std::max(FastLog10::scaled(raw_v) + db_offset, floor_val);
+            float db = std::max(FastLog10::scaled(raw_v, lut) + db_offset, floor_val);
             data[k] = (mode == 2) ? std::max(0.0f, std::min(1.0f, (db - floor_val) * inv_top_db)) : db;
         }
     }

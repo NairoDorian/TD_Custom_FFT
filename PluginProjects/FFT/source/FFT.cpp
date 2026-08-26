@@ -355,6 +355,7 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 
 	myExecStage = 1; // parameters
 	const Parameters::Values p = Parameters::eval(inputs);
+	myLastParamUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_start).count();
 
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
 	double sr = 44100.0;
@@ -458,7 +459,7 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 int32_t
 FFT::getNumInfoCHOPChans(void* reserved1)
 {
-	return 10;
+	return 11;
 }
 
 void
@@ -481,6 +482,7 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 	case 7: chan->name->setString("parallel_active");  chan->value = myParallelActive ? 1.0f : 0.0f; break;
 	case 8: chan->name->setString("cook_time_us");     chan->value = static_cast<float>(myLastCookUs); break;
 	case 9: chan->name->setString("linear_bins");      chan->value = static_cast<float>(myFFTSize / 2 + 1); break;
+	case 10: chan->name->setString("param_fetch_us");  chan->value = static_cast<float>(myLastParamUs); break;
 	}
 }
 
@@ -518,15 +520,14 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 #endif
 		return;
 	case 9: row("fft_engine", myFFTEngine ? myFFTEngine->getPlanStatus() : std::string("Uninitialized")); return;
-	case 10: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us%s", myLastCookUs, myParallelActive ? " (parallel)" : ""); row("cook_time", tempBuffer); return;
+	case 10: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us (params %.1f us)%s", myLastCookUs, myLastParamUs, myParallelActive ? " (parallel)" : ""); row("cook_time", tempBuffer); return;
 	case 11: row("wisdom_file", FFTDSP::FFTWEngine::wisdomPath()); return;
 	default: break;
 	}
-	auto logs = myLog.snapshot();
 	size_t log_idx = static_cast<size_t>(index - 12);
-	if (log_idx < logs.size()) {
+	if (log_idx < myLog.size()) {
 		snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
-		row(tempBuffer, logs[log_idx]);
+		row(tempBuffer, myLog.entry(log_idx));
 	}
 }
 

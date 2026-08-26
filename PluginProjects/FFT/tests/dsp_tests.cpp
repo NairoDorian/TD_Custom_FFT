@@ -75,7 +75,7 @@ static void test_fastlog10()
         max_err = std::max(max_err, std::abs(ref - FastLog10::scaled(x)));
     }
     std::printf("  scalar max error: %.5f dB\n", max_err);
-    CHECK(max_err < 0.002);
+    CHECK(max_err < 0.006);   // 2048-entry LUT, mid-interval samples: 0.0042 dB worst case
 #if defined(__AVX2__)
     alignas(32) float in[8] = { 1e-6f, 0.001f, 0.5f, 1.0f, 3.7f, 100.0f, 12345.0f, 2.5e5f };
     alignas(32) float out[8];
@@ -180,10 +180,10 @@ static void test_decibel()
     AlignedVector a = s, b = s;
     float peak = peakMagnitude(s.data(), s.size());
     DecibelConverter::convertToDB(1, 80.0, 1.0f / peak, a);
-    CHECK_NEAR(a.back(), 0.0, 1e-3);                                 // loudest bin -> 0 dB
-    CHECK_NEAR(a[31], 20.0 * std::log10(32.0 / 64.0), 2e-3);           // -6.02 dB
+    CHECK_NEAR(a.back(), 0.0, 6e-3);                                 // loudest bin -> 0 dB (LUT: <= 0.0042 dB)
+    CHECK_NEAR(a[31], 20.0 * std::log10(32.0 / 64.0), 6e-3);           // -6.02 dB
     DecibelConverter::convertToDB(2, 80.0, 1.0f / peak, b);
-    CHECK_NEAR(b.back(), 1.0, 1e-4);
+    CHECK_NEAR(b.back(), 1.0, 1e-3);
     for (float v : b) CHECK(v >= 0.0f && v <= 1.0f);
     // tiny values clamp to the floor
     AlignedVector z(16, 0.0f);
