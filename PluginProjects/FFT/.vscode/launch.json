@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach to running TouchDesigner",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}",
+            "symbolSearchPath": "${workspaceFolder}/build/bin/Debug;${workspaceFolder}/build/bin/RelWithDebInfo"
+        },
+        {
+            "name": "Launch TouchDesigner (Plugin_FFT.toe)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "C:/Program Files/Derivative/TouchDesigner/bin/TouchDesigner.exe",
+            "args": [
+                "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT/Plugin_FFT.toe"
+            ],
+            "cwd": "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT",
+            "console": "internalConsole",
+            "environment": [
+                {
+                    "name": "TOUCH_TEXT_CONSOLE",
+                    "value": "1"
+                }
+            ]
+        }
+    ]
+}

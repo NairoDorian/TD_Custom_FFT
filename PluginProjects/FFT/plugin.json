@@ -1,0 +1,10 @@
+{
+  "name": "FFT",
+  "family": "CHOP",
+  "optype": "Fftcustom",
+  "template": "BasicCHOP",
+  "features": [],
+  "deps": ["fftw3"],
+  "api_versions": { "CHOP": 10, "Common": 2 },
+  "version": "2.2.0"
+}
