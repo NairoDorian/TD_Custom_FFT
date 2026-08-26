@@ -45,6 +45,7 @@ not a performance change.
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <deque>
 #include <immintrin.h> // AVX2 & FMA SIMD Compiler Intrinsics
 #include <cstdlib>    // _aligned_malloc / _aligned_free for 32-byte SIMD alignment
 
@@ -112,6 +113,58 @@ constexpr double PI_D = 3.14159265358979323846;
 
 inline bool isAligned32(const void* p) noexcept {
     return (reinterpret_cast<std::uintptr_t>(p) & 31u) == 0;
+}
+
+/*
+===========================================================================
+  0a. DENORMAL GUARD (FTZ / DAZ)
+===========================================================================
+IIR filters and envelope followers decay into denormal floats on silence; every
+operation on a denormal costs ~100 cycles. Set flush-to-zero + denormals-are-zero
+for the duration of a cook / worker job and restore the previous MXCSR afterwards.
+*/
+struct DenormalGuard {
+    unsigned int saved;
+    DenormalGuard() noexcept : saved(_mm_getcsr()) { _mm_setcsr(saved | 0x8040u); }   // FTZ (bit 15) | DAZ (bit 6)
+    ~DenormalGuard() noexcept { _mm_setcsr(saved); }
+    DenormalGuard(const DenormalGuard&) = delete;
+    DenormalGuard& operator=(const DenormalGuard&) = delete;
+};
+
+// True if every sample is exactly 0.0 / -0.0 (digital silence). ~0.05 us for 735 samples.
+inline bool blockIsSilent(const float* x, size_t n) noexcept {
+    size_t i = 0;
+#if defined(__AVX2__)
+    __m256i acc = _mm256_setzero_si256();
+    const __m256i mask = _mm256_set1_epi32(0x7FFFFFFF);
+    for (; i + 7 < n; i += 8) {
+        acc = _mm256_or_si256(acc, _mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i)), mask));
+    }
+    if (!_mm256_testz_si256(acc, acc)) return false;
+#endif
+    for (; i < n; ++i) {
+        uint32_t bits; std::memcpy(&bits, x + i, 4);
+        if (bits & 0x7FFFFFFFu) return false;
+    }
+    return true;
+}
+
+// dst[i] = (a[i] + b[i]) (unaligned ok)
+inline void addInto(const float* __restrict a, const float* __restrict b, float* __restrict dst, size_t n) noexcept {
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 7 < n; i += 8) _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+#endif
+    for (; i < n; ++i) dst[i] = a[i] + b[i];
+}
+
+inline void scaleInPlace(float* __restrict x, size_t n, float g) noexcept {
+    size_t i = 0;
+#if defined(__AVX2__)
+    const __m256 vg = _mm256_set1_ps(g);
+    for (; i + 7 < n; i += 8) _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vg));
+#endif
+    for (; i < n; ++i) x[i] *= g;
 }
 
 /*
@@ -204,19 +257,39 @@ inline void writeToTextport(const std::string& msg) {
 
 class PlanLog {
 public:
+    // deferred = true: messages are queued and written to the Textport by flushToTextport()
+    // (call it from the cooking thread). Worker threads must never call into Python directly.
+    void setDeferred(bool deferred) { std::lock_guard<std::mutex> lock(m_mutex); m_deferred = deferred; }
+
     void log(const std::string& msg, bool echoToTextport = true) {
+        bool deferred;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_history.size() >= kMaxPlanLogEntries) {
                 m_history.erase(m_history.begin(), m_history.begin() + static_cast<std::ptrdiff_t>(m_history.size() / 2));
             }
             m_history.push_back(msg);
+            deferred = m_deferred;
+            if (echoToTextport && deferred) m_pending.push_back(msg);
         }
 #ifdef _WIN32
-        if (echoToTextport) python_logger::writeToTextport(msg);
+        if (echoToTextport && !deferred) python_logger::writeToTextport(msg);
 #else
         (void)echoToTextport;
 #endif
+    }
+
+    // Write queued messages to the Textport (cooking thread only). Returns the number written.
+    size_t flushToTextport() {
+        std::deque<std::string> pending;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pending.swap(m_pending);
+        }
+#ifdef _WIN32
+        for (const auto& m : pending) python_logger::writeToTextport(m);
+#endif
+        return pending.size();
     }
     std::vector<std::string> snapshot() const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -233,6 +306,8 @@ public:
 private:
     mutable std::mutex m_mutex;
     std::vector<std::string> m_history;
+    std::deque<std::string> m_pending;
+    bool m_deferred{ false };
 };
 
 /*
@@ -564,11 +639,19 @@ public:
         }
     }
 
+    // 0 = linear (2 taps), 1 = Catmull-Rom cubic (4 taps, smoother lobes -> allows a smaller FFT)
+    void setInterpolation(int mode) noexcept { m_interp = (mode == 1) ? 1 : 0; }
+    int interpolation() const noexcept { return m_interp; }
+
+    // Highest linear bin index the warp reads (+ cubic look-ahead). Magnitudes above it need not be computed.
+    size_t maxLinearIndex() const noexcept { return m_max_index; }
+
     void buildWarpTables(int scale_code, double fmax, size_t n_out, double nyquist, double warp_blend, double log_floor_hz, size_t nlin) {
         computeTargetHzGrid(scale_code, fmax, n_out, warp_blend, log_floor_hz, m_target_hz);
         m_i0.resize(n_out);
         m_w.resize(n_out);
         m_nlin = nlin;
+        m_max_index = 0;
         double denom = (nlin > 1) ? static_cast<double>(nlin - 1) : 1.0;
         bool is_id = (n_out == nlin);
         const size_t max_i0 = (nlin >= 2) ? nlin - 2 : 0;
@@ -582,6 +665,7 @@ public:
             float weight = static_cast<float>(std::clamp(frac - static_cast<double>(i0_val), 0.0, 1.0));
             m_i0[i] = static_cast<uint32_t>(i0_val);
             m_w[i] = weight;
+            m_max_index = std::max(m_max_index, std::min(nlin - 1, i0_val + 2));
             // identity iff every output bin samples exactly linear bin i (the last bin is
             // represented as i0 = nlin-2 with weight 1.0 because of the clamp above)
             if (is_id && std::abs((static_cast<double>(i0_val) + weight) - static_cast<double>(i)) > 1e-5) is_id = false;
@@ -602,6 +686,10 @@ public:
         const uint32_t* idx = m_i0.data();
         const float* w_ptr = m_w.data();
         size_t i = 0;
+        if (m_interp == 1) {
+            applyWarpCubic(src, dst, idx, w_ptr, n_out, linear_magnitude.size());
+            return;
+        }
 #if defined(__AVX2__)
         // Guard: gathers index src[i0+1]; tables guarantee i0 <= nlin-2 <= src.size()-2.
         if (linear_magnitude.size() >= m_nlin) {
@@ -621,6 +709,47 @@ public:
         }
     }
 
+    // Catmull-Rom: v = 0.5*(2p1 + (-p0+p2)t + (2p0-5p1+4p2-p3)t^2 + (-p0+3p1-3p2+p3)t^3), clamped >= 0
+    void applyWarpCubic(const float* __restrict src, float* __restrict dst, const uint32_t* __restrict idx,
+                        const float* __restrict w_ptr, size_t n_out, size_t src_size) const noexcept {
+        if (src_size < 4 || src_size < m_nlin) {
+            for (size_t i = 0; i < n_out; ++i) { size_t i0 = idx[i]; dst[i] = src[i0] + w_ptr[i] * (src[i0 + 1] - src[i0]); }
+            return;
+        }
+        const int last = static_cast<int>(src_size) - 1;
+        size_t i = 0;
+#if defined(__AVX2__)
+        const __m256i v_zero = _mm256_setzero_si256();
+        const __m256i v_last = _mm256_set1_epi32(last);
+        const __m256i one = _mm256_set1_epi32(1), two = _mm256_set1_epi32(2);
+        const __m256 h = _mm256_set1_ps(0.5f), c2 = _mm256_set1_ps(2.0f), c3 = _mm256_set1_ps(3.0f),
+                     c4 = _mm256_set1_ps(4.0f), c5 = _mm256_set1_ps(5.0f), fz = _mm256_setzero_ps();
+        for (; i + 7 < n_out; i += 8) {
+            __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
+            __m256i im1 = _mm256_max_epi32(_mm256_sub_epi32(vi, one), v_zero);
+            __m256i ip1 = _mm256_min_epi32(_mm256_add_epi32(vi, one), v_last);
+            __m256i ip2 = _mm256_min_epi32(_mm256_add_epi32(vi, two), v_last);
+            __m256 p0 = _mm256_i32gather_ps(src, im1, 4);
+            __m256 p1 = _mm256_i32gather_ps(src, vi, 4);
+            __m256 p2 = _mm256_i32gather_ps(src, ip1, 4);
+            __m256 p3 = _mm256_i32gather_ps(src, ip2, 4);
+            __m256 t = _mm256_loadu_ps(w_ptr + i);
+            __m256 a = _mm256_sub_ps(p2, p0);                                                          // -p0 + p2
+            __m256 b = _mm256_sub_ps(_mm256_fmadd_ps(c4, p2, _mm256_fmsub_ps(c2, p0, _mm256_mul_ps(c5, p1))), p3); // 2p0-5p1+4p2-p3
+            __m256 c = _mm256_add_ps(_mm256_fmsub_ps(c3, p1, _mm256_add_ps(p0, _mm256_mul_ps(c3, p2))), p3);       // -p0+3p1-3p2+p3
+            __m256 poly = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(c, t, b), t, a), t, _mm256_mul_ps(c2, p1));
+            _mm256_storeu_ps(dst + i, _mm256_max_ps(_mm256_mul_ps(h, poly), fz));
+        }
+#endif
+        for (; i < n_out; ++i) {
+            int i0 = static_cast<int>(idx[i]);
+            float p0 = src[std::max(i0 - 1, 0)], p1 = src[i0], p2 = src[std::min(i0 + 1, last)], p3 = src[std::min(i0 + 2, last)];
+            float t = w_ptr[i];
+            float v = 0.5f * (2.0f * p1 + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t * t + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t * t * t);
+            dst[i] = std::max(0.0f, v);
+        }
+    }
+
     const std::vector<double>& targetHz() const noexcept { return m_target_hz; }
     bool isIdentity() const noexcept { return m_is_identity; }
     size_t outputBins() const noexcept { return m_i0.size(); }
@@ -630,6 +759,8 @@ private:
     std::vector<uint32_t> m_i0;
     std::vector<float> m_w;
     size_t m_nlin{ 0 };
+    size_t m_max_index{ 0 };
+    int m_interp{ 0 };
     bool m_is_identity{ false };
 };
 
@@ -939,8 +1070,9 @@ class IFFTEngine {
 public:
     virtual ~IFFTEngine() = default;
     virtual void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) = 0;
+    // n_mag: number of magnitude bins to compute (0 = all N/2+1). Bins above n_mag are left untouched.
     virtual void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
-                             AlignedComplexVector& scratch_complex) const noexcept = 0;
+                             AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept = 0;
     virtual std::string getPlanStatus() const = 0;
     virtual size_t fftSize() const noexcept = 0;
     // Called once per cook on the cooking thread; returns true if a better plan was swapped in.
@@ -1148,7 +1280,7 @@ public:
     }
 
     void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
-                     AlignedComplexVector& scratch_complex) const noexcept override {
+                     AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept override {
         size_t n = padded_signal.size();
         size_t n_complex = n / 2 + 1;
         if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
@@ -1160,7 +1292,8 @@ public:
         } else {
             std::memset(scratch_complex.data(), 0, n_complex * sizeof(std::complex<float>));
         }
-        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), n_complex);
+        size_t count = (n_mag == 0) ? n_complex : std::min(n_complex, ((n_mag + 15) / 16) * 16);   // keep 16-bin SIMD blocks
+        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), std::min(count, n_complex));
     }
 
 private:

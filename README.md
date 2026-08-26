@@ -69,7 +69,9 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 
 | Page | Parameter | Type | Default | Notes |
 |---|---|---|---|---|
+| Spectrum | Channels | Menu | **Mono Mix** | Mono Mix (average all inputs → 1 analysis channel) / First Channel / All Channels (one FFT per channel) |
 | Spectrum | Scale | Menu | Log | Log / Mel / ERB / Bark / Chroma / Linear / Melog |
+| Spectrum | Warp Interpolation | Menu | Linear | Linear (2 taps) / Cubic Catmull-Rom (4 taps; a 16K FFT + cubic looks like 32K + linear at half the cost) |
 | Spectrum | Display Max Hz | Float | 24000 | clamped to Nyquist |
 | Spectrum | Output Bins | Int | 16384 | size of the warped output (hard-clamped 8…262144) |
 | Spectrum | Warp Blend | Float | 0.963 | 0 = linear grid, 1 = fully perceptual |
@@ -94,7 +96,10 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Loudness & Ballistics | Attack / Release Speed | Float | 0 / 0 | per-frame coefficients 0…0.99 |
 | Loudness & Ballistics | Attack / Release ms | Float | 50 / 200 | used when mode = Milliseconds |
 | Loudness & Ballistics | Reset | Pulse | | clears ballistics, AGC and EQ state |
-| Performance | Parallel Channels | Toggle | Off | multithread channels (opt-in; worthwhile from ~8 channels) |
+| Performance | Async Analysis | Toggle | **On** | FFT & post-processing on a worker thread; the cook only ingests and copies (≈ 3–6 µs). Off = inline |
+| Performance | Update Every N Cooks | Int | 1 | recompute every N cooks, hold in between |
+| Performance | Parameter Poll Every N Cooks | Int | 1 | read TouchDesigner parameters every N cooks (host-side cost) |
+| Performance | Parallel Channels | Toggle | Off | multithread channels in sync mode (opt-in; worthwhile from ~8 channels) |
 | Performance | Parallel Min Channels | Int | 8 | threshold for parallel processing |
 
 Defaults (Coherent Gain, Frame Peak, Samples, Coefficient; EQ and Ballistics **off**) reproduce the spectrum of the
@@ -109,7 +114,9 @@ reads — when disabled: 19 `getPar*` calls per cook in the default configuratio
 | Same after the background measured plan is in (or wisdom cached) | ~36 µs | 4.8 µs | – | – | **~42 µs** |
 | + EQ Enable (6 dB high shelf, applied at ingest) | | | 3.6 µs | | +4 µs |
 | Everything on (dB, A-weighting, ballistics, EQ) | 42–50 µs | 5 µs | 3.6 µs | 3.5 µs | **~60–70 µs** |
+| N = 16384 + **Warp Interpolation = Cubic** (visually equivalent to 32K linear) | 15–16 µs | 9 µs | – | – | **24–27 µs** |
 | N = 8192 | 6.4 µs | 4.7 µs | – | – | **~15 µs** |
+| **Async on** (default): cost on the cook thread, any N | – | – | – | – | **≈ 3–6 µs** (ingest + copies; DSP runs on the worker) |
 
 The FFT is 75–85 % of the default cost; `Zero-Pad Len` is the lever that matters. History (same bench on every commit):
 the July builds measured 47 µs (measured plan, EQ dead), `d60b7e3` turned the EQ on (+16 µs), `2daf9f1` switched to

@@ -284,6 +284,81 @@ static void test_background_plan()
 }
 
 // ------------------------------------------------------------------------------------------
+static void test_v23_helpers()
+{
+    section("v2.3 helpers: silence, mix, cubic warp, partial magnitude, deferred log");
+    // silence detection
+    AlignedVector z(735, 0.0f);
+    CHECK(blockIsSilent(z.data(), z.size()));
+    z[3] = -0.0f; CHECK(blockIsSilent(z.data(), z.size()));
+    z[700] = 1e-30f; CHECK(!blockIsSilent(z.data(), z.size()));
+    CHECK(blockIsSilent(z.data(), 5));
+
+    // mono mix helpers
+    std::vector<float> a(100), b(100), m(100);
+    for (int i = 0; i < 100; ++i) { a[i] = static_cast<float>(i); b[i] = static_cast<float>(-2 * i); }
+    addInto(a.data(), b.data(), m.data(), 100);
+    scaleInPlace(m.data(), 100, 0.5f);
+    bool ok = true;
+    for (int i = 0; i < 100; ++i) ok = ok && std::abs(m[i] - (-0.5f * i)) < 1e-6f;
+    CHECK(ok);
+
+    // cubic warp vs scalar Catmull-Rom reference, and identity still bypasses
+    const size_t nlin = 513;
+    AlignedVector src(nlin), out;
+    for (size_t i = 0; i < nlin; ++i) src[i] = static_cast<float>(1.0 + std::sin(i * 0.07) * 0.5);
+    PerceptualWarping w;
+    w.setInterpolation(1);
+    w.buildWarpTables(0, 22050.0, 1000, 22050.0, 0.963, 20.0, nlin);
+    w.applyWarp(src, out);
+    const auto& hz = w.targetHz();
+    double max_err = 0.0;
+    int last = static_cast<int>(nlin) - 1;
+    for (size_t i = 0; i < 1000; ++i) {
+        double frac = hz[i] / 22050.0 * (nlin - 1);
+        double r = std::round(frac); if (std::abs(frac - r) < 1e-6) frac = r;
+        int i0 = static_cast<int>(std::min<double>(nlin - 2, std::floor(frac)));
+        float t = static_cast<float>(frac - i0);
+        float p0 = src[std::max(i0 - 1, 0)], p1 = src[i0], p2 = src[std::min(i0 + 1, last)], p3 = src[std::min(i0 + 2, last)];
+        float v = 0.5f * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+        max_err = std::max(max_err, static_cast<double>(std::abs(std::max(0.0f, v) - out[i])));
+    }
+    std::printf("  cubic warp max error vs scalar reference: %.2e\n", max_err);
+    CHECK(max_err < 1e-4);
+    CHECK(w.maxLinearIndex() <= nlin - 1 && w.maxLinearIndex() >= nlin - 3);
+    w.setInterpolation(1);
+    w.buildWarpTables(5, 22050.0, nlin, 22050.0, 1.0, 20.0, nlin);
+    CHECK(w.isIdentity());
+    w.applyWarp(src, out);
+    CHECK(out[100] == src[100]);
+    // Display Max below Nyquist -> fewer magnitude bins needed
+    w.buildWarpTables(0, 11025.0, 1000, 22050.0, 0.963, 20.0, nlin);
+    std::printf("  maxLinearIndex at half Nyquist: %zu of %zu\n", w.maxLinearIndex(), nlin);
+    CHECK(w.maxLinearIndex() < nlin / 2 + 4);
+
+    // partial magnitude: only the first n_mag bins are written
+    PlanLog log;
+    FFTWEngine e;
+    e.prepare(1024, PlannerPolicy::Fast, &log);
+    AlignedVector frame(1024, 0.0f), mag(513, -1.0f); AlignedComplexVector scratch;
+    frame[0] = 1.0f;
+    e.executeRFFT(frame, mag, scratch, 100);
+    CHECK_NEAR(mag[0], 1.0, 1e-5);
+    CHECK_NEAR(mag[99], 1.0, 1e-5);
+    CHECK(mag[512] == -1.0f);                 // untouched beyond the requested (16-rounded) count
+    e.executeRFFT(frame, mag, scratch, 0);
+    CHECK_NEAR(mag[512], 1.0, 1e-5);
+
+    // deferred log: nothing hits the textport until flushed, history is kept
+    PlanLog dl;
+    dl.setDeferred(true);
+    dl.log("a"); dl.log("b");
+    CHECK(dl.size() == 2);
+    CHECK(dl.flushToTextport() == 2);
+    CHECK(dl.flushToTextport() == 0);
+}
+
+// ------------------------------------------------------------------------------------------
 static void test_pipeline_sine()
 {
     section("FFTWEngine pipeline (1 kHz sine @ 44.1 kHz)");
@@ -343,6 +418,7 @@ int main()
     test_decibel();
     test_ballistics();
     test_eq_streaming();
+    test_v23_helpers();
     test_background_plan();
     test_pipeline_sine();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

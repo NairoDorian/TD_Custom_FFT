@@ -34,6 +34,8 @@ enum class Planner : int { Auto = 0, Fast, Measured, COUNT };
 enum class MagNorm : int { CoherentGain = 0, FullScale, COUNT };
 enum class DbRef : int { FramePeak = 0, Dbfs, Agc, COUNT };
 enum class BallisticsMode : int { Coefficient = 0, Milliseconds, COUNT };
+enum class ChanMode : int { MonoMix = 0, FirstChannel, AllChannels, COUNT };
+enum class WarpInterp : int { Linear = 0, Cubic, COUNT };
 
 // Zero-padded FFT transform lengths, indexed by the "Pad" menu (menu order in Parameters.cpp)
 inline constexpr int kPadValues[7] = { 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
@@ -52,10 +54,12 @@ inline constexpr double kMaxSampleRate  = 384000.0;
 // Names & labels
 // ---------------------------------------------------------------------------
 // Page 1: Spectrum
+constexpr char ChanmodeName[]     = "Chanmode";     constexpr char ChanmodeLabel[]     = "Channels";
 constexpr char ScaleName[]        = "Scale";        constexpr char ScaleLabel[]        = "Scale";
 constexpr char DisplaymaxName[]   = "Displaymax";   constexpr char DisplaymaxLabel[]   = "Display Max Hz";
 constexpr char BinsName[]         = "Bins";         constexpr char BinsLabel[]         = "Output Bins";
 constexpr char WarpName[]         = "Warp";         constexpr char WarpLabel[]         = "Warp Blend";
+constexpr char WarpinterpName[]   = "Warpinterp";   constexpr char WarpinterpLabel[]   = "Warp Interpolation";
 constexpr char LogfloorName[]     = "Logfloor";     constexpr char LogfloorLabel[]     = "Log Floor Hz";
 constexpr char WinmodeName[]      = "Winmode";      constexpr char WinmodeLabel[]      = "Window Length Mode";
 constexpr char WinsamplesName[]   = "Winsamples";   constexpr char WinsamplesLabel[]   = "Window Sampling";
@@ -93,6 +97,9 @@ constexpr char ReleasemsName[]    = "Releasems";    constexpr char ReleasemsLabe
 constexpr char ResetName[]        = "Reset";        constexpr char ResetLabel[]        = "Reset";
 
 // Page 5: Performance
+constexpr char AsyncName[]        = "Async";        constexpr char AsyncLabel[]        = "Async Analysis (worker thread)";
+constexpr char UpdateeveryName[]  = "Updateevery";  constexpr char UpdateeveryLabel[]  = "Update Every N Cooks";
+constexpr char ParampollName[]    = "Parampoll";    constexpr char ParampollLabel[]    = "Parameter Poll Every N Cooks";
 constexpr char ParallelName[]     = "Parallel";     constexpr char ParallelLabel[]     = "Parallel Channels";
 constexpr char ParallelminName[]  = "Parallelmin";  constexpr char ParallelminLabel[]  = "Parallel Min Channels";
 
@@ -101,10 +108,12 @@ constexpr char ParallelminName[]  = "Parallelmin";  constexpr char ParallelminLa
 // ---------------------------------------------------------------------------
 struct Values {
     // Spectrum
+    ChanMode   chanMode     = ChanMode::MonoMix;   // mono is the 99 % use case: one analysis channel
     Scale      scale        = Scale::Log;
     double     displayMax   = 24000.0;
     int        bins         = 16384;
     double     warp         = 0.963;
+    WarpInterp warpInterp   = WarpInterp::Linear;
     double     logFloor     = 20.0;
     WinMode    winMode      = WinMode::Samples;
     int        winSamples   = 3175;
@@ -138,6 +147,8 @@ struct Values {
     double     attackMs     = 50.0;
     double     releaseMs    = 200.0;
     // Performance
+    bool       async        = true;       // analysis on a worker thread; the cook only ingests + copies
+    int        updateEvery  = 1;          // recompute the spectrum every N cooks (hold in between)
     bool       parallel     = false;   // opt-in: thread-pool wake-ups cost more than they save below ~8 channels
     int        parallelMin  = 8;
 };
@@ -146,6 +157,11 @@ struct Values {
 // disabled section costs zero TouchDesigner parameter fetches (they are not free).
 // 'reads' receives the number of getPar* calls performed (telemetry).
 Values eval(const TD::OP_Inputs* inputs, int* reads = nullptr);
+
+// Cheap per-cook reads that must not be cached: parameter poll interval, channel mode, output bins
+int  readParamPoll(const TD::OP_Inputs* inputs);
+ChanMode readChanMode(const TD::OP_Inputs* inputs);
+int  readBins(const TD::OP_Inputs* inputs);
 
 // Registers custom parameters and UI controls with TouchDesigner's parameter manager
 void setup(TD::OP_ParameterManager* manager);

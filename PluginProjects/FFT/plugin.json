@@ -6,5 +6,5 @@
   "features": [],
   "deps": ["fftw3"],
   "api_versions": { "CHOP": 10, "Common": 2 },
-  "version": "2.2.2"
+  "version": "2.3.0"
 }

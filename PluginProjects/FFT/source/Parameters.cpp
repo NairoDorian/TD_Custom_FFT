@@ -108,6 +108,10 @@ const char* kDbrefNames[]      = { "Framepeak", "Dbfs", "Agc" };
 const char* kDbrefLabels[]     = { "Frame Peak (0 dB = loudest bin)", "0 dBFS (absolute)", "Slow AGC (peak follower)" };
 const char* kBallmodeNames[]   = { "Coefficient", "Milliseconds" };
 const char* kBallmodeLabels[]  = { "Per-frame Coefficient", "Milliseconds (frame-rate independent)" };
+const char* kChanmodeNames[]   = { "Monomix", "Firstchannel", "Allchannels" };
+const char* kChanmodeLabels[]  = { "Mono Mix (average all inputs -> 1 channel)", "First Channel Only", "All Channels (one FFT per channel)" };
+const char* kWarpinterpNames[] = { "Linear", "Cubic" };
+const char* kWarpinterpLabels[]= { "Linear (2 taps)", "Cubic Catmull-Rom (4 taps, smoother with smaller FFT)" };
 const char* kPadNames[]        = { "1024", "2048", "4096", "8192", "16384", "32768", "65536" };
 const char* kPadLabels[]       = { "1K Bins", "2K Bins", "4K Bins", "8K Bins", "16K Bins", "32K Bins", "64K Bins" };
 
@@ -121,16 +125,20 @@ static_assert(sizeof(kMagnormNames) / sizeof(kMagnormNames[0]) == static_cast<si
 static_assert(sizeof(kDbrefNames) / sizeof(kDbrefNames[0]) == static_cast<size_t>(DbRef::COUNT), "DbRef menu/enum mismatch");
 static_assert(sizeof(kBallmodeNames) / sizeof(kBallmodeNames[0]) == static_cast<size_t>(BallisticsMode::COUNT), "BallisticsMode menu/enum mismatch");
 static_assert(sizeof(kPadNames) / sizeof(kPadNames[0]) == static_cast<size_t>(kPadCount), "Pad menu/table mismatch");
+static_assert(sizeof(kChanmodeNames) / sizeof(kChanmodeNames[0]) == static_cast<size_t>(ChanMode::COUNT), "ChanMode menu/enum mismatch");
+static_assert(sizeof(kWarpinterpNames) / sizeof(kWarpinterpNames[0]) == static_cast<size_t>(WarpInterp::COUNT), "WarpInterp menu/enum mismatch");
 
 } // namespace
 
 void setup(TD::OP_ParameterManager* manager)
 {
 	// --- Page 1: Spectrum ---
+	appendMenu (manager, "Spectrum", ChanmodeName,   ChanmodeLabel,   kChanmodeNames, kChanmodeLabels, static_cast<int>(ChanMode::MonoMix));
 	appendMenu (manager, "Spectrum", ScaleName,      ScaleLabel,      kScaleNames,   kScaleLabels,   static_cast<int>(Scale::Log));
 	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 48000.0);
 	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 32768);
 	appendFloat(manager, "Spectrum", WarpName,       WarpLabel,       0.963, 0.0, 1.0);
+	appendMenu (manager, "Spectrum", WarpinterpName, WarpinterpLabel, kWarpinterpNames, kWarpinterpLabels, static_cast<int>(WarpInterp::Linear));
 	appendFloat(manager, "Spectrum", LogfloorName,   LogfloorLabel,   20.0, 1.0, 500.0);
 	appendMenu (manager, "Spectrum", WinmodeName,    WinmodeLabel,    kWinmodeNames, kWinmodeLabels, static_cast<int>(WinMode::Samples));
 	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768);
@@ -174,6 +182,9 @@ void setup(TD::OP_ParameterManager* manager)
 	}
 
 	// --- Page 5: Performance ---
+	appendToggle(manager, "Performance", AsyncName,       AsyncLabel,       true);
+	appendInt   (manager, "Performance", UpdateeveryName, UpdateeveryLabel, 1, 1, 16);
+	appendInt   (manager, "Performance", ParampollName,   ParampollLabel,   1, 1, 16);
 	// Off by default: for a handful of channels the per-frame thread-pool wake-ups cost more
 	// than the ~60 us of work per channel they distribute, and they add frame-time jitter.
 	appendToggle(manager, "Performance", ParallelName,    ParallelLabel,    false);
@@ -194,6 +205,7 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	};
 
 	// --- Spectrum (always) ---
+	v.chanMode   = menu(ChanMode::MonoMix, ChanmodeName);
 	v.scale      = menu(Scale::Log, ScaleName);
 	v.displayMax = getD(DisplaymaxName);
 	if (!(v.displayMax > 0.0)) v.displayMax = 24000.0;
@@ -202,6 +214,7 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 		v.bins = (bins <= 0) ? 16384 : std::clamp(bins, kMinBins, kMaxBins);
 	}
 	v.warp       = std::clamp(getD(WarpName), 0.0, 1.0);
+	v.warpInterp = menu(WarpInterp::Linear, WarpinterpName);
 	v.logFloor   = std::max(1.0, getD(LogfloorName));
 	v.winMode    = menu(WinMode::Samples, WinmodeName);
 	if (v.winMode == WinMode::Milliseconds) {
@@ -254,11 +267,32 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	}
 
 	// --- Performance ---
+	v.async       = getI(AsyncName) != 0;
+	v.updateEvery = std::clamp(getI(UpdateeveryName), 1, 16);
 	v.parallel = getI(ParallelName) != 0;
 	if (v.parallel) v.parallelMin = std::clamp(getI(ParallelminName), 2, kMaxChannels);
 
 	if (reads) *reads = n;
 	return v;
+}
+
+int readParamPoll(const TD::OP_Inputs* inputs)
+{
+	return inputs ? std::clamp(inputs->getParInt(ParampollName), 1, 16) : 1;
+}
+
+ChanMode readChanMode(const TD::OP_Inputs* inputs)
+{
+	if (!inputs) return ChanMode::MonoMix;
+	int m = inputs->getParInt(ChanmodeName);
+	return (m < 0 || m >= static_cast<int>(ChanMode::COUNT)) ? ChanMode::MonoMix : static_cast<ChanMode>(m);
+}
+
+int readBins(const TD::OP_Inputs* inputs)
+{
+	if (!inputs) return 16384;
+	int bins = inputs->getParInt(BinsName);
+	return (bins <= 0) ? 16384 : std::clamp(bins, kMinBins, kMaxBins);
 }
 
 } // namespace Parameters

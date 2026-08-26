@@ -20,6 +20,8 @@ using clk = std::chrono::steady_clock;
 
 struct Args {
     int channels = 2, fft = 32768, win = 3175, bins = 16384, scale = 0, iters = 200, db = 1, eq = 0, weight = 1, ball = 1;
+    int interp = 0;            // 0 linear, 1 cubic
+    double fmax = 24000.0;     // Display Max Hz (limits the magnitude bins computed)
     PlannerPolicy planner = PlannerPolicy::Auto;
 };
 
@@ -39,6 +41,8 @@ static Args parse(int argc, char** argv)
         else if (k == "--eq") a.eq = std::atoi(v);
         else if (k == "--weight") a.weight = std::atoi(v);
         else if (k == "--ball") a.ball = std::atoi(v);
+        else if (k == "--interp") a.interp = std::atoi(v);
+        else if (k == "--fmax") a.fmax = std::atof(v);
         else if (k == "--planner") {
             std::string p = v;
             a.planner = (p == "fast") ? PlannerPolicy::Fast : (p == "measured") ? PlannerPolicy::Measured : PlannerPolicy::Auto;
@@ -73,7 +77,11 @@ int main(int argc, char** argv)
     AlignedVector window;
     WindowGenerator::generateWindow(0, 15.0, win, window, WindowNorm::CoherentGain);
     PerceptualWarping warp;
-    warp.buildWarpTables(a.scale, 24000.0 > sr / 2 ? sr / 2 : 24000.0, bins, sr / 2.0, 0.963, 20.0, N / 2 + 1);
+    warp.setInterpolation(a.interp);
+    warp.buildWarpTables(a.scale, a.fmax > sr / 2 ? sr / 2 : a.fmax, bins, sr / 2.0, 0.963, 20.0, N / 2 + 1);
+    const size_t n_mag = std::min(N / 2 + 1, warp.maxLinearIndex() + 1);
+    std::printf("warp: %s interpolation, identity=%d, magnitude bins computed %zu of %zu\n",
+                a.interp ? "cubic" : "linear", warp.isIdentity() ? 1 : 0, n_mag, N / 2 + 1);
     AlignedVector weighting;
     EqualLoudness::computeCurve(1, warp.targetHz(), weighting);
 
@@ -135,7 +143,7 @@ int main(int argc, char** argv)
             tick(t, stages[1]);
             multiplyInto(src, window.data(), c.frame.data() + pad_start, win);
             tick(t, stages[2]);
-            engine.executeRFFT(c.frame, c.mag, c.scratch);
+            engine.executeRFFT(c.frame, c.mag, c.scratch, n_mag);
             tick(t, stages[3]);
             warp.applyWarp(c.mag, c.warped);
             tick(t, stages[4]);

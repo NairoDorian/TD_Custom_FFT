@@ -4,6 +4,41 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.3.0] - 2026-08-26 — mono-first real-time architecture
+
+Implements the roadmap in `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (tiers 0–2 except the FFT library swap).
+
+### Architecture
+- **Async analysis (default on)**: the cook thread only mixes/EQs/ingests the new audio block and copies the last
+  finished spectrum to the output; a worker thread owns the FFT engine, the tables and all DSP state
+  (`AnalysisPipeline`). Mailbox with "latest job wins", mutex-guarded double-buffered results, hold-on-late
+  (never blocks the cook). `Async` off runs the same pipeline inline as before.
+- **Channels = Mono Mix (default)**: every input channel is averaged into ONE analysis channel (a stereo input costs one
+  FFT). `First Channel` and `All Channels` (one FFT per channel, the previous behaviour) are selectable. Output channel
+  for a mixed multichannel input is named `mix_fft`.
+- Worker never calls into Python: the plan log is deferred and flushed to the Textport by the cook thread.
+
+### Real-time
+- **FTZ/DAZ** (flush-to-zero / denormals-are-zero) set on the cook and worker threads — no more 100× slow frames on
+  silence from denormal IIR/ballistics state.
+- **Silence short-circuit**: a channel whose whole window is digital silence outputs zeros without an FFT
+  (linear-magnitude mode).
+- **Parameter Poll Every N Cooks** (default 1): TouchDesigner parameter reads are the host-side cost that scales with
+  options; polling every 2–4 cooks removes most of them at ~33–66 ms UI latency.
+- **Update Every N Cooks** (default 1): recompute the spectrum every N cooks and hold in between (the 3175-sample
+  window overlaps 77 % between consecutive 60 fps cooks anyway).
+- **Magnitude only up to Display Max**: the FFT magnitude is computed only for the linear bins the warp reads.
+- **Warp Interpolation = Cubic** (Catmull-Rom, 4 gathers): smoother lobes than linear on a 2× larger FFT — lets a
+  16384-point FFT look like the 32768-point one at half the FFT cost. Default stays Linear.
+- Info CHOP: `async_active`, `dsp_time_us` (worker), `cook_time_us` (cook thread), `jobs_dropped`, `hold_frames`,
+  `analysis_channels`, `param_reads`; Info DAT: mode, magnitude bins computed, async job stats; warning when the worker
+  falls behind.
+
+### Numbers (1 analysis channel, N = 32768, 16384 bins, Log, default options)
+- DSP per analysis (worker): 44–50 µs (≈ 42 with the measured plan).
+- Cook thread with Async on: ingest + window copy + output copy ≈ **3–6 µs** (estimate from stage timings; measure in
+  TD with `cook_time_us`).
+
 ## [v2.2.2] - 2026-08-26 — "why is it slower than in July?"
 
 A per-stage benchmark of **every commit since the first one** (`bench/`, same flags, interleaved runs) answered it:
