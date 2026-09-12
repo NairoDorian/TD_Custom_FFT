@@ -1,5 +1,10 @@
 # FFT CHOP — Real-Time Performance Roadmap (how to make the cook loop as fast as it can be)
 
+> **Status (v2.4.0, 2026-09-10):** the cook thread is now lock-free and syscall-free (wait-free triple buffers both
+> ways, worker polls on a high-resolution timer, peak search on the worker, parameters polled from `getOutputInfo`,
+> dead `Parallel*` reads removed). Measured with the new `fft_bench --cook`: **11 µs mean / 17 µs p99** per cook at
+> 16384 bins, 7 µs at 4096 bins, of which 60 % is the `Bins × channels` result copy. See CHANGELOG v2.4.0.
+>
 > **Status (v2.3.0, same day):** implemented — 1.1 async pipeline (default on), 1.2 FTZ/DAZ, 1.3 parameter poll
 > interval, 1.5 silence short-circuit, 1.6 update-rate divider, 1.7 cubic warp interpolation (option), 1.9 magnitude
 > only up to Display Max, plus **Channels = Mono Mix** (mono-first: one FFT for any input). Not done: 1.4 Bins Auto

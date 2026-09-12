@@ -19,8 +19,12 @@ Processing Pipeline Overview:
 5. SIMD Vectorization: 256-bit AVX2 magnitude spectrum (2x unrolled, rsqrt).
 6. Psychoacoustic Re-mapping: Log/Mel/ERB/Bark/Chroma/Melog with identity bypass (AVX2 gather).
 7. Equal-Loudness Weighting: A / C / ITU-R 468 (2x unrolled).
-8. Dynamic Range Conversion: dB with selectable reference, interpolated LUT log10 (AVX2).
+8. Dynamic Range Conversion: dB with selectable reference, single-gather 2048-entry
+   mantissa-LUT log10 (AVX2) - no interpolation, which measured 2x slower for no gain.
 9. Temporal Smoothing: Asymmetric attack/release envelope (2x unrolled FMA).
+10. Real-time plumbing: wait-free TripleBuffer handoff + WorkerSignal wake-up. The handoff
+    and the wake-up are mutex-free on the cook thread; a plan swap or a deferred log still
+    takes a lock, but only when one of those rare events actually occurred.
 
 SIMD alignment policy
 ---------------------
@@ -42,6 +46,7 @@ not a performance change.
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -59,6 +64,7 @@ not a performance change.
 #include <windows.h>
 #include <intrin.h>
 #endif
+#include <condition_variable>
 
 #include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
 
@@ -270,7 +276,10 @@ public:
             }
             m_history.push_back(msg);
             deferred = m_deferred;
-            if (echoToTextport && deferred) m_pending.push_back(msg);
+            if (echoToTextport && deferred) {
+                m_pending.push_back(msg);
+                m_hasPending.store(true, std::memory_order_release);
+            }
         }
 #ifdef _WIN32
         if (echoToTextport && !deferred) python_logger::writeToTextport(msg);
@@ -279,12 +288,17 @@ public:
 #endif
     }
 
+    // Lock-free check for the real-time caller: true only if flushToTextport() has work to do.
+    bool hasPending() const noexcept { return m_hasPending.load(std::memory_order_acquire); }
+
     // Write queued messages to the Textport (cooking thread only). Returns the number written.
     size_t flushToTextport() {
+        if (!hasPending()) return 0;
         std::deque<std::string> pending;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             pending.swap(m_pending);
+            m_hasPending.store(false, std::memory_order_release);
         }
 #ifdef _WIN32
         for (const auto& m : pending) python_logger::writeToTextport(m);
@@ -307,7 +321,159 @@ private:
     mutable std::mutex m_mutex;
     std::vector<std::string> m_history;
     std::deque<std::string> m_pending;
+    std::atomic<bool> m_hasPending{ false };
     bool m_deferred{ false };
+};
+
+/*
+===========================================================================
+  0d. WAIT-FREE SINGLE-PRODUCER / SINGLE-CONSUMER HANDOFF (triple buffer)
+===========================================================================
+Three slots rotate between the roles "being written" (back), "latest complete"
+(mid) and "being read" (front). Publishing and acquiring are one atomic
+exchange each: neither side ever blocks, spins or allocates, and the reader
+always sees a complete, torn-free T. "Latest wins": if the consumer is slower
+than the producer, intermediate results are simply overwritten.
+Used for both directions of the cook <-> analysis worker exchange, so the
+cook thread never takes a mutex the worker might be holding while descheduled.
+*/
+template <typename T>
+class TripleBuffer {
+public:
+    TripleBuffer() = default;
+    TripleBuffer(const TripleBuffer&) = delete;
+    TripleBuffer& operator=(const TripleBuffer&) = delete;
+
+    // ---- producer side ----
+    T& back() noexcept { return m_slots[m_back]; }
+    // Makes back() the latest complete slot. Returns true if the previously published slot
+    // had NOT been acquired by the consumer yet (i.e. it was dropped).
+    bool publish() noexcept {
+        const uint32_t prev = m_mid.exchange(m_back | kDirty, std::memory_order_acq_rel);
+        m_back = prev & kIndexMask;
+        return (prev & kDirty) != 0;
+    }
+
+    // ---- consumer side ----
+    // Returns true if a newer slot was acquired; front() then refers to it (and stays valid until the next acquire()).
+    bool acquire() noexcept {
+        if ((m_mid.load(std::memory_order_acquire) & kDirty) == 0) return false;
+        m_front = m_mid.exchange(m_front, std::memory_order_acq_rel) & kIndexMask;
+        return true;
+    }
+    const T& front() const noexcept { return m_slots[m_front]; }
+    T& front() noexcept { return m_slots[m_front]; }
+    bool hasNew() const noexcept { return (m_mid.load(std::memory_order_acquire) & kDirty) != 0; }
+
+    // All three slots (setup only, when no other thread is running)
+    T& slot(size_t i) noexcept { return m_slots[i]; }
+    static constexpr size_t kSlots = 3;
+
+private:
+    // m_mid packs two things into one atomic word so that publish() and acquire() are each a single
+    // exchange, with no window in between where the other side could observe a torn state:
+    //   bits 0-1  slot index of the latest complete slot (2 bits is exactly enough for 3 slots)
+    //   bit  2    "a fresh slot has been published since the last acquire" flag
+    // The exchange in publish() therefore both installs the new index and sets the flag atomically,
+    // and the exchange in acquire() both claims the index and clears the flag.
+    static constexpr uint32_t kIndexMask = 3u;   // bits 0-1: slot index
+    static constexpr uint32_t kDirty     = 4u;   // bit 2: unacquired publication pending
+    T m_slots[kSlots];
+    std::atomic<uint32_t> m_mid{ 1u };   // slot 1 is "clean" at start
+    uint32_t m_back{ 2u };
+    uint32_t m_front{ 0u };
+};
+
+/*
+===========================================================================
+  0e. WORKER WAKE-UP (no mutex on the signalling side)
+===========================================================================
+Windows: an auto-reset Event (signal/wait) plus a high-resolution waitable
+timer (waitFor). Nothing on the signalling side takes a lock, so the cook thread
+can never block behind a descheduled worker. Elsewhere: mutex + condvar.
+Measured on the signalling thread (worker blocked in the kernel): 4-5 us median,
+16-18 us p99 for every Win32 primitive (WaitOnAddress, SetEvent, semaphore,
+condvar) - the cost is the kernel unblocking a thread, not the primitive. That
+is why the operator's worker polls with waitFor() while jobs are flowing and only
+needs signal() after it has gone dormant.
+*/
+#if defined(_WIN32) && !defined(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002   // Windows 10 1803+ SDKs define it
+#endif
+
+class WorkerSignal {
+public:
+    WorkerSignal() noexcept {
+#ifdef _WIN32
+        m_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-reset: one signal -> one wake, never lost
+        m_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        m_highRes = (m_timer != nullptr);
+        if (!m_timer) m_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);   // pre-1803 fallback
+#endif
+    }
+    ~WorkerSignal() {
+#ifdef _WIN32
+        if (m_timer) { CancelWaitableTimer(m_timer); CloseHandle(m_timer); }
+        if (m_event) CloseHandle(m_event);
+#endif
+    }
+    WorkerSignal(const WorkerSignal&) = delete;
+    WorkerSignal& operator=(const WorkerSignal&) = delete;
+
+    // Windows: the poll timer is a high-resolution waitable timer, so it fires within ~0.5 ms of the
+    // requested timeout regardless of the process/system timer resolution (a plain timed wait is
+    // rounded to the 15.6 ms clock tick when nobody has called timeBeginPeriod, which would make the
+    // worker miss frames).
+    bool highResolutionTimer() const noexcept { return m_highRes; }
+
+    void signal() noexcept {
+#ifdef _WIN32
+        if (m_event) SetEvent(m_event);
+#else
+        { std::lock_guard<std::mutex> lock(m_mutex); m_flag = true; }
+        m_cv.notify_one();
+#endif
+    }
+    // Blocks until signal() was called since the last wait() (the signal is consumed).
+    void wait() noexcept {
+#ifdef _WIN32
+        if (m_event) WaitForSingleObject(m_event, INFINITE);
+#else
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this] { return m_flag; });
+        m_flag = false;
+#endif
+    }
+    // Like wait() but returns false after timeout_ms without a signal. Lets a worker poll a lock-free
+    // queue at a fixed rate so the producer never has to pay for a kernel wake-up (~4-5 us + tails).
+    bool waitFor(uint32_t timeout_ms) noexcept {
+#ifdef _WIN32
+        if (!m_event) return false;
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>(timeout_ms) * 10000LL;   // relative, 100 ns units
+        if (m_timer && SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE)) {
+            HANDLE h[2] = { m_event, m_timer };                          // the event wins when both are set
+            return WaitForMultipleObjects(2, h, FALSE, INFINITE) == WAIT_OBJECT_0;
+        }
+        return WaitForSingleObject(m_event, timeout_ms) == WAIT_OBJECT_0;
+#else
+        std::unique_lock<std::mutex> lock(m_mutex);
+        bool ok = m_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return m_flag; });
+        m_flag = false;
+        return ok;
+#endif
+    }
+private:
+#ifdef _WIN32
+    HANDLE m_event{ nullptr };
+    HANDLE m_timer{ nullptr };
+    bool m_highRes{ false };
+#else
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_flag{ false };
+    bool m_highRes{ false };
+#endif
 };
 
 /*
@@ -558,6 +724,9 @@ with a single index vector and blends with one FMA.
 */
 class PerceptualWarping {
 public:
+    // R2C output bin count of an N-point real FFT: DC..Nyquist inclusive.
+    static constexpr size_t linearBinCount(size_t fft_size) noexcept { return fft_size / 2 + 1; }
+
     static double htkHzToMel(double hz) { return 2595.0 * std::log10(1.0 + hz / 700.0); }
     static double htkMelToHz(double mel) { return 700.0 * (std::pow(10.0, mel / 2595.0) - 1.0); }
 
@@ -576,8 +745,13 @@ public:
     }
     static double barkToHz(double bark) {
         double z = bark;
+        // Exact inverse of the piecewise extensions above. The upper branch of hzToBark adds
+        // 0.22*(z-20.1), i.e. z' = 1.22*z - 4.422, so undoing it is (z+4.422)/1.22 (it used to
+        // divide by 0.78, which is the inverse of a different line and only agrees at z = 20.1:
+        // past ~6.5 kHz the axis folded over — non-monotonic, top bin back down at 0 Hz — for any
+        // fmax above that, including the 44.1 kHz Nyquist).
         if (z < 2.0) z = (z - 0.3) / 0.85;
-        else if (z > 20.1) z = (z - 4.422) / 0.78;
+        else if (z > 20.1) z = (z + 4.422) / 1.22;
         double f = (1960.0 * (z + 0.53)) / (26.81 - (z + 0.53));
         return std::max(0.0, f);
     }
@@ -614,6 +788,10 @@ public:
                 break;
             }
             case 4: {
+                // Chroma is pitch classes, i.e. a log2 axis, so it needs a positive bottom: the fixed
+                // 20 Hz floor is the lowest frequency whose pitch class is still meaningful. Log Floor Hz
+                // is deliberately NOT consulted here - it is a Log/Mel+Log parameter, and chroma has no
+                // use for it (a log2 axis cannot start at 0 Hz, which is the value Log Floor guards).
                 double c_min = hzToChroma(20.0), c_max = hzToChroma(fmax);
                 for (size_t i = 0; i < n_out; ++i) perceptual[i] = chromaToHz(c_min + i * inv_denom * (c_max - c_min));
                 break;
@@ -750,6 +928,23 @@ public:
         }
     }
 
+    /*
+    The frequency axis this grid describes, in Hz, one entry per output bin. m_target_hz[0] is
+    DC for the linear-in-Hz scales (Mel, ERB, Bark, Linear) and the log floor (~20 Hz) for the
+    logarithmic family, which cannot contain 0; m_target_hz[n_out-1] is exactly fmax for all of
+    them, verified monotonic for every scale.
+
+    This is what the CHOP's reported sample rate is derived from, and the derivation is exact
+    rather than fitted. A CHOP sample rate normally counts time samples per second; for a
+    spectrum the coherent reading is "the axis spans 0..sr_out/2", i.e. the last bin sits on
+    Nyquist, so
+
+        sr_out = 2 * m_target_hz[n_out-1] = 2 * fmax
+
+    for every grid — uniform, warped, or linear. Two consequences worth checking by hand:
+    the whole-FFT raw grid (fmax = sr_in/2) reports exactly sr_in, and per-bin spacing is
+    sr_out / (2*(n_out-1)), which for that raw grid is sr_in/fft_size, the FFT's own resolution.
+    */
     const std::vector<double>& targetHz() const noexcept { return m_target_hz; }
     bool isIdentity() const noexcept { return m_is_identity; }
     size_t outputBins() const noexcept { return m_i0.size(); }
@@ -775,6 +970,10 @@ public:
     static void computeCurve(int weighting_code, const std::vector<double>& freqs_hz, AlignedVector& weights) {
         weights.resize(freqs_hz.size());
         if (weighting_code == 0) { std::fill(weights.begin(), weights.end(), 1.0f); return; }
+        // A and C are defined up to a constant, and the standard fixes that constant by the value at
+        // 1 kHz. So: evaluate the same response at f = 1 kHz and divide it out, which puts the curve
+        // at exactly 0 dB there. f1k is f^2 at 1 kHz (1e6), because the response formulas below are
+        // written in f^2 (and f^4 for A) rather than f, so 1 kHz has to arrive pre-squared to match.
         double inv_ref = 1.0;
         if (weighting_code == 1) {
             const double f1k = 1e6;
@@ -813,7 +1012,9 @@ public:
 ===========================================================================
  6a. FAST 20*log10 (IEEE 754 exponent + 2048-entry mantissa LUT, single gather)
 ===========================================================================
-Max error 20*log10(1 + 1/2048) = 0.0042 dB (the earlier 256-entry table was 0.034 dB).
+Max error 0.0021 dB: the table is sampled at mid-interval (see Table below), so the worst case is
+half the 0.0042 dB entry spacing (= 20*log10(1 + 1/2048), what a table rounded to its lower edge
+would give). The earlier 256-entry table was 0.034 dB.
 One gather per 8 bins: an interpolated two-gather variant measured 2x slower in the
 dB stage for no visible benefit on a display spectrum. The 8 KB table stays L1-resident.
 Table is a function-local static -> thread-safe initialisation.
@@ -829,7 +1030,9 @@ public:
             float v[kTableSize];
             Table() {
                 for (int i = 0; i < kTableSize; ++i)
-                    v[i] = 20.0f * std::log10(1.0f + (static_cast<float>(i) + 0.5f) / static_cast<float>(kTableSize)); // mid-interval
+                    // Mid-interval: the entry for a mantissa bucket is evaluated at the bucket's centre,
+                    // so the worst-case deviation is half a bucket instead of a whole one.
+                    v[i] = 20.0f * std::log10(1.0f + (static_cast<float>(i) + 0.5f) / static_cast<float>(kTableSize));
             }
         } table;
         return table.v;
@@ -1061,16 +1264,20 @@ public:
 ===========================================================================
 */
 enum class PlannerPolicy : int {
-    Auto = 0,     // MEASURE for N <= 16384, ESTIMATE above (never a noticeable stall)
+    Auto = 0,     // instant plan (wisdom or ESTIMATE), FFTW_MEASURE upgraded on a background thread
     Fast = 1,     // ESTIMATE always
-    Measured = 2, // MEASURE always; plans are cached in wisdom so only the first run of a size costs time
+    Measured = 2, // MEASURE synchronously; plans are cached in wisdom so only the first run of a size costs time
+    Patient = 3,  // like Auto but the background upgrade is FFTW_PATIENT (~10 % faster execute, seconds of planning once per size)
 };
 
 class IFFTEngine {
 public:
     virtual ~IFFTEngine() = default;
     virtual void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) = 0;
-    // n_mag: number of magnitude bins to compute (0 = all N/2+1). Bins above n_mag are left untouched.
+    // n_mag: how many magnitude bins the caller will read (0 = all N/2+1). It is a lower bound on
+    // what gets written, not an exact count: the AVX2 kernel works in 16-bin blocks, so an
+    // implementation is free to produce up to 15 bins more than asked (see the FFTW override). The
+    // magnitude_spectrum vector is always sized N/2+1 regardless.
     virtual void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
                              AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept = 0;
     virtual std::string getPlanStatus() const = 0;
@@ -1083,6 +1290,12 @@ public:
 inline void computeMagnitudeAVX2_FMA(const float* __restrict raw_c, float* __restrict mptr, size_t n_complex) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
+    // Puts the 8 magnitudes of one register back into bin order. The re/im de-interleave above uses
+    // _mm256_shuffle_ps, which works within each 128-bit half, so the two loads leave the magnitudes
+    // in the order 0,1,4,5,2,3,6,7 (each half of the result covers a different group of four bins).
+    // _mm256_permute4x64_pd with lanes [0,2,1,3] swaps the two middle 64-bit lanes - i.e. the two
+    // middle pairs of floats - which is exactly the fixup. Doing it in-register costs one permute
+    // instead of splitting the store into two 128-bit halves.
     auto reorderLanes = [](__m256 mag) noexcept -> __m256 {
         return _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(mag), _MM_SHUFFLE(3, 1, 2, 0)));
     };
@@ -1161,15 +1374,17 @@ public:
     }
 
     static bool importWisdomOnce(PlanLog* log) {
-        static bool done = false;
+        static std::once_flag once;
         static bool ok = false;
-        if (done) return ok;
-        done = true;
-        std::string path = wisdomPath();
-        if (!path.empty()) {
-            ok = fftwf_import_wisdom_from_filename(path.c_str()) != 0;
+        std::call_once(once, [log] {
+            std::string path = wisdomPath();
+            if (path.empty()) return;
+            {
+                std::lock_guard<std::mutex> lock(plannerMutex());   // wisdom import touches planner state
+                ok = fftwf_import_wisdom_from_filename(path.c_str()) != 0;
+            }
             if (log) log->log(std::string("[FFT Plugin] [FFTW3] wisdom ") + (ok ? "loaded from " : "not found at ") + path, ok);
-        }
+        });
         return ok;
     }
 
@@ -1201,8 +1416,20 @@ public:
                    instantly; otherwise use an ESTIMATE plan right away and measure a better one on a background
                    thread, swap it in on the next cook (pollBackgroundPlan) and save it to wisdom. Real-time is never
                    interrupted and the second run of any size is already optimal.
+        Patient  : same scheme with FFTW_PATIENT (measured: -12 % execute time at N = 32768 for 2.7 s of planning,
+                   once per size per machine). The cook thread is never blocked in the steady state - planning
+                   happens on the background thread, after the node already has an ESTIMATE plan in hand.
+                   Patient wisdom also satisfies Auto's lookup, so once a size has been planned patiently every
+                   policy but Fast benefits.
+                   Caveat: FFTW's planner is process-wide and single-threaded, so a plan request (a size
+                   change, another instance) that arrives while a patient measurement is running waits on
+                   the planner lock for the rest of that ~2.7 s. What waits is whoever asked next - the
+                   patient node itself already has its ESTIMATE plan and keeps cooking through it.
     */
     void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) override {
+        // Re-planning is not free even when the size looks unchanged: it destroys the plan under the
+        // process-wide planner lock, and a synchronous policy then re-measures and re-exports wisdom.
+        // So the early-out compares the policy too, and returns before any of that.
         if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy) return;
         destroyPlan();
         if (fft_size == 0) return;
@@ -1215,6 +1442,7 @@ public:
         auto t0 = std::chrono::high_resolution_clock::now();
         const char* used = "FFTW_ESTIMATE";
         bool start_background = false;
+        unsigned bg_rigor = FFTW_MEASURE;
         {
             std::lock_guard<std::mutex> lock(plannerMutex());
             Buffers b(fft_size);
@@ -1227,6 +1455,17 @@ public:
                     break;
                 case PlannerPolicy::Fast:
                     m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                    break;
+                case PlannerPolicy::Patient:
+                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_PATIENT | FFTW_WISDOM_ONLY);
+                    if (m_plan) {
+                        used = "FFTW_PATIENT (from wisdom)";
+                    } else {
+                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                        used = "FFTW_ESTIMATE (patient measure in background)";
+                        start_background = true;
+                        bg_rigor = FFTW_PATIENT;
+                    }
                     break;
                 case PlannerPolicy::Auto:
                 default:
@@ -1254,9 +1493,73 @@ public:
             if (log) log->log("[FFT Plugin] [FFTW3] ERROR: plan creation failed for N=" + std::to_string(fft_size));
             return;
         }
-        if (start_background) startBackgroundMeasure(fft_size);
+        if (start_background) startBackgroundMeasure(fft_size, bg_rigor);
     }
 
+    void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
+                     AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept override {
+        size_t n = padded_signal.size();
+        size_t n_complex = n / 2 + 1;
+        if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
+        if (scratch_complex.size() != n_complex) scratch_complex.resize(n_complex);
+        if (m_plan && n == m_fft_size) {
+            float* in_ptr = const_cast<float*>(padded_signal.data());
+            fftwf_complex* out_ptr = reinterpret_cast<fftwf_complex*>(scratch_complex.data());
+            fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
+        } else {
+            std::memset(scratch_complex.data(), 0, n_complex * sizeof(std::complex<float>));
+        }
+        // Round the request up to a whole 16-bin SIMD block: the vector loop below writes 16 at a
+        // time, and a partial final block is not worth a scalar epilogue. So the caller may find up
+        // to 15 bins past n_mag written - it only ever reads up to maxLinearIndex() anyway.
+        size_t count = (n_mag == 0) ? n_complex : std::min(n_complex, ((n_mag + 15) / 16) * 16);
+        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), std::min(count, n_complex));
+    }
+
+private:
+    struct Buffers {
+        float* in{ nullptr }; fftwf_complex* out{ nullptr };
+        explicit Buffers(size_t n) {
+            in = static_cast<float*>(fftwf_malloc(sizeof(float) * n));
+            out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n / 2 + 1)));
+        }
+        ~Buffers() { if (in) fftwf_free(in); if (out) fftwf_free(out); }
+        bool ok() const { return in && out; }
+    };
+
+    // rigor: FFTW_MEASURE or FFTW_PATIENT. Runs at ABOVE_NORMAL: it must never be starved below the
+    // normal-priority threads it is racing, so that a plan upgrade finishes in the ~0.3 s / ~3 s it
+    // is budgeted instead of stretching out under load. It is still one notch under the analysis
+    // worker (HIGHEST), so a real cook always wins the core back from it.
+    void startBackgroundMeasure(size_t fft_size, unsigned rigor) {
+        joinBackground();
+        m_bg_size = fft_size;
+        m_bg_rigor = rigor;
+        m_bg_running = true;
+        m_bg_thread = std::thread([this, fft_size, rigor]() {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+            if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+                if (auto fn = reinterpret_cast<SetDescFn>(GetProcAddress(k32, "SetThreadDescription")))
+                    fn(GetCurrentThread(), L"FFT background planner");
+            }
+#endif
+            auto t0 = std::chrono::high_resolution_clock::now();
+            fftwf_plan p = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
+                Buffers b(fft_size);
+                if (b.ok()) p = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, rigor);
+                if (p) exportWisdom();
+            }
+            m_bg_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            m_bg_plan.store(p);
+            m_bg_running = false;
+        });
+    }
+
+public:
     // Call once per cook from the cooking thread (before any channel executes). Swaps in a
     // background-measured plan when one is ready. Returns true when the plan changed.
     bool pollBackgroundPlan() override {
@@ -1274,58 +1577,13 @@ public:
             m_plan = ready;
         }
         joinBackground();
-        m_planStatus = "FFTW3 (FFTW_MEASURE upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
-        if (m_log) m_log->log("[FFT Plugin] [FFTW3] background FFTW_MEASURE plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in");
+        const char* rigor = (m_bg_rigor == FFTW_PATIENT) ? "FFTW_PATIENT" : "FFTW_MEASURE";
+        m_planStatus = std::string("FFTW3 (") + rigor + " upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
+        if (m_log) m_log->log(std::string("[FFT Plugin] [FFTW3] background ") + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in and saved to wisdom");
         return true;
     }
 
-    void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
-                     AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept override {
-        size_t n = padded_signal.size();
-        size_t n_complex = n / 2 + 1;
-        if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
-        if (scratch_complex.size() != n_complex) scratch_complex.resize(n_complex);
-        if (m_plan && n == m_fft_size) {
-            float* in_ptr = const_cast<float*>(padded_signal.data());
-            fftwf_complex* out_ptr = reinterpret_cast<fftwf_complex*>(scratch_complex.data());
-            fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
-        } else {
-            std::memset(scratch_complex.data(), 0, n_complex * sizeof(std::complex<float>));
-        }
-        size_t count = (n_mag == 0) ? n_complex : std::min(n_complex, ((n_mag + 15) / 16) * 16);   // keep 16-bin SIMD blocks
-        computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(scratch_complex.data()), magnitude_spectrum.data(), std::min(count, n_complex));
-    }
-
 private:
-    struct Buffers {
-        float* in{ nullptr }; fftwf_complex* out{ nullptr };
-        explicit Buffers(size_t n) {
-            in = static_cast<float*>(fftwf_malloc(sizeof(float) * n));
-            out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n / 2 + 1)));
-        }
-        ~Buffers() { if (in) fftwf_free(in); if (out) fftwf_free(out); }
-        bool ok() const { return in && out; }
-    };
-
-    void startBackgroundMeasure(size_t fft_size) {
-        joinBackground();
-        m_bg_size = fft_size;
-        m_bg_running = true;
-        m_bg_thread = std::thread([this, fft_size]() {
-            auto t0 = std::chrono::high_resolution_clock::now();
-            fftwf_plan p = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
-                Buffers b(fft_size);
-                if (b.ok()) p = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE);
-                if (p) exportWisdom();
-            }
-            m_bg_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
-            m_bg_plan.store(p);
-            m_bg_running = false;
-        });
-    }
-
     void joinBackground() noexcept {
         if (m_bg_thread.joinable()) {
             try { m_bg_thread.join(); } catch (...) {}
@@ -1348,6 +1606,7 @@ private:
     std::atomic<fftwf_plan> m_bg_plan{ nullptr };
     std::atomic<bool> m_bg_running{ false };
     size_t m_bg_size{ 0 };
+    unsigned m_bg_rigor{ FFTW_MEASURE };
     double m_bg_ms{ 0.0 };
 };
 

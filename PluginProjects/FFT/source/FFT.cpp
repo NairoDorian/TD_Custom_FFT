@@ -1,4 +1,4 @@
-/* Shared Use License: This file is owned by Derivative Inc. (Derivative)
+﻿/* Shared Use License: This file is owned by Derivative Inc. (Derivative)
 * and can only be used, and/or modified for use, in conjunction with
 * Derivative's TouchDesigner software, and only if you are a licensee who has
 * accepted Derivative's TouchDesigner license or assignment agreement
@@ -18,15 +18,20 @@
  * ===========================================================================
  * Source File: FFT.cpp   (see FFT.h for the threading architecture)
  *
- * Cook (every frame, cook thread):
- *   1. FTZ/DAZ guard, parameters (polled every N cooks), input sample rate, frame delta
- *   2. ingest: mono-mix / first / per-channel block -> optional EQ (new samples only) -> FIFO,
- *      digital-silence tracking
- *   3. every "Update Every N Cooks": snapshot the windows into an AnalysisJob and either
- *        - post it to the worker (Async on; latest job wins, never blocks), or
- *        - run the pipeline inline (Async off)
- *   4. copy the last finished spectrum to the output (hold when nothing new)
- *   5. telemetry + deferred Textport log flush
+ * Per cook (cook thread):
+ *   getOutputInfo : poll the parameters (the only getPar* calls anywhere in the cook path),
+ *                   report bins x channels.
+ *   execute       :
+ *     1. FTZ/DAZ guard, input sample rate, frame delta, window length
+ *     2. ingest: mono-mix / first / per-channel block -> optional EQ (new samples only) -> FIFO,
+ *        digital-silence tracking
+ *     3. write the windows into a free job slot and publish it (every cook)
+ *          - Async on: nothing else; the worker polls the slot every 2 ms (a kernel wake-up is
+ *            only issued when the worker went dormant after 500 ms without jobs), or
+ *          - Async off: run the pipeline inline
+ *     4. acquire the latest finished result (one atomic exchange) and memcpy it to the output
+ *        (hold the previous spectrum when nothing new has been published)
+ *     5. telemetry; deferred Textport log flush only when something was logged
  * ===========================================================================
  */
 
@@ -37,6 +42,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <execution>
 #include <numeric>
 #include <string>
 
@@ -48,10 +54,60 @@ const char* kOpType    = "Fftcustom";   // must not collide with the built-in FF
 const char* kOpLabel   = "FFT Custom";
 const char* kOpIcon    = "FFT";
 const int   kMajorVersion = 2;
-const int   kMinorVersion = 3;
+const int   kMinorVersion = 8;
 
 using clk = std::chrono::steady_clock;
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
+
+// Window length in samples for the given parameters and input rate (ms mode converts with the rate).
+// Shared by the CHOP (getOutputInfo/execute) and the pipeline (rebuild) so they cannot disagree.
+int windowSamplesFrom(const Parameters::Values& p, double sampleRate)
+{
+	if (p.winMode == Parameters::WinMode::Milliseconds) {
+		return std::clamp(static_cast<int>(std::lround(p.winMs * sampleRate / 1000.0)), 1, Parameters::kMaxWinSamples);
+	}
+	return p.winSamples;
+}
+
+// FFT size >= the zero-pad choice and >= the next power of two of the window.
+size_t fftSizeFrom(const Parameters::Values& p, int winSamples)
+{
+	size_t needed = 1;
+	while (needed < static_cast<size_t>(std::max(1, winSamples))) needed *= 2;
+	return std::max<size_t>(static_cast<size_t>(std::max(2, p.padSize)), needed);
+}
+
+// Output sample count. getOutputInfo and execute must agree on this — TouchDesigner allocates from
+// here — so it lives in one place, and updateWarp() builds its grid with the same number.
+//
+// To get the raw linear FFT (every bin, no resampling): Output Bins = fft_size/2 + 1, Display Max
+// >= Nyquist, and either Scale = Linear or Warp Blend = 0 (both put the axis on the linear grid -
+// the Scale's own curve at blend 0 has nothing to blend, and Linear's curve IS the linear grid).
+// PerceptualWarping then detects the identity and memcpy's the magnitude straight through, bit for
+// bit. There is deliberately no separate switch for it - a second spelling of the same setting is a
+// second thing to disagree.
+int outputBinCountFrom(const Parameters::Values& p)
+{
+	return p.bins;
+}
+
+#ifdef _WIN32
+void nameAndBoostCurrentThread(const wchar_t* name)
+{
+	// THREAD_PRIORITY_HIGHEST (normal + 2): the worker now sits above TouchDesigner's normal-priority
+	// threads — including the cook thread that hands it the next job — so a busy machine cannot delay
+	// a result into the next frame (which shows up as hold_frames > 1). It sleeps > 99 % of the time
+	// and does ~50 us of work per frame, so the preemption window it can open is small; the cost is
+	// that when it DOES run long (a first-time measured plan, a large FFT), it no longer yields to
+	// whatever TD is doing. THREAD_PRIORITY_TIME_CRITICAL is deliberately not used: that level can
+	// starve the audio and UI threads, and buys nothing over HIGHEST for a 50 us burst.
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+	if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+		if (auto fn = reinterpret_cast<SetDescFn>(GetProcAddress(k32, "SetThreadDescription"))) fn(GetCurrentThread(), name);
+	}
+}
+#endif
 
 } // namespace
 
@@ -119,7 +175,16 @@ AnalysisPipeline::status() const
 	s.capacity = myCapacity;
 	s.linearBins = myFFTSize / 2 + 1;
 	s.magnitudeBins = myMagnitudeBins;
-	s.dspUs = myLastUs;
+	s.axisRate = myOutputSampleRate;
+	// The grid's actual low end. Not always DC: only Mel, ERB and Linear start there, and only at
+	// blend 0 is every scale pulled down to it — Log starts at Log Floor, Chroma at 20 Hz, Bark at
+	// ~13 Hz. Reported so the axis row cannot claim 0 Hz for a grid that does not reach it.
+	{
+		const std::vector<double>& hz = myWarping.targetHz();
+		s.axisBottom = hz.empty() ? 0.0 : hz.front();
+	}
+	s.outputBins = static_cast<int>(myWarping.outputBins());
+	s.linearGrid = myLinearGrid;
 	s.planUpgrading = myEngine ? myEngine->upgradeInProgress() : false;
 	return s;
 }
@@ -133,9 +198,7 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 	myPlanner = static_cast<FFTDSP::PlannerPolicy>(job.p.planner);
 
 	// FFT size >= zero-pad length and >= next power of two of the window (window never overflows the frame)
-	size_t needed = 1;
-	while (needed < myCapacity) needed *= 2;
-	myFFTSize = std::max<size_t>(static_cast<size_t>(myPadChoice), std::max<size_t>(needed, 2));
+	myFFTSize = fftSizeFrom(job.p, static_cast<int>(myCapacity));
 
 	// 8-float aligned centre offset: a shift of < 8 samples only changes phase, never magnitude
 	size_t centre = (myFFTSize > myCapacity) ? (myFFTSize - myCapacity) / 2 : 0;
@@ -149,12 +212,12 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 
 	for (auto& ch : myChannels) {
 		ch.padded_frame.assign(myFFTSize, 0.0f);
-		ch.rfft_magnitude.assign(myFFTSize / 2 + 1, 0.0f);
-		ch.scratch_complex.resize(myFFTSize / 2 + 1);
+		ch.rfft_magnitude.assign(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize), 0.0f);
+		ch.scratch_complex.resize(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize));
 		ch.prev_spectrum.clear();
 		ch.agc_peak = 0.0f;
 	}
-	++myTablesVersion;
+	++myStatusVersion;
 }
 
 void
@@ -168,20 +231,77 @@ AnalysisPipeline::updateWindow(const Parameters::Values& p)
 	myWindowKey = key;
 }
 
+/*
+Output rate model — what "sample rate" means for a spectrum.
+
+A CHOP sample rate normally says how many time samples fit in a second. For a spectrum the
+coherent reading is the band the axis covers: bin 0 is DC, the last bin is the top of the
+displayed band, and the axis spans 0..sr_out/2 — i.e. the last bin sits on Nyquist. So the
+rate is not the input rate and not something to be fitted, it is simply twice the top of the
+axis the warp actually built:
+
+    sr_out = 2 * target_hz[n_out-1] = 2 * fmax
+
+Every grid this node can emit is covered by that one line:
+
+  linear grid, fmax == nyquist       fmax is the top of the band, so sr_out = sr_in exactly. When
+                                     Output Bins also equals fft_size/2+1 the warp is the identity
+                                     and the bins are the untouched FFT bins, making the implied
+                                     spacing sr_out/(2*(n_out-1)) exactly sr_in/fft_size — the
+                                     transform's own resolution. (This is the setting that used to be
+                                     the "Raw Linear Bins" toggle; it was removed because these
+                                     sliders already produce it.)
+  warped grid, Display Max < nyquist the axis stops at Display Max instead of Nyquist, so
+                                     sr_out = 2*Display Max. Keeping sr_in there would claim
+                                     the spectrum reaches sr_in/2 Hz when it really stops at
+                                     Display Max — the error the old code made.
+  warped grid, fmax == nyquist       sr_out = sr_in: same band as the input, only resampled
+                                     onto a different number of bins. Resampling changes how
+                                     many bins describe the band, never how wide the band is,
+                                     so the rate correctly does not move with Output Bins.
+  perceptual (Log/Mel/ERB/...)       non-uniform bin spacing, but the TOP endpoint is still fmax
+                                     for every scale, so sr_out = 2*fmax still holds and is exact
+                                     at the top; only the bins in between are non-uniform, which no
+                                     single rate could describe anyway. (The bottom endpoint is
+                                     blend * perceptual[0], so it is exactly DC only when the blend
+                                     is 0 or the scale itself starts at 0 Hz — Mel, ERB, Linear. Log
+                                     starts at Log Floor, Chroma at 20 Hz, Bark at ~13 Hz. That is a
+                                     property of the scale, not of the rate model: the model only
+                                     claims the top of the axis.)
+
+Note that the old `Output Bins`-dependent form (2*fmax*bins/(bins-1)) was wrong: it stretched
+the axis by one bin, putting Nyquist one bin above Display Max.
+*/
 void
 AnalysisPipeline::updateWarp(const Parameters::Values& p)
 {
-	size_t n_linear_bins = myFFTSize / 2 + 1;
-	double nyquist = mySampleRate / 2.0;
-	double fmax = std::min(p.displayMax, nyquist);
-	WarpKey key{ static_cast<int>(p.scale), fmax, p.bins, p.warp, p.logFloor, n_linear_bins, nyquist, static_cast<int>(p.warpInterp) };
+	const size_t n_linear_bins = FFTDSP::PerceptualWarping::linearBinCount(myFFTSize);
+	const double nyquist = mySampleRate / 2.0;
+	// Display Max is clamped to Nyquist: above it there are no bins to show, and a larger axis would
+	// just leave the top of the output empty and the bin spacing wrong.
+	const double fmax = std::min(p.displayMax, nyquist);
+	const int    scale = static_cast<int>(p.scale);
+	const double blend = p.warp;
+	const size_t n_out = static_cast<size_t>(outputBinCountFrom(p));
+	const int    interp = static_cast<int>(p.warpInterp);
+
+	WarpKey key{ scale, fmax, static_cast<int>(n_out), blend, p.logFloor, n_linear_bins, nyquist, interp };
 	if (key == myWarpKey) return;
-	myWarping.setInterpolation(static_cast<int>(p.warpInterp));
-	myWarping.buildWarpTables(static_cast<int>(p.scale), fmax, static_cast<size_t>(p.bins), nyquist, p.warp, p.logFloor, n_linear_bins);
+	myWarping.setInterpolation(interp);
+	myWarping.buildWarpTables(scale, fmax, n_out, nyquist, blend, p.logFloor, n_linear_bins);
 	myMagnitudeBins = std::min(n_linear_bins, myWarping.maxLinearIndex() + 1);
+	// Top of the axis is fmax by construction (both endpoints are pinned in computeTargetHzGrid),
+	// so the axis rate follows from fmax alone. Published for the cook thread, which reads it back
+	// through outputAxisRate(). When fmax has been clamped to Nyquist the axis rate is sr_in. Note
+	// this is NOT info->sampleRate — that is bins x me.time.rate (see outputSampleRate()).
+	myOutputSampleRate = 2.0 * fmax;
+	// Read the identity back off the tables rather than inferring it from the parameter values: this
+	// is the same flag applyWarp() branches on, so the Info CHOP cannot claim a bypass that the
+	// pointer loop below did not take.
+	myLinearGrid = myWarping.isIdentity();
 	myWarpKey = key;
 	++myWarpVersion;
-	++myTablesVersion;
+	++myStatusVersion;
 }
 
 void
@@ -234,6 +354,11 @@ AnalysisPipeline::runChannel(DspState& st, const FFTDSP::AlignedVector& window_i
 	// 5. dB with the selected reference
 	const int loudness = static_cast<int>(p.loudness);
 	if (loudness != 0) {
+		// st.prev_spectrum holds the previous frame in whatever unit that frame was in. Crossing the
+		// Off boundary changes the unit (linear magnitude <-> dB), and smoothing across a unit change
+		// would drag a dB frame toward a linear magnitude, so the history is dropped at the crossing.
+		// Only the boundary is handled: dB <-> dB-normalized is a rescale of the same dB curve and is
+		// continuous enough to keep smoothing through.
 		if (st.prev_loudness_mode == 0) st.prev_spectrum.clear();
 		float peak = FFTDSP::peakMagnitude(out.data(), out.size());
 		float ref = 1.0f;
@@ -260,13 +385,16 @@ AnalysisPipeline::runChannel(DspState& st, const FFTDSP::AlignedVector& window_i
 	// 6. ballistics (bypassed at 0/0)
 	if (attackCoef > 0.0f || releaseCoef > 0.0f) {
 		FFTDSP::BallisticsFilter ball;
+		// apply() reads `current` and writes the smoothed frame into prev_out; it never writes through
+		// `current`. So the smoothed result has to be copied back into the buffer the caller publishes,
+		// and prev_spectrum keeps only the history the next frame smooths against.
 		ball.apply(attackCoef, releaseCoef, out, st.prev_spectrum);
 		std::memcpy(out.data(), st.prev_spectrum.data(), bins * sizeof(float));
 	}
 }
 
 void
-AnalysisPipeline::process(const AnalysisJob& job, std::vector<FFTDSP::AlignedVector>& out)
+AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 {
 	const auto t0 = clk::now();
 	const Parameters::Values& p = job.p;
@@ -277,15 +405,17 @@ AnalysisPipeline::process(const AnalysisJob& job, std::vector<FFTDSP::AlignedVec
 	                         || p.padSize != myPadChoice
 	                         || static_cast<FFTDSP::PlannerPolicy>(p.planner) != myPlanner;
 	if (rebuild_needed) rebuild(job);
-	myEngine->pollBackgroundPlan();
+	if (myEngine->pollBackgroundPlan()) ++myStatusVersion;
+	const bool upgrading = myEngine->upgradeInProgress();
+	if (upgrading != myLastUpgrading) { myLastUpgrading = upgrading; ++myStatusVersion; }
 
 	if (myChannels.size() != static_cast<size_t>(job.numChannels)) {
 		size_t old = myChannels.size();
 		myChannels.resize(static_cast<size_t>(job.numChannels));
 		for (size_t i = old; i < myChannels.size(); ++i) {
 			myChannels[i].padded_frame.assign(myFFTSize, 0.0f);
-			myChannels[i].rfft_magnitude.assign(myFFTSize / 2 + 1, 0.0f);
-			myChannels[i].scratch_complex.resize(myFFTSize / 2 + 1);
+			myChannels[i].rfft_magnitude.assign(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize), 0.0f);
+			myChannels[i].scratch_complex.resize(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize));
 		}
 	}
 	if (job.reset) {
@@ -308,10 +438,49 @@ AnalysisPipeline::process(const AnalysisJob& job, std::vector<FFTDSP::AlignedVec
 	}
 	const float agcDecay = FFTDSP::BallisticsFilter::coefFromMs(1500.0, job.dtMs);
 
+	std::vector<FFTDSP::AlignedVector>& out = res.spectra;
 	if (out.size() != static_cast<size_t>(job.numChannels)) out.resize(static_cast<size_t>(job.numChannels));
-	for (int ch = 0; ch < job.numChannels; ++ch) {
-		const bool silent = ch < static_cast<int>(job.silent.size()) && job.silent[ch] != 0;
-		runChannel(myChannels[ch], job.windows[ch], silent, p, attackCoef, releaseCoef, agcDecay, out[ch]);
+
+	// 2. The whole per-channel pipeline, one channel per DspState. Channels share nothing but
+	// read-only tables (window, warp tables, weighting curve) and the FFT plan, so the loop is
+	// embarrassingly parallel and runs that way whenever there is more than one channel.
+	//
+	// This node is one mono channel per instance — several channels means several nodes, each with
+	// its own analysis worker — so in normal use numChannels is 1 and none of this runs. It is here
+	// for the one mode that still produces several transforms per cook, Channels = All Channels.
+	// There is no parameter: with one channel the branch is a single integer compare and the serial
+	// path is taken, and with several, serial would be measurably worse for nothing.
+	//
+	// Threads do not help a *single* transform: FFTW parallelizes the howmany loop of a plan_many,
+	// never the inside of a 1-D transform (measured 13-51 % slower with nthreads > 1), which is why
+	// the parallelism has to be the channel loop or nothing.
+	myParallelActive.store(job.numChannels > 1, std::memory_order_relaxed);
+	if (job.numChannels > 1) {
+		std::vector<int> idx(static_cast<size_t>(job.numChannels));
+		std::iota(idx.begin(), idx.end(), 0);
+		std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int ch) {
+			const bool silent = ch < static_cast<int>(job.silent.size()) && job.silent[ch] != 0;
+			runChannel(myChannels[static_cast<size_t>(ch)], job.windows[static_cast<size_t>(ch)], silent, p,
+			           attackCoef, releaseCoef, agcDecay, out[static_cast<size_t>(ch)]);
+		});
+	} else {
+		for (int ch = 0; ch < job.numChannels; ++ch) {
+			const bool silent = ch < static_cast<int>(job.silent.size()) && job.silent[ch] != 0;
+			runChannel(myChannels[static_cast<size_t>(ch)], job.windows[static_cast<size_t>(ch)], silent, p,
+			           attackCoef, releaseCoef, agcDecay, out[static_cast<size_t>(ch)]);
+		}
+	}
+
+	// Peak telemetry (channel 0) belongs here, not on the cook thread: the owner has the Hz table.
+	res.peakMag = 0.0f;
+	res.peakHz = 0.0f;
+	if (!out.empty() && !out[0].empty()) {
+		size_t max_idx = 0;
+		res.peakMag = FFTDSP::findPeakWithIndex(out[0].data(), out[0].size(), max_idx);
+		// targetHz() is the literal output grid, whatever built it, so the peak's Hz needs no special
+		// case — not even for the identity grid, where the table is exactly index * sr/fft_size.
+		const std::vector<double>& hz = myWarping.targetHz();
+		if (max_idx < hz.size()) res.peakHz = static_cast<float>(hz[max_idx]);
 	}
 	myLastUs = usSince(t0);
 }
@@ -345,6 +514,19 @@ FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* rese
 	ginfo->inputMatchIndex = 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Parameters: one eval() per cook, from getOutputInfo() (TouchDesigner calls it right before
+// execute()). execute() only re-polls if getOutputInfo() was skipped for this cook.
+// ---------------------------------------------------------------------------------------------
+void
+FFT::pollParameters(const OP_Inputs* inputs)
+{
+	const auto t0 = clk::now();
+	myParams = Parameters::eval(inputs, &myParamReads);
+	myHaveParams = true;
+	myParamUs = usSince(t0);
+}
+
 int
 FFT::analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode) const
 {
@@ -353,15 +535,106 @@ FFT::analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode)
 	return 1;
 }
 
+// The band the frequency axis covers, expressed in the standard "bin 0 is DC, the last bin is
+// Nyquist" form: 2 * (top of the axis). Display Max is clamped to Nyquist, so this is 2 * min(Display
+// Max, nyquist) — the input rate when Display Max reaches the top of the band. It does NOT depend on
+// how many Output Bins describe the band.
+//
+// This is what hzPerSample() and the `output_spectrum_axis` Info row are derived from. It is NOT
+// what info->sampleRate reports — see outputSampleRate() below.
+double
+FFT::outputAxisRate(const Parameters::Values& p, double sampleRate) const
+{
+	const double nyquist = sampleRate * 0.5;
+	if (nyquist <= 0.0) return sampleRate;
+	const double exact = myOutputSampleRate.load(std::memory_order_relaxed);
+	if (exact > 0.0) return exact;
+	// Not built yet. 2*fmax with fmax = min(Display Max, nyquist) — identical to what updateWarp
+	// publishes, so the reported axis never jumps once the first result lands.
+	const double fmax = std::min(p.displayMax > 0.0 ? p.displayMax : nyquist, nyquist);
+	return 2.0 * fmax;
+}
+
+// Sample rate reported to TouchDesigner for the spectrum, as requested: one output vector of
+// `bins` samples is produced every 1/me.time.rate seconds, so the node emits bins * rate samples
+// per second. At the defaults (16384 bins, 60 fps) that is 983 040.
+//
+// This is the CONCATENATED-STREAM reading of the output: it is the rate you get if you string one
+// frame's spectrum after another into a single signal, and it is what sizes a buffer, a ring, a GPU
+// upload or a network send. It is a property of the refresh cadence, not of the spectrum itself —
+// so it carries no bin-index-to-Hz information. The axis (and therefore every frequency you read
+// off this CHOP) lives in outputAxisRate()/hzPerSample(), which the Info CHOP exposes as
+// `hz_per_sample` and `output_spectrum_axis`. Use those to convert a bin index to Hz; the sample
+// rate now tells you how fast the data is coming, not what the bins mean.
+//
+// Deliberately takes no input rate: this number is `bins` x the cook rate and nothing else. Passing
+// the audio rate in here is what used to make it wrong.
+double
+FFT::outputSampleRate(const Parameters::Values& p) const
+{
+	const int n_out = outputBinCountFrom(p);
+	const double rate = myCookRate.load(std::memory_order_relaxed);
+	return static_cast<double>(n_out) * (rate > 0.0 ? rate : 60.0);
+}
+
+// Hz per output bin — the index-to-Hz mapping, and now the only channel that carries it, since
+// info->sampleRate reports throughput (see outputSampleRate above). The axis covers
+// outputAxisRate()/2 Hz over (bins - 1) intervals, so this is exactly fmax/(bins-1): the true
+// frequency resolution of the grid that was built. A uniform axis (Scale = Linear, whose perceptual
+// ramp IS the linear one, or Warp Blend = 0, which ignores the scale entirely) has this spacing
+// everywhere; a perceptual grid does not, and there the mean is reported, which is the only single
+// number that can describe it. TouchDesigner's Audio Spectrum CHOP exposes its equivalent as
+// `hz_per_sample`, for the same reason: the sample rate cannot carry the index-to-Hz mapping once a
+// grid is resampled.
+double
+FFT::hzPerSample(const Parameters::Values& p, double sampleRate) const
+{
+	const int n_out = outputBinCountFrom(p);
+	if (n_out < 2) return 0.0;
+	return outputAxisRate(p, sampleRate) / (2.0 * static_cast<double>(n_out - 1));
+}
+
+// Data throughput of the node, in samples per second — deliberately NOT the sample rate.
+//
+// This is the same quantity as outputSampleRate(), but measured instead of declared: `bins` samples
+// actually left the node over the cook delta we actually observed, rather than over the nominal
+// 1/me.time.rate. It is the figure to sanity-check a buffer, a ring, a GPU upload or a network send
+// with, and the rate of a signal you get by concatenating frames.
+//
+// It exists as a separate number because info->sampleRate means two different things by convention,
+// and this node has to pick one. A CHOP sample rate normally says how far apart the samples inside
+// one output vector are; for a spectrum that is a FREQUENCY spacing, not a time one. What
+// TouchDesigner does with `sampleRate` downstream (an Audio Spectrum CHOP's bin-to-Hz maths, for
+// one) assumes the time reading, so the honest choice for a spectrum is the throughput reading —
+// see outputSampleRate() for why the node reports bins x me.time.rate and not the input rate.
+double
+FFT::outputBandwidth(const Parameters::Values& p) const
+{
+	const int n_out = outputBinCountFrom(p);
+	const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
+	if (!(dt_ms > 0.0)) return 0.0;
+	return static_cast<double>(n_out) * 1000.0 / dt_ms;
+}
+
 bool
 FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserved1)
 {
-	const int bins = Parameters::readBins(inputs);
+	pollParameters(inputs);
+	myParamsFreshForExecute = true;
+	// me.time.rate for this cook — the timeline rate where this node lives, which can differ from
+	// the root rate inside a component with Component Time. The reported sample rate is
+	// bins * this, so read it here: getOutputInfo needs it now, and it also publishes it for the
+	// Info CHOP/DAT callbacks, which never receive an OP_Inputs of their own.
+	if (const OP_TimeInfo* ti = inputs->getTimeInfo()) {
+		if (ti->rate > 0.0) myCookRate.store(ti->rate, std::memory_order_relaxed);
+	}
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
+	const Parameters::Values& p = myParams;
+	const int bins = outputBinCountFrom(p);
 	info->startIndex = 0;
 	info->numSamples = bins;
-	info->numChannels = analysisChannelCount(cinput, Parameters::readChanMode(inputs));
-	info->sampleRate = (cinput && cinput->sampleRate > 0.0) ? static_cast<float>(cinput->sampleRate) : static_cast<float>(bins);
+	info->numChannels = analysisChannelCount(cinput, p.chanMode);
+	info->sampleRate = static_cast<float>(outputSampleRate(p));
 	return true;
 }
 
@@ -369,16 +642,15 @@ void
 FFT::getChannelName(int32_t index, OP_String* name, const OP_Inputs* inputs, void* reserved1)
 {
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
-	const Parameters::ChanMode mode = Parameters::readChanMode(inputs);
 	if (cinput && cinput->numChannels > 0) {
-		if (mode == Parameters::ChanMode::MonoMix && cinput->numChannels > 1) {
+		if (myParams.chanMode == Parameters::ChanMode::MonoMix && cinput->numChannels > 1) {
 			name->setString("mix_fft");
 			return;
 		}
 		if (index < cinput->numChannels) {
-			std::string cname = cinput->getChannelName(index);
-			cname += "_fft";
-			name->setString(cname.c_str());
+			char buf[128];
+			snprintf(buf, sizeof(buf), "%s_fft", cinput->getChannelName(index));
+			name->setString(buf);
 			return;
 		}
 	}
@@ -448,13 +720,63 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 }
 
 // ---------------------------------------------------------------------------------------------
+// Job / result handoff
+// ---------------------------------------------------------------------------------------------
+void
+FFT::fillJob(AnalysisJob& job, int numChannels, int winSamples, double dtMs)
+{
+	job.seq = ++myJobSeq;
+	job.numChannels = numChannels;
+	job.sampleRate = mySampleRate;
+	job.winSamples = winSamples;
+	job.dtMs = dtMs;
+	job.p = myParams;
+	job.reset = myResetPending;
+	const size_t n = static_cast<size_t>(numChannels);
+	if (job.windows.size() != n) job.windows.resize(n);     // no allocation after the first cooks
+	if (job.silent.size() != n) job.silent.resize(n);
+	for (int ch = 0; ch < numChannels; ++ch) {
+		myIngest[ch].fifo.get(job.windows[ch]);
+		job.silent[ch] = myIngest[ch].silent_run >= myCapacity ? 1 : 0;
+	}
+	myResetPending = false;
+}
+
+// Pipeline owner thread: worker (Async on) or cook thread (Async off)
+void
+FFT::runJob(const AnalysisJob& job)
+{
+	AnalysisResult& res = myResults.back();
+	try {
+		myPipeline->process(job, res);
+	} catch (...) {
+		return;                        // the slot is not published: the previous result stays visible
+	}
+	res.seq = job.seq;
+	myResults.publish();
+	myDspUs.store(myPipeline->lastUs(), std::memory_order_relaxed);
+	// Exactly the axis rate read off the tables that produced these bins — it is 2*(top of the axis)
+	// by construction, never fitted and never assumed (relaxed: the cook only needs it to be a recent,
+	// self-consistent value, and every channel of this cook reports the same one).
+	myOutputSampleRate.store(myPipeline->outputSampleRate(), std::memory_order_relaxed);
+
+	const uint64_t ver = myPipeline->statusVersion();
+	if (ver != myStatusVersionSeen) {  // strings are built only when the plan / tables actually changed
+		std::lock_guard<std::mutex> lock(myStatusMutex);
+		myStatusCopy = myPipeline->status();
+		myStatusVersionSeen = ver;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------------------------
 void
 FFT::startWorker()
 {
 	if (myWorkerRunning) return;
-	myWorkerStop = false;
+	myWorkerStop.store(false, std::memory_order_release);
+	myWorkerDormant.store(false, std::memory_order_release);
 	myWorkerRunning = true;
 	myWorker = std::thread([this]() { workerLoop(); });
 }
@@ -463,90 +785,67 @@ void
 FFT::stopWorker()
 {
 	if (!myWorkerRunning) return;
-	{
-		std::lock_guard<std::mutex> lock(myJobMutex);
-		myWorkerStop = true;
-	}
-	myJobCv.notify_all();
+	myWorkerStop.store(true, std::memory_order_release);
+	myWake.signal();
 	if (myWorker.joinable()) myWorker.join();
 	myWorkerRunning = false;
-	myMailboxFull = false;
 }
 
+// Hot: poll the job slot every kWorkerPollMs (the cook never pays for a kernel wake-up).
+// Dormant (no job for kWorkerDormantAfterMs, e.g. TouchDesigner paused or the node not cooking):
+// sleep until the cook signals once. The dormancy transition is a Dekker handshake with the
+// cook (store dormant; full fence; re-check the job slot) so a job published at that instant
+// is never left unprocessed.
 void
 FFT::workerLoop()
 {
+#ifdef _WIN32
+	nameAndBoostCurrentThread(L"FFT Custom CHOP analysis");
+#endif
 	FFTDSP::DenormalGuard ftz;
-	AnalysisJob job;
-	std::vector<FFTDSP::AlignedVector> scratch;   // reused: the pipeline writes here, then we swap into the back buffer
+	auto lastJob = clk::now();
 	for (;;) {
-		{
-			std::unique_lock<std::mutex> lock(myJobMutex);
-			myJobCv.wait(lock, [this] { return myWorkerStop || myMailboxFull; });
-			if (myWorkerStop) return;
-			std::swap(job, myMailbox);      // take the latest job; keeps the mailbox's buffers for reuse
-			myMailboxFull = false;
+		if (myWorkerStop.load(std::memory_order_acquire)) return;
+		if (myJobs.acquire()) {                          // latest job wins; older unconsumed jobs were overwritten
+			runJob(myJobs.front());
+			lastJob = clk::now();
+			myWorkerDormant.store(false, std::memory_order_relaxed);
+			continue;
 		}
-		try {
-			myPipeline->process(job, scratch);
-		} catch (...) {
-			continue;                        // keep the previous result on any failure
-		}
-		{
-			std::lock_guard<std::mutex> lock(myResultMutex);
-			int back = 1 - myFront;
-			std::swap(myResults[back], scratch);
-			myFront = back;
-			myPublishedSeq = job.seq;
-			refreshTelemetryLocked();
+		if (!myWorkerDormant.load(std::memory_order_relaxed)) {
+			if (std::chrono::duration<double, std::milli>(clk::now() - lastJob).count() > kWorkerDormantAfterMs) {
+				myWorkerDormant.store(true, std::memory_order_seq_cst);
+				std::atomic_thread_fence(std::memory_order_seq_cst);
+				continue;                                // re-check the slot before sleeping (pairs with the cook's fence)
+			}
+			myWake.waitFor(kWorkerPollMs);
+		} else {
+			myWake.wait();
 		}
 	}
-}
-
-void
-FFT::refreshTelemetryLocked()
-{
-	myStatusCopy = myPipeline->status();
-	if (myPipeline->tablesVersion() != myTablesVersionSeen) {
-		myTargetHzCopy = myPipeline->targetHz();
-		myTablesVersionSeen = myPipeline->tablesVersion();
-	}
-}
-
-void
-FFT::publishSync(AnalysisJob& job)
-{
-	std::vector<FFTDSP::AlignedVector>& back = myResults[1 - myFront];
-	myPipeline->process(job, back);
-	std::lock_guard<std::mutex> lock(myResultMutex);
-	myFront = 1 - myFront;
-	myPublishedSeq = job.seq;
-	refreshTelemetryLocked();
 }
 
 void
 FFT::copyResultsToOutput(CHOP_Output* output, int numChannels)
 {
-	std::lock_guard<std::mutex> lock(myResultMutex);
-	const auto& res = myResults[myFront];
+	myResults.acquire();                                   // one atomic exchange; no-op when nothing new
+	const AnalysisResult& res = myResults.front();
 	const size_t out_samples = static_cast<size_t>(std::max(0, output->numSamples));
 	for (int ch = 0; ch < numChannels && ch < output->numChannels; ++ch) {
 		float* dst = output->channels[ch];
 		if (!dst) continue;
-		if (ch < static_cast<int>(res.size()) && !res[ch].empty()) {
-			size_t n = std::min(out_samples, res[ch].size());
-			std::memcpy(dst, res[ch].data(), n * sizeof(float));
+		if (ch < static_cast<int>(res.spectra.size()) && !res.spectra[ch].empty()) {
+			const FFTDSP::AlignedVector& src = res.spectra[ch];
+			size_t n = std::min(out_samples, src.size());
+			std::memcpy(dst, src.data(), n * sizeof(float));
 			if (out_samples > n) std::memset(dst + n, 0, (out_samples - n) * sizeof(float));
 		} else {
 			std::memset(dst, 0, out_samples * sizeof(float));
 		}
 	}
-	// peak telemetry from channel 0 of the published result
-	if (!res.empty() && !res[0].empty()) {
-		size_t max_idx = 0;
-		myPeakMagnitude = FFTDSP::findPeakWithIndex(res[0].data(), res[0].size(), max_idx);
-		if (max_idx < myTargetHzCopy.size()) myPeakFrequencyHz = static_cast<float>(myTargetHzCopy[max_idx]);
-	}
+	myPeakMagnitude = res.peakMag;
+	myPeakFrequencyHz = res.peakHz;
+	myHoldFrames = (res.seq <= myJobSeq) ? static_cast<int>(myJobSeq - res.seq) : 0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -562,18 +861,11 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	const auto t_start = clk::now();
 	FFTDSP::DenormalGuard ftz;
 
-	// --- 1. parameters (polled) ---
+	// --- 1. parameters (normally already polled by getOutputInfo for this cook) ---
 	myExecStage = 1;
-	const int poll = Parameters::readParamPoll(inputs);
-	if (!myHaveParams || poll <= 1 || (myExecuteCount % poll) == 0) {
-		myParams = Parameters::eval(inputs, &myParamReads);
-		myParamReads += 1;   // + the poll read itself
-		myHaveParams = true;
-	} else {
-		myParamReads = 1;
-	}
+	if (!myParamsFreshForExecute) pollParameters(inputs);
+	myParamsFreshForExecute = false;
 	const Parameters::Values& p = myParams;
-	myParamUs = usSince(t_start);
 
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
 	double sr = 44100.0;
@@ -584,12 +876,11 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	if (const OP_TimeInfo* ti = inputs->getTimeInfo()) {
 		if (ti->deltaMS > 0.0 && ti->deltaMS < 5000.0) dt_ms = ti->deltaMS;
 		else if (ti->rate > 0.0) dt_ms = 1000.0 / ti->rate;
+		if (ti->rate > 0.0) myCookRate.store(ti->rate, std::memory_order_relaxed);
 	}
+	myCookDtMs.store(dt_ms, std::memory_order_relaxed);    // outputBandwidth() reads it (Info callbacks)
 
-	int win_samples = p.winSamples;
-	if (p.winMode == Parameters::WinMode::Milliseconds) {
-		win_samples = std::clamp(static_cast<int>(std::lround(p.winMs * mySampleRate / 1000.0)), 1, Parameters::kMaxWinSamples);
-	}
+	const int win_samples = windowSamplesFrom(p, mySampleRate);
 	myCapacity = static_cast<size_t>(win_samples);
 
 	// --- 2. ingest ---
@@ -606,55 +897,27 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	}
 	myAsyncActive = myWorkerRunning;
 
-	const bool due = (p.updateEvery <= 1) || (myExecuteCount % p.updateEvery) == 0;
-	if (due) {
-		if (myAsyncActive) {
-			std::lock_guard<std::mutex> lock(myJobMutex);
-			if (myMailboxFull) myJobsDropped.fetch_add(1);   // worker still busy: latest job wins
-			AnalysisJob& job = myMailbox;
-			job.seq = ++myJobSeq;
-			job.numChannels = num_channels;
-			job.sampleRate = mySampleRate;
-			job.winSamples = win_samples;
-			job.dtMs = dt_ms;
-			job.p = p;
-			job.reset = myResetPending;
-			job.windows.resize(static_cast<size_t>(num_channels));
-			job.silent.resize(static_cast<size_t>(num_channels));
-			for (int ch = 0; ch < num_channels; ++ch) {
-				myIngest[ch].fifo.get(job.windows[ch]);
-				job.silent[ch] = myIngest[ch].silent_run >= myCapacity ? 1 : 0;
-			}
-			myMailboxFull = true;
-			myResetPending = false;
-			myJobCv.notify_one();
-		} else {
-			AnalysisJob& job = myMailbox;     // reuse the buffers, no allocation after the first cook
-			job.seq = ++myJobSeq;
-			job.numChannels = num_channels;
-			job.sampleRate = mySampleRate;
-			job.winSamples = win_samples;
-			job.dtMs = dt_ms;
-			job.p = p;
-			job.reset = myResetPending;
-			job.windows.resize(static_cast<size_t>(num_channels));
-			job.silent.resize(static_cast<size_t>(num_channels));
-			for (int ch = 0; ch < num_channels; ++ch) {
-				myIngest[ch].fifo.get(job.windows[ch]);
-				job.silent[ch] = myIngest[ch].silent_run >= myCapacity ? 1 : 0;
-			}
-			myResetPending = false;
-			publishSync(job);
-		}
+	// Every cook publishes a job. (v2.7.0 removed "Update Every N Cooks", which used to skip this on
+	// N-1 cooks out of N: with the analysis already off the cook thread, skipping bought nothing and
+	// only halved the rate at which the spectrum updated.)
+	fillJob(myJobs.back(), num_channels, win_samples, dt_ms);
+	if (myJobs.publish()) myJobsDropped.fetch_add(1, std::memory_order_relaxed);   // worker had not taken the previous job
+	if (myAsyncActive) {
+		// The hot worker polls the slot itself. Only a dormant worker needs a kernel wake-up
+		// (~5 us): fence + load pair with the worker's store + fence, so exactly one side always
+		// sees the other and the job is picked up either way.
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (myWorkerDormant.load(std::memory_order_seq_cst)) myWake.signal();
+	} else if (myJobs.acquire()) {
+		runJob(myJobs.front());                           // inline on the cook thread
 	}
 
 	// --- 4. output (hold the previous spectrum when nothing new has been published) ---
 	myExecStage = 4;
 	copyResultsToOutput(output, num_channels);
-	myHoldFrames = static_cast<int>(myJobSeq - myPublishedSeq);
 
-	// --- 5. deferred Textport log ---
-	myLog.flushToTextport();
+	// --- 5. deferred Textport log (lock-free check; only locks when something was logged) ---
+	if (myLog.hasPending()) myLog.flushToTextport();
 	myLastCookUs = usSince(t_start);
 	myExecStage = 0;
 }
@@ -676,46 +939,59 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 }
 
 // =============================================================================================
-// Info CHOP / DAT / popup / diagnostics
+// Info CHOP / DAT / popup / diagnostics (UI callbacks; not part of the real-time path)
 // =============================================================================================
+AnalysisPipeline::Status
+FFT::statusSnapshot()
+{
+	std::lock_guard<std::mutex> lock(myStatusMutex);
+	return myStatusCopy;
+}
+
 int32_t
 FFT::getNumInfoCHOPChans(void* reserved1)
 {
-	return 16;
+	return 21;
 }
 
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
-	AnalysisPipeline::Status s;
-	{
-		std::lock_guard<std::mutex> lock(myResultMutex);
-		s = myStatusCopy;
-	}
+	const AnalysisPipeline::Status s = statusSnapshot();
 	switch (index) {
 	case 0:  chan->name->setString("execute_count");     chan->value = static_cast<float>(myExecuteCount); break;
 	case 1:  chan->name->setString("fft_size");          chan->value = static_cast<float>(s.fftSize); break;
 	case 2:  chan->name->setString("window_samples");    chan->value = static_cast<float>(s.capacity); break;
-	case 3:  chan->name->setString("sample_rate");       chan->value = static_cast<float>(mySampleRate); break;
-	case 4:  chan->name->setString("peak_freq_hz");      chan->value = myPeakFrequencyHz; break;
-	case 5:  chan->name->setString("peak_magnitude");    chan->value = myPeakMagnitude; break;
-	case 6:  chan->name->setString("simd_avx2_active");  chan->value = myCpuOk ? 1.0f : 0.0f; break;
-	case 7:  chan->name->setString("async_active");      chan->value = myAsyncActive ? 1.0f : 0.0f; break;
-	case 8:  chan->name->setString("cook_time_us");      chan->value = static_cast<float>(myLastCookUs); break;
-	case 9:  chan->name->setString("dsp_time_us");       chan->value = static_cast<float>(s.dspUs); break;
-	case 10: chan->name->setString("linear_bins");       chan->value = static_cast<float>(s.linearBins); break;
-	case 11: chan->name->setString("param_fetch_us");    chan->value = static_cast<float>(myParamUs); break;
-	case 12: chan->name->setString("param_reads");       chan->value = static_cast<float>(myParamReads); break;
-	case 13: chan->name->setString("jobs_dropped");      chan->value = static_cast<float>(myJobsDropped.load()); break;
-	case 14: chan->name->setString("analysis_channels"); chan->value = static_cast<float>(myAnalysisChannels); break;
-	case 15: chan->name->setString("hold_frames");       chan->value = static_cast<float>(myHoldFrames); break;
+	case 3:  chan->name->setString("input_sample_rate"); chan->value = static_cast<float>(mySampleRate); break;
+	case 4:  chan->name->setString("output_sample_rate");chan->value = static_cast<float>(outputSampleRate(myParams)); break;
+	case 5:  chan->name->setString("peak_freq_hz");      chan->value = myPeakFrequencyHz; break;
+	case 6:  chan->name->setString("peak_magnitude");    chan->value = myPeakMagnitude; break;
+	case 7:  chan->name->setString("simd_avx2_active");  chan->value = myCpuOk ? 1.0f : 0.0f; break;
+	case 8:  chan->name->setString("async_active");      chan->value = myAsyncActive ? 1.0f : 0.0f; break;
+	case 9:  chan->name->setString("cook_time_us");      chan->value = static_cast<float>(myLastCookUs); break;
+	case 10: chan->name->setString("dsp_time_us");       chan->value = static_cast<float>(myDspUs.load(std::memory_order_relaxed)); break;
+	case 11: chan->name->setString("linear_bins");       chan->value = static_cast<float>(s.linearBins); break;
+	case 12: chan->name->setString("param_fetch_us");    chan->value = static_cast<float>(myParamUs); break;
+	case 13: chan->name->setString("param_reads");       chan->value = static_cast<float>(myParamReads); break;
+	case 14: chan->name->setString("jobs_dropped");      chan->value = static_cast<float>(myJobsDropped.load(std::memory_order_relaxed)); break;
+	case 15: chan->name->setString("analysis_channels"); chan->value = static_cast<float>(myAnalysisChannels); break;
+	case 16: chan->name->setString("hold_frames");       chan->value = static_cast<float>(myHoldFrames); break;
+	// 17: was `raw_linear`, driven by the removed Raw Linear Bins toggle. Same meaning, read off the
+	// built tables instead of a parameter, and named for what it describes: the output grid IS the
+	// linear FFT grid (the warp came out as the identity and the magnitude is memcpy'd).
+	case 17: chan->name->setString("linear_grid");       chan->value = s.linearGrid ? 1.0f : 0.0f; break;
+	case 18: chan->name->setString("hz_per_sample");     chan->value = static_cast<float>(hzPerSample(myParams, mySampleRate)); break;
+	case 19: chan->name->setString("output_bandwidth_sps"); chan->value = static_cast<float>(outputBandwidth(myParams)); break;
+	// 20: whether process() fanned the channel loop out over cores this cook. Same name as the Info DAT
+	// row that reports it; off (0) is the normal reading for the intended one-mono-channel-per-node use.
+	case 20: chan->name->setString("channel_fanout");    chan->value = (myPipeline && myPipeline->parallelActive()) ? 1.0f : 0.0f; break;
 	}
 }
 
 bool
 FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-	infoSize->rows = 14 + static_cast<int32_t>(myLog.size());
+	infoSize->rows = 19 + static_cast<int32_t>(myLog.size());
 	infoSize->cols = 2;
 	infoSize->byColumn = false;
 	return true;
@@ -724,11 +1000,8 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 void
 FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entries, void* reserved1)
 {
-	AnalysisPipeline::Status s;
-	{
-		std::lock_guard<std::mutex> lock(myResultMutex);
-		s = myStatusCopy;
-	}
+	const AnalysisPipeline::Status s = statusSnapshot();
+	const double dspUs = myDspUs.load(std::memory_order_relaxed);
 	char tempBuffer[256];
 	auto row = [&](const char* k, const std::string& v) {
 		entries->values[0]->setString(k);
@@ -740,18 +1013,77 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 	case 2: row("fft_size", std::to_string(s.fftSize)); return;
 	case 3: snprintf(tempBuffer, sizeof(tempBuffer), "%zu of %zu computed", s.magnitudeBins, s.linearBins); row("linear_bins", tempBuffer); return;
 	case 4: row("window_samples", std::to_string(s.capacity)); return;
-	case 5: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate); row("sample_rate", tempBuffer); return;
-	case 6: snprintf(tempBuffer, sizeof(tempBuffer), "%.2f Hz", s.capacity > 0 ? mySampleRate / static_cast<double>(s.capacity) : 0.0); row("window_resolution", tempBuffer); return;
-	case 7: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", myPeakFrequencyHz); row("spectral_peak_freq", tempBuffer); return;
-	case 8: row("simd_acceleration", myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU (no AVX2)"); return;
-	case 9: row("fft_engine", s.plan + (s.planUpgrading ? " [measuring better plan in background]" : "")); return;
-	case 10: snprintf(tempBuffer, sizeof(tempBuffer), "cook %.1f us (params %.1f us / %d reads)", myLastCookUs, myParamUs, myParamReads); row("cook_time", tempBuffer); return;
-	case 11: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us per analysis (%s)", s.dspUs, myAsyncActive ? "off the cook thread" : "on the cook thread"); row("dsp_time", tempBuffer); return;
-	case 12: snprintf(tempBuffer, sizeof(tempBuffer), "%llu dropped, hold %d frame(s)", static_cast<unsigned long long>(myJobsDropped.load()), myHoldFrames); row("async_jobs", tempBuffer); return;
-	case 13: row("wisdom_file", FFTDSP::FFTWEngine::wisdomPath()); return;
+	case 5: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", mySampleRate); row("input_sample_rate", tempBuffer); return;
+	case 6: {
+		// The frequency axis itself: axisBottom .. outputAxisRate/2 with the last bin on the top, so
+		// n_out bins cover (n_out-1) intervals of outputAxisRate/(2*(n_out-1)). This — not the sample
+		// rate — is what converts a bin index to Hz. The low end is printed rather than assumed to be
+		// DC: it is 0 only for Mel / ERB / Linear (and for any scale at Warp Blend 0).
+		const double axis_rate = outputAxisRate(myParams, mySampleRate);
+		const int n_out = outputBinCountFrom(myParams);
+		snprintf(tempBuffer, sizeof(tempBuffer), "%.2f Hz per bin x %d bins = %.1f..%.1f Hz",
+		         hzPerSample(myParams, mySampleRate), n_out, s.axisBottom, axis_rate * 0.5);
+		row("output_spectrum_axis", tempBuffer);
+		return;
+	}
+	case 7: {
+		// bins x me.time.rate: the rate of one output vector per cook, i.e. the sample rate of the
+		// frames concatenated. The axis row above carries the frequency meaning.
+		const int n_out = outputBinCountFrom(myParams);
+		const double rate = myCookRate.load(std::memory_order_relaxed);
+		snprintf(tempBuffer, sizeof(tempBuffer), "%.0f samples/s (%d bins x %.2f frames/s, %s)",
+		         outputSampleRate(myParams), n_out,
+		         rate > 0.0 ? rate : 60.0,
+		         s.linearGrid ? "linear grid, no resampling" : "warped grid, resampled");
+		row("output_sample_rate", tempBuffer);
+		return;
+	}
+	case 8: snprintf(tempBuffer, sizeof(tempBuffer), "%.2f Hz (%zu-sample window)", s.capacity > 0 ? mySampleRate / static_cast<double>(s.capacity) : 0.0, s.capacity);
+	        row("window_resolution", tempBuffer); return;
+	case 9: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f Hz", myPeakFrequencyHz); row("spectral_peak_freq", tempBuffer); return;
+	case 10: row("simd_acceleration", myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU (no AVX2)"); return;
+	case 11: row("fft_engine", s.plan + (s.planUpgrading ? " [measuring better plan in background]" : "")); return;
+	case 12: snprintf(tempBuffer, sizeof(tempBuffer), "cook %.1f us (params %.1f us / %d reads this cook)", myLastCookUs, myParamUs, myParamReads); row("cook_time", tempBuffer); return;
+	case 13: snprintf(tempBuffer, sizeof(tempBuffer), "%.1f us per analysis (%s%s)", dspUs,
+	                  myAsyncActive ? "off the cook thread" : "on the cook thread",
+	                  (myPipeline && myPipeline->parallelActive()) ? ", channel loop parallel" : ""); row("dsp_time", tempBuffer); return;
+	case 14: snprintf(tempBuffer, sizeof(tempBuffer), "%llu dropped, hold %d frame(s)", static_cast<unsigned long long>(myJobsDropped.load(std::memory_order_relaxed)), myHoldFrames); row("async_jobs", tempBuffer); return;
+	case 15: row("wisdom_file", FFTDSP::FFTWEngine::wisdomPath()); return;
+	case 16: {
+		// The axis is uniform whenever the blend collapses every scale onto the linear ramp: Scale =
+		// Linear (its perceptual grid IS the linear one, so any blend stays uniform) or Warp Blend = 0
+		// (the blend ignores the scale entirely). Otherwise the grid is perceptual and the number below
+		// is the mean spacing, the only scalar that can describe a non-uniform axis.
+		const bool uniform = (myParams.scale == Parameters::Scale::Linear) || (myParams.warp <= 0.0);
+		snprintf(tempBuffer, sizeof(tempBuffer), "%.4f Hz per bin%s",
+		         hzPerSample(myParams, mySampleRate),
+		         uniform ? "" : " (mean; a perceptual grid is not uniform)");
+		row("hz_per_sample", tempBuffer);
+		return;
+	}
+	case 17: {
+		// Throughput, not the sample rate: bins per new frame x frames per second. See outputBandwidth().
+		const int n_out = outputBinCountFrom(myParams);
+		const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
+		snprintf(tempBuffer, sizeof(tempBuffer), "%.0f samples/s (%d bins x %.1f frames/s)",
+		         outputBandwidth(myParams), n_out,
+		         dt_ms > 0.0 ? 1000.0 / dt_ms : 0.0);
+		row("output_bandwidth_sps", tempBuffer);
+		return;
+	}
+	case 18: {
+		const bool par = myPipeline && myPipeline->parallelActive();
+		snprintf(tempBuffer, sizeof(tempBuffer), "%s",
+		         par ? "on: std::execution::par over the channel loop"
+		             : "off: one channel, nothing to fan out (expected - this node is mono per instance)");
+		// Named for what it reports (whether the channel loop was fanned out), not for the parameters
+		// that used to gate it - those are gone, and this row cannot disagree with what process() did.
+		row("channel_fanout", tempBuffer);
+		return;
+	}
 	default: break;
 	}
-	size_t log_idx = static_cast<size_t>(index - 14);
+	size_t log_idx = static_cast<size_t>(index - 19);
 	if (log_idx < myLog.size()) {
 		snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
 		row(tempBuffer, myLog.entry(log_idx));
@@ -761,16 +1093,36 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 void
 FFT::getInfoPopupString(OP_String* info, void* reserved1)
 {
-	AnalysisPipeline::Status s;
-	{
-		std::lock_guard<std::mutex> lock(myResultMutex);
-		s = myStatusCopy;
-	}
+	const AnalysisPipeline::Status s = statusSnapshot();
+	char buf[256];
 	std::string text = "TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + " | " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
 	text += "Engine & Plan: " + s.plan + "\n";
 	text += "FFT Size: N = " + std::to_string(s.fftSize) + " | Window: " + std::to_string(s.capacity) + " samples | magnitude bins computed: " + std::to_string(s.magnitudeBins) + "\n";
-	text += "Cook: " + std::to_string(myLastCookUs) + " us (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(s.dspUs) + " us\n";
+	{
+		const double axis_rate = outputAxisRate(myParams, mySampleRate);
+		const int n_out = outputBinCountFrom(myParams);
+		snprintf(buf, sizeof(buf), "Spectrum axis: %d bins @ %.2f Hz = %.1f..%.1f Hz (input %.1f Hz%s)\n",
+		         n_out, hzPerSample(myParams, mySampleRate), s.axisBottom, axis_rate * 0.5, mySampleRate,
+		         s.linearGrid ? ", linear grid: identity warp, no resampling" : ", resampled onto the warp grid");
+		text += buf;
+	}
+	{
+		// The reported sample rate is bins x me.time.rate; the measured throughput is the same idea
+		// with the cook delta actually observed. Both are shown, plus the axis rate, because only the
+		// axis rate converts a bin index to Hz.
+		const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
+		const double rate = myCookRate.load(std::memory_order_relaxed);
+		const int n_out = outputBinCountFrom(myParams);
+		snprintf(buf, sizeof(buf), "Sample rate (to TouchDesigner): %.0f Hz = %d bins x %.2f frames/s (me.time.rate)\n",
+		         outputSampleRate(myParams), n_out, rate > 0.0 ? rate : 60.0);
+		text += buf;
+		snprintf(buf, sizeof(buf), "Measured throughput: %.0f samples/s (cook delta %.2f ms)\n",
+		         outputBandwidth(myParams),
+		         dt_ms);
+		text += buf;
+	}
+	text += "Cook: " + std::to_string(myLastCookUs) + " us (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us\n";
 	text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
 	auto logs = myLog.snapshot();
 	size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
@@ -781,6 +1133,7 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 void
 FFT::getWarningString(OP_String* warning, void* reserved1)
 {
+	// hold_frames == 1 is the normal one-frame latency of the async pipeline
 	if (myAsyncActive && myHoldFrames > 3) {
 		warning->setString("Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins.");
 	}

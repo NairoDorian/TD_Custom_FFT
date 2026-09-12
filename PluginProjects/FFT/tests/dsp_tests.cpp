@@ -281,6 +281,30 @@ static void test_background_plan()
     CHECK(e.getPlanStatus().find("FFTW_MEASURE") != std::string::npos);
     e.executeRFFT(frame, mag, scratch);
     CHECK_NEAR(mag[0], 1.0, 1e-4);                           // impulse -> flat magnitude 1
+
+    // Patient: same non-blocking scheme with FFTW_PATIENT (small N so the test stays quick)
+    FFTWEngine pe;
+    t0 = std::chrono::steady_clock::now();
+    pe.prepare(2048, PlannerPolicy::Patient, &log);
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("  prepare(2048, Patient) returned in %.1f ms: %s\n", ms, pe.getPlanStatus().c_str());
+    CHECK(ms < 250.0);
+    AlignedVector pframe(2048, 0.0f), pmag; AlignedComplexVector pscratch;
+    pframe[7] = 1.0f;
+    for (int i = 0; i < 1500 && !pe.pollBackgroundPlan(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        pe.executeRFFT(pframe, pmag, pscratch);             // executing while the patient planner runs is fine
+    }
+    std::printf("  final: %s\n", pe.getPlanStatus().c_str());
+    CHECK(pe.getPlanStatus().find("FFTW_PATIENT") != std::string::npos);
+    pe.executeRFFT(pframe, pmag, pscratch);
+    CHECK_NEAR(pmag[0], 1.0, 1e-4);
+    // the patient plan is now in wisdom: a fresh engine gets it instantly, and so does Auto
+    FFTWEngine pe2, ae;
+    pe2.prepare(2048, PlannerPolicy::Patient, &log);
+    CHECK(pe2.getPlanStatus().find("from wisdom") != std::string::npos);
+    ae.prepare(2048, PlannerPolicy::Auto, &log);
+    CHECK(ae.getPlanStatus().find("from wisdom") != std::string::npos);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -359,6 +383,96 @@ static void test_v23_helpers()
 }
 
 // ------------------------------------------------------------------------------------------
+static void test_triple_buffer_and_signal()
+{
+    section("TripleBuffer / WorkerSignal (v2.4 lock-free handoff)");
+    struct Payload { uint64_t a{ 0 }, b{ 0 }; std::vector<float> data; };
+
+    // single thread: roles rotate, latest wins, dropped flag
+    TripleBuffer<Payload> tb;
+    CHECK(!tb.acquire());                       // nothing published yet
+    CHECK(tb.front().a == 0);
+    tb.back().a = 1; tb.back().b = 1;
+    CHECK(!tb.publish());                       // nothing was pending -> not dropped
+    tb.back().a = 2; tb.back().b = 2;
+    CHECK(tb.publish());                        // consumer did not take #1 -> dropped
+    CHECK(tb.acquire());
+    CHECK(tb.front().a == 2);                   // latest wins
+    CHECK(!tb.acquire());                       // consumed
+    CHECK(tb.front().a == 2);                   // front stays valid until the next acquire
+    // the three slots are always distinct roles: writing back never touches front
+    Payload* f = &tb.front();
+    for (int i = 0; i < 10; ++i) { tb.back().a = 100 + i; CHECK(&tb.back() != f); tb.publish(); }
+    CHECK(f->a == 2);
+    CHECK(tb.acquire() && tb.front().a == 109);
+
+    // two threads: the consumer must never observe a torn payload (a != b or data[k] != a)
+    TripleBuffer<Payload> tb2;
+    for (size_t i = 0; i < TripleBuffer<Payload>::kSlots; ++i) tb2.slot(i).data.assign(256, 0.0f);
+    std::atomic<bool> stop{ false };
+    std::atomic<uint64_t> produced{ 0 };
+    std::thread producer([&] {
+        for (uint64_t n = 1; !stop.load(); ++n) {
+            Payload& p = tb2.back();
+            p.a = n;
+            for (auto& v : p.data) v = static_cast<float>(n & 0xFFFF);
+            p.b = n;
+            tb2.publish();
+            produced.store(n);
+        }
+    });
+    uint64_t last = 0, acquired = 0, torn = 0, non_monotonic = 0;
+    auto t_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < t_end) {
+        if (tb2.acquire()) {
+            const Payload& p = tb2.front();
+            if (p.a != p.b) ++torn;
+            for (float v : p.data) if (v != static_cast<float>(p.a & 0xFFFF)) { ++torn; break; }
+            if (p.a < last) ++non_monotonic;
+            last = p.a;
+            ++acquired;
+        }
+    }
+    stop.store(true);
+    producer.join();
+    std::printf("  produced %llu, consumer acquired %llu, torn %llu, non-monotonic %llu\n",
+                static_cast<unsigned long long>(produced.load()), static_cast<unsigned long long>(acquired),
+                static_cast<unsigned long long>(torn), static_cast<unsigned long long>(non_monotonic));
+    CHECK(acquired > 0);
+    CHECK(torn == 0);
+    CHECK(non_monotonic == 0);
+    CHECK(tb2.acquire() || true);                   // drain
+    CHECK(tb2.front().a == produced.load());        // the very last publish is visible after the producer stopped
+
+    // WorkerSignal: a signal issued before wait() is not lost; wait() consumes it; cross-thread wake works
+    WorkerSignal sig;
+    sig.signal();
+    auto t0 = std::chrono::steady_clock::now();
+    sig.wait();
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+    std::atomic<int> woke{ 0 };
+    std::thread waiter([&] { sig.wait(); woke.store(1); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(woke.load() == 0);                        // still blocked: the earlier signal was consumed
+    sig.signal();
+    waiter.join();
+    CHECK(woke.load() == 1);
+    // waitFor: times out close to the requested 2 ms even when the system clock ticks at 15.6 ms
+    // (high-resolution waitable timer), and returns true immediately when a signal is pending
+    double worst_ms = 0.0;
+    for (int i = 0; i < 20; ++i) {
+        auto s = std::chrono::steady_clock::now();
+        CHECK(!sig.waitFor(2));
+        worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count());
+    }
+    std::printf("  waitFor(2 ms): worst %.2f ms over 20 calls (high-res timer: %s)\n", worst_ms, sig.highResolutionTimer() ? "yes" : "no");
+    CHECK(worst_ms >= 1.0);
+    if (sig.highResolutionTimer()) CHECK(worst_ms < 6.0);
+    sig.signal();
+    CHECK(sig.waitFor(1000));
+}
+
+// ------------------------------------------------------------------------------------------
 static void test_pipeline_sine()
 {
     section("FFTWEngine pipeline (1 kHz sine @ 44.1 kHz)");
@@ -401,6 +515,117 @@ static void test_pipeline_sine()
 }
 
 // ------------------------------------------------------------------------------------------
+// The linear-grid ("no resampling") case is not a mode of its own: Scale = Linear + Warp Blend = 0
+// + Display Max >= Nyquist + Output Bins = nlin makes the warp come out as the identity, and
+// applyWarp() then memcpy's the magnitude through untouched. These checks pin that equivalence and
+// the frequency-axis model that goes with it.
+static void test_identity_grid_and_rate()
+{
+    section("linear grid (identity warp, no resampling) + spectrum frequency axis");
+    const size_t nlin = 513;                        // a 1024-point R2C transform
+    const double sr = 44100.0, nyq = sr / 2.0;
+    AlignedVector src(nlin), out;
+    for (size_t i = 0; i < nlin; ++i) src[i] = static_cast<float>(std::sin(i * 0.03) * 5.0 + 2.0);
+    PerceptualWarping w;
+
+    // --- linear grid: the output grid IS the linear FFT grid, copied verbatim ---
+    w.buildWarpTables(5 /*Linear*/, nyq, nlin, nyq, 0.0, 20.0, nlin);
+    CHECK(w.isIdentity());
+    CHECK(w.outputBins() == nlin);
+    // every bin must land exactly on its own linear index: bin i of an N-point R2C transform is i*sr/N
+    double max_bin_err = 0.0;
+    for (size_t i = 0; i < nlin; ++i) {
+        max_bin_err = std::max(max_bin_err, std::abs(w.targetHz()[i] - i * sr / 1024.0));
+    }
+    std::printf("  linear grid: max bin freq error %.2e Hz (bin spacing %.2f Hz)\n", max_bin_err, sr / 1024.0);
+    CHECK(max_bin_err < 1e-9);
+    CHECK_NEAR(w.targetHz()[nlin - 1], nyq, 1e-9);          // top bin sits on Nyquist
+    w.applyWarp(src, out);
+    bool identical = out.size() == nlin;
+    for (size_t i = 0; identical && i < nlin; ++i) identical = (out[i] == src[i]);
+    CHECK(identical);
+
+    // --- axis model: axisRate = 2 * (top of the axis), so the last bin sits on Nyquist ---
+    // Full-band grid: fmax = nyquist, so the axis rate is exactly the input rate, and the implied
+    // spacing axisRate/(2*(nlin-1)) is exactly the 1024-point transform's own resolution. This is
+    // what hz_per_sample / output_spectrum_axis report; info->sampleRate is bins x me.time.rate.
+    const double raw_axis = 2.0 * w.targetHz()[w.outputBins() - 1];
+    CHECK_NEAR(raw_axis, sr, 1e-9);
+    CHECK_NEAR(raw_axis / (2.0 * static_cast<double>(nlin - 1)), sr / 1024.0, 1e-9);
+    CHECK(raw_axis == 44100.0);                              // same band as the input signal
+
+    // Linear grid held to Display Max below Nyquist: the axis stops at Display Max, so the axis
+    // rate is twice that, whatever the bin count. This is where it stops equalling the input rate.
+    {
+        const double fmax = 10000.0;
+        const size_t n_out = 1000;
+        w.buildWarpTables(5, fmax, n_out, nyq, 0.0, 20.0, nlin);
+        CHECK(!w.isIdentity());                              // 1000 bins gathered from 513: not 1:1
+        CHECK_NEAR(w.targetHz()[0], 0.0, 1e-12);
+        CHECK_NEAR(w.targetHz()[n_out - 1], fmax, 1e-9);     // last bin sits exactly on Display Max
+        CHECK_NEAR(2.0 * w.targetHz()[n_out - 1], 20000.0, 1e-9);
+        CHECK_NEAR(w.targetHz()[n_out - 1] / static_cast<double>(n_out - 1), 10000.0 / 999.0, 1e-9);
+        // More bins over the same band: the count of bins describing the band changes, the band
+        // does not, so the axis rate must not move with Output Bins.
+        w.buildWarpTables(5, fmax, 4000, nyq, 0.0, 20.0, nlin);
+        CHECK_NEAR(2.0 * w.targetHz()[3999], 20000.0, 1e-9);
+        w.buildWarpTables(5, fmax, 257, nyq, 0.0, 20.0, nlin);
+        CHECK_NEAR(2.0 * w.targetHz()[256], 20000.0, 1e-9);
+    }
+    // A full-Nyquist band over 1000 bins: same 0..nyquist band as the input, so the axis rate is
+    // the input rate for every scale, whatever Order the bins land in.
+    for (int scale = 0; scale < 7; ++scale) {
+        w.buildWarpTables(scale, nyq, 1000, nyq, 0.0, 20.0, nlin);
+        CHECK_NEAR(2.0 * w.targetHz()[999], sr, 1e-9);
+    }
+    // Every scale is monotonic and ends exactly on fmax, which is what makes axisRate = 2*fmax exact
+    // at the top of the axis even where the bins in between are non-uniform.
+    for (int scale = 0; scale < 7; ++scale) {
+        w.buildWarpTables(scale, 16000.0, 2000, nyq, 1.0, 20.0, nlin);
+        CHECK(std::is_sorted(w.targetHz().begin(), w.targetHz().end()));
+        CHECK_NEAR(w.targetHz()[1999], 16000.0, 1e-6);
+        CHECK_NEAR(2.0 * w.targetHz()[1999], 32000.0, 1e-6);
+    }
+    // Bark used to fold over past ~6.5 kHz (barkToHz divided by 0.78 where the inverse of
+    // hzToBark's 1.22*z-4.422 needs 1.22), which left the top bin back down at 0 Hz.
+    {
+        const double f[] = { 0.0, 20.0, 1000.0, 6543.0, 8000.0, 16000.0, 22050.0 };
+        for (double f_hz : f) {
+            CHECK_NEAR(PerceptualWarping::barkToHz(PerceptualWarping::hzToBark(f_hz)), f_hz, 1e-6);
+        }
+    }
+    // A perceptual scale reads a narrowed band, so fewer magnitude bins are needed than the FFT has.
+    w.buildWarpTables(0, 1000.0, 2000, nyq, 1.0, 20.0, nlin);
+    CHECK(w.maxLinearIndex() < nlin / 20 + 4);
+    CHECK(!w.isIdentity());
+
+    // --- end to end: a sine at bin 100 of a 1024-point FFT reads back as bin 100's exact Hz ---
+    {
+        PlanLog log;
+        FFTWEngine e;
+        e.prepare(1024, PlannerPolicy::Fast, &log);
+        const size_t bin = 100;
+        const double f0 = bin * sr / 1024.0;
+        AlignedVector frame(1024, 0.0f), mag, raw;
+        AlignedComplexVector scratch;
+        for (size_t i = 0; i < 1024; ++i) frame[i] = static_cast<float>(std::sin(2.0 * PI_D * f0 * i / sr));
+        e.executeRFFT(frame, mag, scratch);                 // no window: the sine lands in one bin
+        PerceptualWarping rw;
+        rw.buildWarpTables(5, nyq, mag.size(), nyq, 0.0, 20.0, mag.size());
+        CHECK(rw.isIdentity());
+        rw.applyWarp(mag, raw);
+        size_t idx = 0;
+        findPeakWithIndex(raw.data(), raw.size(), idx);
+        CHECK(idx == bin);
+        CHECK_NEAR(rw.targetHz()[idx], f0, 1e-9);
+        // the raw grid's axis is 2*nyquist = the input rate, so bin i reads back at i*axisRate/N Hz
+        const double axis_rate = 2.0 * rw.targetHz()[rw.outputBins() - 1];
+        CHECK_NEAR(axis_rate, sr, 1e-9);
+        CHECK_NEAR(idx * axis_rate / 1024.0, f0, 1e-9);
+    }
+}
+
+// ------------------------------------------------------------------------------------------
 int main()
 {
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
@@ -419,8 +644,10 @@ int main()
     test_ballistics();
     test_eq_streaming();
     test_v23_helpers();
+    test_triple_buffer_and_signal();
     test_background_plan();
     test_pipeline_sine();
+    test_identity_grid_and_rate();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

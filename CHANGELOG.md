@@ -4,6 +4,269 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.8.0] - 2026-09-12 — fewer knobs, same features: withdraw `FFT Threads`, the parallel-channel knobs and `Raw Linear Bins`
+
+The multi-threading added earlier today was built on FFTW's own threads, and it was the wrong lever: FFTW
+parallelizes the `howmany` loop of a `plan_many`, never the inside of a single 1-D transform, so it did nothing
+for the default `Mono Mix` — and changing its menu rebuilt the plan under the process-wide FFTW planner lock,
+which froze the node. It is gone.
+
+The v2.2.0 `Parallel Channels` / `Parallel Min Channels` parameters that briefly replaced it are gone too. This
+node is **one mono channel per instance**: several channels means several nodes, each with its own analysis worker
+thread, so a per-channel fan-out knob can never fire in the intended use. `Performance` now holds exactly one
+control, `Async`.
+
+`Raw Linear Bins` went the same way for a different reason: it was a second spelling of settings that already
+exist. Nothing it did is lost.
+
+### Removed (breaking: existing `.toe` files lose these parameters)
+- **`Performance > FFT Threads`** (menu Auto / 1 / 2 / 4 / 8), the `FFTWEngine::prepareBatch` /
+  `executeBatchRFFT` batched-`plan_many` path, its `m_batch_*` buffers, `AnalysisPipeline::setThreads` /
+  `refreshBatchPlan` / `resolveThreads`, and `FFTWEngine::initFftwThreads`. Selecting a thread count destroyed and
+  rebuilt an FFTW plan on the pipeline thread while `fftwf_plan_with_nthreads` mutated **global** FFTW state — the
+  access violation that took TouchDesigner down when the menu changed.
+- **`Performance > Parallel Channels`** and **`Parallel Min Channels`**: dead reads in the mono-per-instance
+  design, and the same category of knob as the two removed in v2.7.0. The fan-out they controlled is not a
+  parameter any more — see below.
+- **`Spectrum > Raw Linear Bins (no resampling)`**: it only skipped the frequency warp, and the warp already
+  detects the identity case and `memcpy`s the linear magnitude through. It was therefore reachable from the
+  sliders all along — `Scale = Linear`, `Warp Blend = 0`, `Display Max >= Nyquist`, `Output Bins = fft_size/2+1`
+  — so the toggle gave two spellings of one setting the chance to disagree. `Scale`, `Display Max` and
+  `Output Bins` still describe the grid; nothing about the feature was dropped.
+
+### Changed
+- `AnalysisPipeline::process` runs its channel loop under `std::execution::par` whenever the job has **more than
+  one** channel, and serially otherwise. With one channel the branch is a single integer compare; the fan-out
+  exists only for `Channels = All Channels`, the one mode that still produces several transforms per cook. Each
+  channel owns its `DspState` (padded frame, magnitude, scratch, ballistics history); the only shared state is
+  read-only. No plan is rebuilt and no FFTW state is touched, so nothing here can stall a cook.
+- Info CHOP `raw_linear` (17) is now **`linear_grid`**, and it no longer reads a parameter: it reports what the
+  built warp tables actually are (`PerceptualWarping::isIdentity`), which is the same flag `applyWarp()` branches
+  on, so the Info row cannot claim a bypass the pointer loop did not take. The Info DAT and popup strings that
+  mentioned a "raw" mode now say "linear grid / identity warp".
+- `Display Max Hz` slider max raised **48000 → 192000** and `Output Bins` slider max **32768 → 65536**, so the
+  linear grid is reachable from the UI at every accepted input rate (up to 384 kHz) and every pad size (up to
+  64K → 32769 bins). Previously the sliders could not express it, which is what made the removed toggle look
+  necessary.
+- `outputBinCountFrom()` is now a function of the parameter snapshot alone, and `outputAxisRate()` /
+  `hzPerSample()` / `outputSampleRate()` / `outputBandwidth()` lost the arguments that only existed to serve the
+  old raw path. `outputSampleRate()` takes no input rate at all — passing the audio rate into it is what used to
+  make it wrong.
+- Info CHOP `channel_fanout` (20, was `parallel_active`) and Info DAT `channel_fanout` (was `parallel_channels`)
+  report whether the fan-out ran — in normal mono use it is off, which is the correct reading, not a fault. Renamed
+  so nothing in the operator's interface is still spelled after a parameter that no longer exists.
+
+### Measured
+- `fft_bench` reports the fan-out directly (same per-channel pipeline, serial vs `par`, outputs compared
+  bin-for-bin first so a speedup cannot come from skipping work), N = 32768, 16384 bins, `Planner Fast`:
+
+  | channels | serial | `std::execution::par` | |
+  |---|---|---|---|
+  | 2 | 252.9 µs/cook | 156.1 µs/cook | **−38 %** |
+  | 4 | 528.0 µs/cook | 186.3 µs/cook | −65 % |
+  | 8 | 1050.1 µs/cook | 252.9 µs/cook | −76 % |
+
+  Outputs identical bin for bin in every case. This only ever applies to `Channels = All Channels`.
+- `bench/fftw_threads_probe` keeps the evidence for why the channel loop and not FFTW's threads: a single 1-D R2C
+  transform is **13–51 % slower** with `nthreads > 1` under both `FFTW_ESTIMATE` and `FFTW_MEASURE`.
+
+### Notes
+- `Mono Mix` (the default, and the design target) issues one transform per cook and stays serial — not by
+  policy but because there is nothing to split. Running several mono channels is several node instances, each
+  with its own `FFT Custom CHOP analysis` worker, and that already spreads across cores with no knob at all.
+- The two "every N cooks" parameters stay removed and `Parameters::eval` still runs on every cook, so a parameter
+  change lands on the next frame. (`eval` does skip the blocks that a section toggle has switched off — EQ,
+  ballistics, and the dB options when no dB mode is active — but that is a function of the toggle, not of the
+  cook count.)
+
+---
+
+## [v2.7.0] - 2026-09-12 — remove the two "every N cooks" parameters; nothing runs below normal priority
+
+### Removed (breaking: existing `.toe` files lose these parameters)
+- **`Performance > Update Every N Cooks`** (was default 1). It skipped the whole job publish on N−1 cooks out of N
+  so the spectrum only refreshed every N frames. That saving was already banked in v2.3: the FFT runs on the worker
+  and the cook thread pays only the ingest (≈ 2 µs) and the result copy (≈ 2–7 µs), neither of which the divider
+  touched. Net effect was a strictly worse node — half the spectrum update rate for a cook-thread saving that the
+  async architecture had already made irrelevant. Every cook now publishes a job.
+- **`Performance > Parameter Poll Every N Cooks`** (was default 1). It skipped `Parameters::eval` on N−1 cooks,
+  saving ~18 `getPar*` calls (~20 µs, host-side). The price was UI latency: a parameter change took up to N frames
+  to appear. Every parameter is now read on every cook, so a change lands on the next frame — and the ~20 µs is
+  ~0.1 % of a 60 fps frame.
+- `Parameters::Values::updateEvery` / `paramPoll` and their name/label constants are gone. `outputBandwidth()` no
+  longer divides by the divider, and the `output_bandwidth_sps` Info channel and popup line lost their
+  "Update Every N Cooks" suffix. `pollParameters()` is now an unconditional `eval()`.
+
+### Changed
+- **Nothing in the plugin runs below normal priority any more.** The FFTW background planner thread moved from
+  `THREAD_PRIORITY_BELOW_NORMAL` to `THREAD_PRIORITY_ABOVE_NORMAL`, and both threads are now named for the
+  debugger (`FFT Custom CHOP analysis`, `FFT background planner`). The planner still sits one notch under the
+  analysis worker (`THREAD_PRIORITY_HIGHEST`), so a cook always wins the core back from it; the point of the raise
+  is that a ~3 s `FFTW_PATIENT` measurement now completes in its budget under load instead of stretching out.
+
+### Measured, and rejected
+- **FFTW's built-in threading does not help this node, and would hurt it.** `fftwf_init_threads` /
+  `fftwf_plan_with_nthreads` *are* exported by the vendored `libfftw3f-3.dll` (checked the `.def`, the import
+  library and the export table), so this was worth testing rather than assuming. Measured with the plugin's
+  zero-padding (N = 32768, 3175 nonzeros) via `bench/fftw_threads_probe.cpp` (new, wired as
+  `fft_threads_probe.exe` so the claim is reproducible) — nthreads 1 / 2 / 4 / 6 → **68.8 / 85.3 / 81.7 /
+  102.5 µs**, i.e. it gets *slower*: FFTW parallelizes the `howmany` loop (and multi-dimensional transforms),
+  not the inside of a lone 1-D transform, so the threads only add hand-off cost. The same probe shows where it
+  *would* pay — a `howmany = 4` plan drops from 86.3 µs to 29.9 µs per transform (−65 %) — i.e. it is a real
+  lever for `Channels = All Channels`, but it needs a batched `fftwf_plan_many_dft_r2c` plan, which the engine
+  does not currently build. Not implemented; the default `Mono Mix` is one transform per cook and cannot use it
+  at all. Re-run twice on a machine with TouchDesigner running: absolute numbers drift ~15 %, every delta's
+  sign reproduced.
+
+### Tests
+- 432 checks, 0 failures, unchanged — neither the divider nor the poll interval was ever exercised by the headless
+  suite (both lived in `FFT::executeImpl` / `pollParameters`, which need an `OP_Inputs`).
+
+---
+
+## [v2.6.0] - 2026-09-12 — `sample_rate = output bins × me.time.rate`
+
+
+Requested change, overruling the v2.5.0 axis model. The reported sample rate is now the rate of the output frames
+**concatenated**: one vector of `output bins` samples is produced every `1/me.time.rate` seconds, so the node emits
+`bins × me.time.rate` samples/s — **983 040** at the defaults (16384 bins, 60 fps).
+
+### Changed
+- **`info->sampleRate = output bins × me.time.rate`** (FFT.cpp `FFT::outputSampleRate`). `me.time.rate` is read from
+  `OP_TimeInfo::rate` in `getOutputInfo` — the timeline rate **where the node lives**, so a component with Component
+  Time reports that component's rate, not the root's — and is re-read every cook, so an FPS change lands on the next
+  frame.
+- **The frequency axis moved to its own function**, `FFT::outputAxisRate` (was v2.5.0's `outputSampleRate`): still
+  `2 × (top of the axis)` — `sr_in` for raw/full-band grids, `2 × Display Max` when the band is clipped — and still
+  independent of `Output Bins`. `hz_per_sample` and the `output_spectrum_axis` row are now derived from it, so the
+  bin-index-to-Hz mapping survives the change intact: **`hz_per_sample` and `output_spectrum_axis` are what convert a
+  bin index to Hz now, not the sample rate.**
+
+### Notes
+- Consequence, stated plainly: the sample rate no longer says anything about what the bins mean. A 16384-bin vector
+  describing 0…22.05 kHz and a 16384-bin vector describing 0…10 kHz both report 983 040 Hz at 60 fps. Use
+  `hz_per_sample` for frequency.
+- `output_bandwidth_sps` (v2.5.0) is unchanged and still the *measured* figure — the same number as the sample rate,
+  computed from the cook delta actually observed rather than from `me.time.rate`.
+- `Raw Linear Bins` stays **off** by default (user decision).
+- Info DAT `output_sample_rate` now reads `983040 samples/s (16384 bins x 60.00 frames/s, warped grid, resampled)`;
+  the middle-click popup prints the sample rate, the measured throughput and the cook delta it was measured over.
+
+### Tests
+- 432 checks, 0 failures. The `test_raw_linear_and_rate` assertions were **relabelled, not weakened** — they test the
+  pipeline's grid (`2 × targetHz()[last]`), which is the axis and is unchanged; the local `reported_rate` is now
+  `axis_rate` so the file does not imply the CHOP reports that as `info->sampleRate`.
+- `FFT::outputSampleRate` itself is **not** covered headlessly: `getOutputInfo` needs an `OP_Inputs`, so this path is
+  verified in TouchDesigner — middle-click the node and read the `Sample rate (to TouchDesigner)` line, or the
+  Info CHOP `output_sample_rate` channel.
+
+---
+
+## [v2.5.0] - 2026-09-12 — raw linear bins, and the spectrum's sample rate told properly
+
+The spectrum's `sampleRate` was the input rate, always. That told TouchDesigner the axis reached `sr_in/2` Hz no
+matter what the node actually emitted — wrong as soon as `Display Max` clips the band below Nyquist, and it left the
+`Output Bins` resampling undocumented. Both are fixed, and there is now a way to skip the resampling entirely.
+
+### Added
+- **`Spectrum > Raw Linear Bins`** (toggle, default **off**): skip the warp and output the linear FFT grid itself —
+  all `fft_size/2 + 1` bins, DC to Nyquist, copied bit-for-bit (`memcpy`, no interpolation, no rounding, no
+  reassociation). `Scale`, `Display Max`, `Warp Blend`, `Output Bins` and `Log Floor` are inert while it is on;
+  `raw_linear` in the Info CHOP reports whether the current spectrum is raw. At Zero-Pad 32768 this doubles the
+  output bin count versus a 16384-bin warped grid (16385 vs 16384 — the whole FFT grid, not a subset of it).
+- **Info CHOP `hz_per_sample`** (18): the Hz between consecutive bins, `rate/(2*(bins-1))` — the same channel name
+  TouchDesigner's Audio Spectrum CHOP uses, because the sample rate alone cannot carry the index-to-Hz mapping once
+  a grid is resampled. Exact for raw linear / Linear / blend = 0 grids; the mean spacing for a perceptual one.
+- **Info CHOP `output_bandwidth_sps`** (19): data throughput, `bins x frames/s` (983 040 samples/s at 16384 bins
+  and 60 fps) — the number to size buffers/GPU uploads with, and the rate of a
+  signal made by concatenating frames. Deliberately *not* `info->sampleRate`: that would break bin-to-Hz by the
+  frame rate and make the reported rate move with the project frame rate for a byte-identical spectrum.
+  Info CHOP is now 20 channels, Info DAT 18 fixed rows + plan log; the middle-click popup prints both numbers.
+
+### Fixed
+- **Output sample rate is now derived from the grid that is actually emitted**: `sr_out = 2 × (top of the axis)`,
+  i.e. the last bin sits on Nyquist. Raw linear and any full-band grid report `sr_in` exactly (44100 in → 44100
+  out, bin *i* at `i*sr_in/fft_size`); a band clipped to `Display Max = 10000` reports 20000 Hz instead of 44100.
+  Previously the rate was `sr_in` unconditionally, so a 10 kHz view claimed to reach 22.05 kHz. The rate no longer
+  depends on `Output Bins` — resampling changes how a band is described, never how wide it is. The pipeline
+  publishes the exact value from the tables it built (`AnalysisPipeline::updateWarp`), with the same formula as the
+  fallback for the cooks before the first result lands, so the reported rate never jumps.
+- **Bark scale folded over above ~6.5 kHz.** `hzToBark` maps `z' = 1.22z - 4.422` above 20.1 Bark but `barkToHz`
+  undid it by dividing by 0.78 — the inverse of a different line, agreeing only at `z = 20.1`. Past 6.5 kHz the
+  target axis was non-monotonic and its **top bin landed back at 0 Hz** at exactly the 44.1 kHz Nyquist
+  (fmax = 22050 → 0.0). The inverse is now `(z + 4.422)/1.22`; forward/inverse round-trips to 1e-6 Hz from 0 to
+  22050 Hz, and every scale's axis is monotonic and ends exactly on `fmax`.
+- Info DAT's `output_spectrum_axis` and the middle-click popup printed bin spacing as `rate/bins`; it is
+  `rate / (2*(bins-1))` (Nyquist over `bins-1` intervals). `output_sample_rate` and `raw_linear` rows added, and
+  `sample_rate` was renamed `input_sample_rate` for clarity.
+
+### Tests
+- 432 checks, 0 failures (was 375). New `test_raw_linear_and_rate`: raw grid is a bit-exact memcpy and its grid is
+  `i*sr/fft_size`; `sr_out == sr_in` for the raw and full-band grids including every scale; `sr_out == 2*Display
+  Max` for a clipped axis at 257 / 1000 / 4000 bins alike; every scale monotonic ending on `fmax`; Bark
+  forward/inverse round trip over 0…22050 Hz; end-to-end sine at bin 100 of a 1024-point FFT reading back at
+  `100*44100/1024 = 4306.64 Hz`.
+
+---
+
+## [v2.4.0] - 2026-09-10 — cook thread: no locks, no kernel calls, nothing that is not a copy
+
+Everything in this release is about the ~16 µs the operator spends on TouchDesigner's cook thread each frame with
+Async on; the DSP itself (worker thread) is unchanged. All numbers from `fft_bench.exe --cook 300` (new), which
+simulates the exact cook path at 60 fps with the caches evicted between cooks, and from scratch micro-benchmarks.
+
+### Real-time fixes (the cook thread could block or do hidden work)
+- **Lock-free job and result handoff** (`FFTDSP::TripleBuffer`, wait-free single-producer/single-consumer triple
+  buffer, one atomic exchange per side, "latest wins", never torn). v2.3 used a mutex-guarded mailbox and a
+  mutex-guarded result double buffer; the worker held the result mutex while building telemetry **strings**
+  (`std::string` allocation, 128 KB `targetHz` copy on table changes), so a descheduled worker could stall the cook
+  thread for milliseconds. The cook thread now takes no mutex at all in async mode.
+- **No kernel wake-up per cook.** Measured on this machine: unblocking a sleeping worker costs the *signalling* thread
+  4–5 µs median and 16–18 µs p99 with every Win32 primitive (WaitOnAddress, SetEvent, semaphore, condvar). The worker
+  now polls the job slot every 2 ms on a **high-resolution waitable timer** (independent of the 15.6 ms system clock
+  tick; a plain timed wait made it miss frames) and goes dormant after 500 ms without jobs; the cook only signals a
+  dormant worker (Dekker handshake, no lost job). Pickup latency 1.2 ms median / 2.8 ms max, 0 drops, 0 holds.
+- **Peak search moved to the worker** (it owns the Hz table); the cook thread copies two floats instead of scanning
+  the spectrum and copying the table.
+- **Parameter reads**: `Parameters::eval()` now runs from `getOutputInfo()` (which precedes every `execute()`), so the
+  separate per-cook `readBins` / `readChanMode` / `readParamPoll` fetches are gone and the poll interval is honoured by
+  *every* read. The dead `Parallel Channels` / `Parallel Min Channels` parameters (their thread pool was replaced by
+  the worker in v2.3, the reads remained) are removed. Default configuration: 18 `getPar*` calls per poll, **0** on
+  non-poll cooks (was 19 + 3 every cook).
+- Textport log flush checks an atomic flag instead of taking the log mutex every cook.
+- Worker thread: `THREAD_PRIORITY_ABOVE_NORMAL`, named `FFT Custom CHOP analysis` (Visual Studio / Process Explorer).
+- FFTW wisdom import is now `std::call_once` under the planner mutex (two instances could race on plain statics and
+  run the non-thread-safe import concurrently with a planner).
+
+### Measured (cook thread, Async on, stereo mono-mix, 60 fps, caches evicted between cooks)
+| configuration | v2.3 (kernel wake) | v2.4 | of which |
+|---|---|---|---|
+| 1 ch, 16384 bins, N = 32768 (default) | 14.4 µs mean / 30 µs p99 | **11 µs mean / 17 µs p99** | ingest 2.3, snapshot 1.9, output copy 6.8 |
+| 1 ch, 4096 bins, N = 16384 cubic | 10.1 / 24 | **7 µs / 11.5 µs** | output copy 2.0 |
+| 8 ch (All Channels), 16384 bins | – | 75 µs | output copy 57 (8 × 64 KB cross-core) |
+| Async off (inline), default | 91–106 µs | same | FFT on a cold cache is 2× the hot-loop number |
+
+What remains is memory traffic proportional to `Output Bins × channels` (the 64 KB result written by the worker's core
+and read by the cook's core, then written into TouchDesigner's buffer); `Output Bins` is the lever.
+
+### FFT Planner = Patient (new menu entry)
+- Same non-blocking scheme as Auto (instant estimate plan, upgrade measured on a background thread, swapped in
+  on the next analysis, saved to wisdom) but with `FFTW_PATIENT`: 27.2 µs vs 31.1 µs per 32768-point FFT (−12 %)
+  for ~2.7 s of planning, once per size per machine. The planner thread runs on a low-priority background thread
+  and never touches a TouchDesigner thread (raised from below-normal to above-normal in v2.7.0 — see that entry). Verified: patient wisdom also satisfies Auto's lookup (so Auto gets the faster
+  plan afterwards), measured wisdom does not satisfy a patient lookup (so Patient really measures). Caveat: FFTW's
+  planner is process-wide, so a size change or a second instance planning during those seconds waits for it.
+
+### Not changed, measured and rejected
+- `FFTW_DESTROY_INPUT` (+ the 118 KB re-zero it forces): 34.1 µs vs 31.1 µs — slower.
+
+### Tests / bench
+- `TripleBuffer` / `WorkerSignal` tests (single-thread semantics, 2-thread torn-read stress ≈ 1 M publishes,
+  high-resolution timeout); 370 checks.
+- `fft_bench.exe --cook N`: cook-thread simulation (async and inline) with per-phase breakdown and pickup latency.
+
+---
+
 ## [v2.3.0] - 2026-08-26 — mono-first real-time architecture
 
 Implements the roadmap in `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (tiers 0–2 except the FFT library swap).
@@ -23,9 +286,9 @@ Implements the roadmap in `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (tiers 0–2 exc
   silence from denormal IIR/ballistics state.
 - **Silence short-circuit**: a channel whose whole window is digital silence outputs zeros without an FFT
   (linear-magnitude mode).
-- **Parameter Poll Every N Cooks** (default 1): TouchDesigner parameter reads are the host-side cost that scales with
+- **Parameter Poll Every N Cooks** (default 1; **removed in v2.7.0**): TouchDesigner parameter reads are the host-side cost that scales with
   options; polling every 2–4 cooks removes most of them at ~33–66 ms UI latency.
-- **Update Every N Cooks** (default 1): recompute the spectrum every N cooks and hold in between (the 3175-sample
+- **Update Every N Cooks** (default 1; **removed in v2.7.0**): recompute the spectrum every N cooks and hold in between (the 3175-sample
   window overlaps 77 % between consecutive 60 fps cooks anyway).
 - **Magnitude only up to Display Max**: the FFT magnitude is computed only for the linear bins the warp reads.
 - **Warp Interpolation = Cubic** (Catmull-Rom, 4 gathers): smoother lobes than linear on a 2× larger FFT — lets a

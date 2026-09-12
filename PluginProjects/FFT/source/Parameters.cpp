@@ -19,13 +19,14 @@
 Source File: Parameters.cpp
 
 Registers the custom parameters on 5 pages:
-1. Spectrum:               scale, display range, output bins, warp, log floor, window length
-                           (samples or ms), zero-pad size, FFT planner policy.
+1. Spectrum:               scale, display range, output bins, warp, log floor,
+                           window length (samples or ms), zero-pad size, FFT planner policy.
 2. EQ:                     high/low shelf gain + cutoff, Q, wet/dry.
 3. Window & Weighting:     window type, Kaiser beta, equal-loudness weighting, magnitude normalization.
 4. Loudness & Ballistics:  linear/dB/dB-normalized, dB reference, dB floor, attack/release
                            (per-frame coefficient or milliseconds), reset.
-5. Performance:            per-channel multithreading.
+5. Performance:            the async worker thread. That is the whole page - this node is one mono
+                           channel per instance, so there is nothing else to schedule.
 
 Defaults reproduce the behaviour of the previous version exactly (Window Length Mode = Samples,
 Magnitude Normalization = Coherent Gain, dB Reference = Frame Peak, Ballistics Mode = Coefficient).
@@ -100,8 +101,9 @@ const char* kLoudnessNames[]   = { "Off", "Db", "Dbnorm" };
 const char* kLoudnessLabels[]  = { "Off (Linear Magnitude)", "dB (Decibels)", "dB Normalized (0.0 to 1.0)" };
 const char* kWinmodeNames[]    = { "Samples", "Milliseconds" };
 const char* kWinmodeLabels[]   = { "Samples (Window Sampling)", "Milliseconds (Window Length ms)" };
-const char* kPlannerNames[]    = { "Auto", "Fast", "Measured" };
-const char* kPlannerLabels[]   = { "Auto (instant plan, measured plan upgraded in background)", "Fast (Estimate only, never stalls)", "Measured (blocking measure once per size, wisdom cached)" };
+const char* kPlannerNames[]    = { "Auto", "Fast", "Measured", "Patient" };
+const char* kPlannerLabels[]   = { "Auto (instant plan, measured plan upgraded in background)", "Fast (Estimate only, never stalls)", "Measured (blocking measure once per size, wisdom cached)",
+                                   "Patient (instant plan, FFTW_PATIENT measured in background ~3 s once per size, wisdom cached)" };
 const char* kMagnormNames[]    = { "Coherentgain", "Fullscale" };
 const char* kMagnormLabels[]   = { "Coherent Gain (mean(window) = 1)", "Full Scale (sine amplitude 1 -> 1.0)" };
 const char* kDbrefNames[]      = { "Framepeak", "Dbfs", "Agc" };
@@ -135,8 +137,11 @@ void setup(TD::OP_ParameterManager* manager)
 	// --- Page 1: Spectrum ---
 	appendMenu (manager, "Spectrum", ChanmodeName,   ChanmodeLabel,   kChanmodeNames, kChanmodeLabels, static_cast<int>(ChanMode::MonoMix));
 	appendMenu (manager, "Spectrum", ScaleName,      ScaleLabel,      kScaleNames,   kScaleLabels,   static_cast<int>(Scale::Log));
-	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 48000.0);
-	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 32768);
+	// Display Max and Output Bins reach past the widest input the node accepts (384 kHz -> 192 kHz
+	// Nyquist) and past the largest pad (64K -> 32769 bins) so that the linear/no-resample output is
+	// reachable from the UI at every setting, without a dedicated toggle for it.
+	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 192000.0);
+	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 65536);
 	appendFloat(manager, "Spectrum", WarpName,       WarpLabel,       0.963, 0.0, 1.0);
 	appendMenu (manager, "Spectrum", WarpinterpName, WarpinterpLabel, kWarpinterpNames, kWarpinterpLabels, static_cast<int>(WarpInterp::Linear));
 	appendFloat(manager, "Spectrum", LogfloorName,   LogfloorLabel,   20.0, 1.0, 500.0);
@@ -145,6 +150,11 @@ void setup(TD::OP_ParameterManager* manager)
 	appendFloat(manager, "Spectrum", WinmsName,      WinmsLabel,      72.0, 1.0, 1000.0);
 	appendMenu (manager, "Spectrum", PadName,        PadLabel,        kPadNames,     kPadLabels,     5 /* 32768 */);
 	appendMenu (manager, "Spectrum", PlannerName,    PlannerLabel,    kPlannerNames, kPlannerLabels, static_cast<int>(Planner::Auto));
+	// (v2.8.0) "Raw Linear Bins (no resampling)" was removed: it was a fourth way to say what Scale +
+	// Display Max + Output Bins already say. Its only effect was to skip the frequency warp, and the
+	// warp already detects the identity case and memcpy's the linear magnitude straight through
+	// (see PerceptualWarping::isIdentity), so the toggle changed nothing the sliders cannot produce -
+	// it only gave two spellings of one setting the chance to disagree.
 
 	// --- Page 2: EQ (off by default: the 6 dB default boost is a prototype leftover and costs real-time budget) ---
 	appendToggle(manager, "EQ", EqenableName,  EqenableLabel,  false);
@@ -183,12 +193,22 @@ void setup(TD::OP_ParameterManager* manager)
 
 	// --- Page 5: Performance ---
 	appendToggle(manager, "Performance", AsyncName,       AsyncLabel,       true);
-	appendInt   (manager, "Performance", UpdateeveryName, UpdateeveryLabel, 1, 1, 16);
-	appendInt   (manager, "Performance", ParampollName,   ParampollLabel,   1, 1, 16);
-	// Off by default: for a handful of channels the per-frame thread-pool wake-ups cost more
-	// than the ~60 us of work per channel they distribute, and they add frame-time jitter.
-	appendToggle(manager, "Performance", ParallelName,    ParallelLabel,    false);
-	appendInt   (manager, "Performance", ParallelminName, ParallelminLabel, 8, 2, 64);
+	// (v2.7.0) "Update Every N Cooks" / "Parameter Poll Every N Cooks" removed: both made the node
+	// strictly worse. Update Every N Cooks halved the spectrum's effective update rate to save a cost
+	// that the async worker already took off the cook thread; Parameter Poll Every N Cooks saved
+	// ~18 getPar* calls (~20 us) on the cooks in between, at the price of a parameter change taking up
+	// to N frames to show up. eval() now runs on every cook, so a parameter change lands on the next
+	// frame. (eval still skips the blocks a section toggle has switched off - see the early-outs below.)
+	// (v2.8.0) "FFT Threads" was tried here and withdrawn the same day. FFTW cannot split a single 1-D
+	// transform across threads - measured, nthreads > 1 makes one transform 13-51 % slower - so it
+	// bought nothing for the default Mono Mix. Worse, fftwf_plan_with_nthreads sets process-global
+	// sticky state: the value set by this node leaked into every plan created afterwards, in this node
+	// and in every other FFT node in the session, so changing the menu crashed TouchDesigner.
+	// (v2.8.0) "Parallel Channels" / "Parallel Min Channels" came back with it and went again for the
+	// same reason in the other direction: this node is one mono channel per node instance, so several
+	// channels means several nodes, and a per-channel fan-out knob can never fire. The fan-out itself
+	// stays (unconditional, >1 channel only) for Channels = All Channels, which is the one mode that
+	// still produces more than one transform per cook. Performance has exactly one control: Async.
 }
 
 Values eval(const TD::OP_Inputs* inputs, int* reads)
@@ -268,31 +288,9 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 
 	// --- Performance ---
 	v.async       = getI(AsyncName) != 0;
-	v.updateEvery = std::clamp(getI(UpdateeveryName), 1, 16);
-	v.parallel = getI(ParallelName) != 0;
-	if (v.parallel) v.parallelMin = std::clamp(getI(ParallelminName), 2, kMaxChannels);
 
 	if (reads) *reads = n;
 	return v;
-}
-
-int readParamPoll(const TD::OP_Inputs* inputs)
-{
-	return inputs ? std::clamp(inputs->getParInt(ParampollName), 1, 16) : 1;
-}
-
-ChanMode readChanMode(const TD::OP_Inputs* inputs)
-{
-	if (!inputs) return ChanMode::MonoMix;
-	int m = inputs->getParInt(ChanmodeName);
-	return (m < 0 || m >= static_cast<int>(ChanMode::COUNT)) ? ChanMode::MonoMix : static_cast<ChanMode>(m);
-}
-
-int readBins(const TD::OP_Inputs* inputs)
-{
-	if (!inputs) return 16384;
-	int bins = inputs->getParInt(BinsName);
-	return (bins <= 0) ? 16384 : std::clamp(bins, kMinBins, kMaxBins);
 }
 
 } // namespace Parameters

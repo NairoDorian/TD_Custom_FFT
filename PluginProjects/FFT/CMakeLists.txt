@@ -18,6 +18,11 @@ if(NOT EXISTS "${PLUGIN_BUILDER_DIR}/cmake/TDPlugin.cmake")
 endif()
 include(${PLUGIN_BUILDER_DIR}/cmake/TDPlugin.cmake)
 
+# CTest only writes a CTestTestfile.cmake for directories where enable_testing() ran in the TOP-LEVEL
+# scope; td_plugin_add_test() calls it from inside a function, which does not take effect here, so
+# `ctest --test-dir build` found nothing. Enabling it at the top level makes the documented command work.
+enable_testing()
+
 # ---------------------------------------------------------------------------
 # The plugin
 # ---------------------------------------------------------------------------
@@ -37,4 +42,6 @@ if(FFT_BUILD_TESTS)
 endif()
 if(FFT_BUILD_BENCH)
     td_plugin_add_bench(FFT fft_bench SOURCES bench/bench.cpp)
+    # Answers "would FFTW's built-in threading help?" with numbers (it does not for Mono Mix).
+    td_plugin_add_bench(FFT fft_threads_probe SOURCES bench/fftw_threads_probe.cpp)
 endif()

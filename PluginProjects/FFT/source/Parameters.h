@@ -30,7 +30,7 @@ enum class WindowType : int { Kaiser = 0, Hann, Hamming, Blackman, BlackmanHarri
 enum class Weighting : int { Off = 0, AWeighting, CWeighting, ITU468, COUNT };
 enum class Loudness : int { Off = 0, Db, DbNorm, COUNT };
 enum class WinMode : int { Samples = 0, Milliseconds, COUNT };
-enum class Planner : int { Auto = 0, Fast, Measured, COUNT };
+enum class Planner : int { Auto = 0, Fast, Measured, Patient, COUNT };   // == FFTDSP::PlannerPolicy
 enum class MagNorm : int { CoherentGain = 0, FullScale, COUNT };
 enum class DbRef : int { FramePeak = 0, Dbfs, Agc, COUNT };
 enum class BallisticsMode : int { Coefficient = 0, Milliseconds, COUNT };
@@ -98,10 +98,6 @@ constexpr char ResetName[]        = "Reset";        constexpr char ResetLabel[] 
 
 // Page 5: Performance
 constexpr char AsyncName[]        = "Async";        constexpr char AsyncLabel[]        = "Async Analysis (worker thread)";
-constexpr char UpdateeveryName[]  = "Updateevery";  constexpr char UpdateeveryLabel[]  = "Update Every N Cooks";
-constexpr char ParampollName[]    = "Parampoll";    constexpr char ParampollLabel[]    = "Parameter Poll Every N Cooks";
-constexpr char ParallelName[]     = "Parallel";     constexpr char ParallelLabel[]     = "Parallel Channels";
-constexpr char ParallelminName[]  = "Parallelmin";  constexpr char ParallelminLabel[]  = "Parallel Min Channels";
 
 // ---------------------------------------------------------------------------
 // Snapshot of every parameter for one cook
@@ -111,8 +107,8 @@ struct Values {
     ChanMode   chanMode     = ChanMode::MonoMix;   // mono is the 99 % use case: one analysis channel
     Scale      scale        = Scale::Log;
     double     displayMax   = 24000.0;
-    int        bins         = 16384;
-    double     warp         = 0.963;
+    int        bins         = 16384;      // output bins; the FFT's own grid is pad/2 + 1 = 16385 at the default 32K pad
+    double     warp         = 0.963;      // 0 = linear axis whatever Scale says, 1 = the Scale's own axis
     WarpInterp warpInterp   = WarpInterp::Linear;
     double     logFloor     = 20.0;
     WinMode    winMode      = WinMode::Samples;
@@ -148,20 +144,15 @@ struct Values {
     double     releaseMs    = 200.0;
     // Performance
     bool       async        = true;       // analysis on a worker thread; the cook only ingests + copies
-    int        updateEvery  = 1;          // recompute the spectrum every N cooks (hold in between)
-    bool       parallel     = false;   // opt-in: thread-pool wake-ups cost more than they save below ~8 channels
-    int        parallelMin  = 8;
 };
 
-// Fetch parameters once per cook. Optional sections are only read when enabled, so a
-// disabled section costs zero TouchDesigner parameter fetches (they are not free).
+// Fetch every parameter in one pass. Optional sections are only read when enabled, so a
+// disabled section costs zero TouchDesigner parameter fetches (they are not free: each
+// getPar* is a virtual call into TouchDesigner's parameter system, ~1-5 us).
+// The operator calls this from getOutputInfo() (which precedes every execute()) on EVERY
+// cook; nothing else in the cook path reads a parameter.
 // 'reads' receives the number of getPar* calls performed (telemetry).
 Values eval(const TD::OP_Inputs* inputs, int* reads = nullptr);
-
-// Cheap per-cook reads that must not be cached: parameter poll interval, channel mode, output bins
-int  readParamPoll(const TD::OP_Inputs* inputs);
-ChanMode readChanMode(const TD::OP_Inputs* inputs);
-int  readBins(const TD::OP_Inputs* inputs);
 
 // Registers custom parameters and UI controls with TouchDesigner's parameter manager
 void setup(TD::OP_ParameterManager* manager);
