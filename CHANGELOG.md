@@ -4,6 +4,22 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.8.1] - 2026-09-14
+
+### Changed
+- **`AnalysisPipeline` extracted into a TD-free translation unit.** `AnalysisJob`, `AnalysisResult`,
+  and the full `AnalysisPipeline` class (window → FFT → magnitude → warp → weighting → dB → ballistics)
+  now live in `source/AnalysisPipeline.h` / `source/AnalysisPipeline.cpp`. `FFT.h` now `#include`s the
+  header; `FFT.cpp` no longer contains the pipeline implementation. The extraction makes the pipeline
+  unit-testable without a worker thread or the TouchDesigner operator — `dsp_tests.cpp` drives
+  `AnalysisPipeline::process()` directly: 1 kHz sine → peak verified at ~1 kHz, 3-channel parallel fan-out
+  bin-for-bin identical to serial, silence short-circuit yields all-zero output. 493/493 checks green.
+- **Default zero-pad length reduced 32768 → 16384.** FFT stage roughly halves (≈ 34 µs → ≈ 18 µs at
+  44.1 kHz); the warp resamples 8193 → 16384 linear bins to the 16384 output bins. Per §3.3 of the review
+  doc this is a 2–4× FFT-time cut with no visible loss for a 16384-bin log display.
+
+---
+
 ## [v2.8.0] - 2026-09-12 — fewer knobs, same features: withdraw `FFT Threads`, the parallel-channel knobs and `Raw Linear Bins`
 
 The multi-threading added earlier today was built on FFTW's own threads, and it was the wrong lever: FFTW

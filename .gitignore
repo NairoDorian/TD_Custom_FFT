@@ -37,6 +37,11 @@ Plugin_FFT.[0-9]*.toe
 scratchpad/
 
 # OS metadata
+# Build helper / test artifacts (per-project)
+PluginProjects/FFT/_b.bat
+PluginProjects/FFT/fft_tests_wisdom.txt
+
+# OS metadata
 Thumbs.db
 Desktop.ini
 .DS_Store
