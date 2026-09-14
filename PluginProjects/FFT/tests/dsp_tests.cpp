@@ -5,6 +5,7 @@
 // reference, and the full pipeline is checked against a known sine.
 
 #include "DSPModules.h"
+#include "RateModel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -626,6 +627,102 @@ static void test_identity_grid_and_rate()
 }
 
 // ------------------------------------------------------------------------------------------
+static void test_rate_model()
+{
+    section("RateModel (TD-free sample-rate / axis model)");
+    Parameters::Values p;            // defaults: Scale=Log, Display Max=24000, Bins=16384, WinMode=Ms(50/72), pad=32768
+    const double sr = 48000.0;
+
+    // outputBinCountFrom is the single source of truth for the output width.
+    CHECK(outputBinCountFrom(p) == p.bins);
+
+    // Reported sample rate is bins * cook_rate — and crucially must NOT depend on the input sample
+    // rate (that was the v2.5.0/2.6.0 mistake). Same params + rate, different input → same number.
+    p.bins = 16384;
+    const double td_rate_low  = sampleRateToTouchDesigner(p, 60.0);
+    const double td_rate_high = sampleRateToTouchDesigner(p, 30.0);
+    CHECK(td_rate_low  == 16384.0 * 60.0);
+    CHECK(td_rate_high == 16384.0 * 30.0);
+
+    // Axis rate: 2 * min(Display Max, Nyquist). Default Display Max=24000 >= Nyquist(48000/2=24000) → sr_in.
+    CHECK_NEAR(axisRate(p, sr, 0.0), sr, 1e-6);
+    // Display Max below Nyquist clamps the band to 2*Display Max (this node stops at Display Max).
+    p.displayMax = 10000.0;
+    CHECK_NEAR(axisRate(p, sr, 0.0), 20000.0, 1e-6);
+    // A published axis rate from the live tables wins and is returned verbatim (never jumps).
+    CHECK_NEAR(axisRate(p, sr, 31415.0), 31415.0, 1e-9);
+    // Non-positive rate falls back through to the scalar sample rate.
+    CHECK(axisRate(p, 0.0, 0.0) == 0.0);
+
+    // Hz-per-bin on a uniform grid is fmax/(bins-1) == axis_rate/(2*(bins-1)).
+    p.displayMax = 24000.0;
+    p.bins = 1025;                       // e.g. fft_size 2048 → 1025 linear bins, identity grid
+    CHECK_NEAR(hzPerBin(p, sr, 0.0), (sr * 0.5) / (1025 - 1), 1e-6);
+    // n_out < 2 → undefined spacing, report 0.
+    p.bins = 1;
+    CHECK(hzPerBin(p, sr, 0.0) == 0.0);
+
+    // Throughput = bins * 1000 / dt_ms (measured, not nominal-rate).
+    p.bins = 16384;
+    CHECK_NEAR(throughput(p, 16.6667), 16384.0 * 1000.0 / 16.6667, 1e-6);
+    CHECK(throughput(p, 0.0) == 0.0);
+
+    // fftSizeFrom: next power of two >= winSamples, and >= padSize.
+    Parameters::Values q;
+    q.padSize = 32768;
+    CHECK(fftSizeFrom(q, 3175) == 32768);          // pad wins (32768 > nextpow2(3175)=4096)
+    q.winSamples = 50000;
+    CHECK(fftSizeFrom(q, 50000) == 65536);         // window needs 65536 (next pow2 > 50000)
+    q.padSize = 256;
+    CHECK(fftSizeFrom(q, 1) == 256);              // pad alone (256 >= nextpow2(1)=1)
+
+    // windowSamplesFrom: ms mode clamps and rounds; sample mode is the raw value.
+    Parameters::Values r;
+    r.winMode = Parameters::WinMode::Milliseconds;
+    r.winMs = 72.0;
+    CHECK(windowSamplesFrom(r, sr) == static_cast<int>(std::lround(72.0 * sr / 1000.0)));
+    r.winMs = 200000.0;                           // clamps to kMaxWinSamples
+    CHECK(windowSamplesFrom(r, sr) == Parameters::kMaxWinSamples);
+    r.winMode = Parameters::WinMode::Samples;
+    CHECK(windowSamplesFrom(r, sr) == r.winSamples);
+}
+
+// ------------------------------------------------------------------------------------------
+static void test_equal_loudness()
+{
+    section("EqualLoudness (A/C/468) golden vectors");
+    // freqs[5] = 1 kHz (the normalisation anchor for A and C).
+    std::vector<double> freqs = { 31.5, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 6300.0, 10000.0 };
+    AlignedVector a, c, g;
+    EqualLoudness::computeCurve(1, freqs, a);   // A
+    EqualLoudness::computeCurve(2, freqs, c);    // C
+    EqualLoudness::computeCurve(3, freqs, g);    // ITU-R 468
+
+    // A and C are normalized so 1 kHz == 0 dB (weight 1.0) by construction (inv_ref). Lock that in —
+    // it is the property downstream relies on.
+    CHECK_NEAR(a[5], 1.0, 1e-6);
+    CHECK_NEAR(c[5], 1.0, 1e-6);
+
+    // Shape invariants (true for any correct A/C weighting, independent of an exact dB table):
+    // A rolls off steeper than C at low frequencies (A(31.5) << C(31.5)), and C stays closer to 1.0
+    // than A at high frequencies (C(10k) nearer 1 than A(10k)). A @ 31.5 Hz is ~-40 dB (weight ~0.01).
+    CHECK(a[0] < c[0]);                          // A(31.5) more attenuated than C(31.5)
+    CHECK(a[0] < 0.02);                           // deep low-frequency attenuation (~-40 dB)
+    // Every weight is a legal linear magnitude in (0, inf); sanity-bound the whole curve so a refactor
+    // can't silently invert or explode a band.
+    for (float w : a) { CHECK(w > 0.0f && w < 100.0f); }
+    for (float w : c) { CHECK(w > 0.0f && w < 100.0f); }
+    // A has its small peak just above 1 kHz, so A(2000) > A(1000) = 1.
+    CHECK(a[6] > 1.0);
+
+    // ITU-R 468: rises toward its ~6.3 kHz peak, then falls — check the shape, not absolute dB
+    // (the implemented normalisation does not sit at 0 dB at 1 kHz).
+    CHECK(g[5] > 0.0 && g[7] > 0.0);
+    CHECK(g[7] > g[5]);   // 6300 Hz > 1000 Hz
+    CHECK(g[7] > g[8]);   // past the peak: 6300 Hz > 10000 Hz
+}
+
+// ------------------------------------------------------------------------------------------
 int main()
 {
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
@@ -648,6 +745,8 @@ int main()
     test_background_plan();
     test_pipeline_sine();
     test_identity_grid_and_rate();
+    test_rate_model();
+    test_equal_loudness();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -448,7 +448,12 @@ public:
     // queue at a fixed rate so the producer never has to pay for a kernel wake-up (~4-5 us + tails).
     bool waitFor(uint32_t timeout_ms) noexcept {
 #ifdef _WIN32
-        if (!m_event) return false;
+        if (!m_event) {
+            // CreateEventW failed (effectively never) — fall back to a real sleep so the worker's poll
+            // loop does not degenerate into a busy spin consuming a core while TouchDesigner is idle.
+            Sleep(timeout_ms);
+            return false;
+        }
         LARGE_INTEGER due;
         due.QuadPart = -static_cast<LONGLONG>(timeout_ms) * 10000LL;   // relative, 100 ns units
         if (m_timer && SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE)) {
@@ -1282,6 +1287,9 @@ public:
                              AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept = 0;
     virtual std::string getPlanStatus() const = 0;
     virtual size_t fftSize() const noexcept = 0;
+    // True if a valid plan is ready to execute (i.e. prepare() produced m_plan). Lets the pipeline
+    // escalate a failed plan creation to getErrorString instead of silently outputting zeros.
+    virtual bool hasPlan() const noexcept = 0;
     // Called once per cook on the cooking thread; returns true if a better plan was swapped in.
     virtual bool pollBackgroundPlan() { return false; }
 };
@@ -1406,6 +1414,10 @@ public:
 
     std::string getPlanStatus() const override { return m_planStatus.empty() ? "FFTW3 (Uninitialized)" : m_planStatus; }
     size_t fftSize() const noexcept override { return m_fft_size; }
+    // A plan exists iff prepare() produced m_plan. Fast/ESTIMATE policy always does; MEASURE/Patient
+    // can fail to create one (rare), in which case the pipeline must surface the failure rather than
+    // silently cooking zeros.
+    bool hasPlan() const noexcept override { return m_plan != nullptr; }
     bool upgradeInProgress() const noexcept { return m_bg_running.load(); }
 
     /*

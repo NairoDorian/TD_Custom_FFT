@@ -112,6 +112,7 @@ public:
     // Telemetry (owner thread only). statusVersion() changes whenever status() would.
     struct Status {
         std::string plan;
+        bool planFailed{ false };          // prepare() could not produce a plan — surface via getErrorString
         size_t fftSize{ 0 }, capacity{ 0 }, linearBins{ 0 }, magnitudeBins{ 0 };
         double axisRate{ 0.0 };              // 2 x (top of the axis) for the grid that was built; NOT info->sampleRate
         double axisBottom{ 0.0 };            // target_hz[0]: DC for Mel/ERB/Linear, the log floor / 20 Hz / ~13 Hz otherwise
@@ -135,6 +136,9 @@ public:
     // the cook thread when it is off) and read by the Info CHOP/DAT callbacks, which TouchDesigner calls
     // from its own thread. Plain relaxed telemetry — never used to make a decision.
     bool parallelActive() const noexcept { return myParallelActive.load(std::memory_order_relaxed); }
+    // True if the engine has no plan ready (owner thread only; read once per published job by FFT::runJob
+    // to decide whether to escalate the failure to getErrorString).
+    bool planFailed() const noexcept { return !myEngine || !myEngine->hasPlan(); }
 
 private:
     struct DspState {
@@ -278,6 +282,10 @@ private:
 	FFTDSP::TripleBuffer<AnalysisJob>    myJobs;      // cook -> pipeline owner
 	FFTDSP::TripleBuffer<AnalysisResult> myResults;   // pipeline owner -> cook
 	std::atomic<uint64_t> myJobsDropped{ 0 };
+
+	// --- engine/pipeline failure escalation (lock-free; details go to the deferred textport log) ---
+	std::atomic<bool>		myPlanFailed{ false };      // prepare() failed to produce a plan for the current size
+	std::atomic<uint64_t>	myPipelineErrors{ 0 };      // runJob() caught an exception (slot not published)
 
 	// --- telemetry ---
 	std::atomic<double>	myDspUs{ 0.0 };

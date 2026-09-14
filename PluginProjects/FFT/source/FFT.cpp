@@ -38,6 +38,7 @@
 #include "FFT.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -59,37 +60,10 @@ const int   kMinorVersion = 8;
 using clk = std::chrono::steady_clock;
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
 
-// Window length in samples for the given parameters and input rate (ms mode converts with the rate).
-// Shared by the CHOP (getOutputInfo/execute) and the pipeline (rebuild) so they cannot disagree.
-int windowSamplesFrom(const Parameters::Values& p, double sampleRate)
-{
-	if (p.winMode == Parameters::WinMode::Milliseconds) {
-		return std::clamp(static_cast<int>(std::lround(p.winMs * sampleRate / 1000.0)), 1, Parameters::kMaxWinSamples);
-	}
-	return p.winSamples;
-}
-
-// FFT size >= the zero-pad choice and >= the next power of two of the window.
-size_t fftSizeFrom(const Parameters::Values& p, int winSamples)
-{
-	size_t needed = 1;
-	while (needed < static_cast<size_t>(std::max(1, winSamples))) needed *= 2;
-	return std::max<size_t>(static_cast<size_t>(std::max(2, p.padSize)), needed);
-}
-
-// Output sample count. getOutputInfo and execute must agree on this — TouchDesigner allocates from
-// here — so it lives in one place, and updateWarp() builds its grid with the same number.
-//
-// To get the raw linear FFT (every bin, no resampling): Output Bins = fft_size/2 + 1, Display Max
-// >= Nyquist, and either Scale = Linear or Warp Blend = 0 (both put the axis on the linear grid -
-// the Scale's own curve at blend 0 has nothing to blend, and Linear's curve IS the linear grid).
-// PerceptualWarping then detects the identity and memcpy's the magnitude straight through, bit for
-// bit. There is deliberately no separate switch for it - a second spelling of the same setting is a
-// second thing to disagree.
-int outputBinCountFrom(const Parameters::Values& p)
-{
-	return p.bins;
-}
+// The TD-free sample-rate / bin / axis model (windowSamplesFrom, fftSizeFrom,
+// outputBinCountFrom, axisRate, sampleRateToTouchDesigner, hzPerBin, throughput) lives in
+// RateModel.h so it is shared by the CHOP and the pipeline and is unit-testable headlessly.
+#include "RateModel.h"
 
 #ifdef _WIN32
 void nameAndBoostCurrentThread(const wchar_t* name)
@@ -171,6 +145,7 @@ AnalysisPipeline::status() const
 {
 	Status s;
 	s.plan = myEngine ? myEngine->getPlanStatus() : std::string("Uninitialized");
+	s.planFailed = planFailed();
 	s.fftSize = myFFTSize;
 	s.capacity = myCapacity;
 	s.linearBins = myFFTSize / 2 + 1;
@@ -318,7 +293,7 @@ AnalysisPipeline::runChannel(DspState& st, const FFTDSP::AlignedVector& window_i
                              float attackCoef, float releaseCoef, float agcDecay, FFTDSP::AlignedVector& out) noexcept
 {
 	const size_t bins = myWarping.outputBins();
-	if (out.size() != bins) out.resize(bins);
+	assert(out.size() == bins);   // process() pre-sizes spectra; a size mismatch here is an invariant violation, not an allocation
 
 	// Digital silence: nothing to analyse. (dB modes need the floor value and ballistics need to decay,
 	// so the short-circuit only applies to the plain linear-magnitude path.)
@@ -440,6 +415,13 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 
 	std::vector<FFTDSP::AlignedVector>& out = res.spectra;
 	if (out.size() != static_cast<size_t>(job.numChannels)) out.resize(static_cast<size_t>(job.numChannels));
+	// Pre-size every output spectrum here (not in the noexcept runChannel): with output bins stable
+	// across cooks, steady state performs zero allocations on the cook path, so a bad_alloc can no
+	// longer terminate a noexcept function. runChannel asserts the invariant instead of resizing.
+	const size_t bins = myWarping.outputBins();
+	for (auto& s : out) {
+		if (s.size() != bins) s.resize(bins);
+	}
 
 	// 2. The whole per-channel pipeline, one channel per DspState. Channels share nothing but
 	// read-only tables (window, warp tables, weighting curve) and the FFT plan, so the loop is
@@ -545,14 +527,9 @@ FFT::analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode)
 double
 FFT::outputAxisRate(const Parameters::Values& p, double sampleRate) const
 {
-	const double nyquist = sampleRate * 0.5;
-	if (nyquist <= 0.0) return sampleRate;
-	const double exact = myOutputSampleRate.load(std::memory_order_relaxed);
-	if (exact > 0.0) return exact;
-	// Not built yet. 2*fmax with fmax = min(Display Max, nyquist) — identical to what updateWarp
-	// publishes, so the reported axis never jumps once the first result lands.
-	const double fmax = std::min(p.displayMax > 0.0 ? p.displayMax : nyquist, nyquist);
-	return 2.0 * fmax;
+	// Thin delegate to the TD-free, unit-tested axisRate() in RateModel.h; reads the axis rate the
+	// last pipeline published (0 when nothing has run yet, which axisRate falls back to 2*fmax).
+	return axisRate(p, sampleRate, myOutputSampleRate.load(std::memory_order_relaxed));
 }
 
 // Sample rate reported to TouchDesigner for the spectrum, as requested: one output vector of
@@ -572,9 +549,8 @@ FFT::outputAxisRate(const Parameters::Values& p, double sampleRate) const
 double
 FFT::outputSampleRate(const Parameters::Values& p) const
 {
-	const int n_out = outputBinCountFrom(p);
-	const double rate = myCookRate.load(std::memory_order_relaxed);
-	return static_cast<double>(n_out) * (rate > 0.0 ? rate : 60.0);
+	// Delegate to the TD-free, unit-tested sampleRateToTouchDesigner() in RateModel.h.
+	return sampleRateToTouchDesigner(p, myCookRate.load(std::memory_order_relaxed));
 }
 
 // Hz per output bin — the index-to-Hz mapping, and now the only channel that carries it, since
@@ -589,9 +565,8 @@ FFT::outputSampleRate(const Parameters::Values& p) const
 double
 FFT::hzPerSample(const Parameters::Values& p, double sampleRate) const
 {
-	const int n_out = outputBinCountFrom(p);
-	if (n_out < 2) return 0.0;
-	return outputAxisRate(p, sampleRate) / (2.0 * static_cast<double>(n_out - 1));
+	// Delegate to the TD-free, unit-tested hzPerBin() in RateModel.h.
+	return hzPerBin(p, sampleRate, myOutputSampleRate.load(std::memory_order_relaxed));
 }
 
 // Data throughput of the node, in samples per second — deliberately NOT the sample rate.
@@ -610,10 +585,8 @@ FFT::hzPerSample(const Parameters::Values& p, double sampleRate) const
 double
 FFT::outputBandwidth(const Parameters::Values& p) const
 {
-	const int n_out = outputBinCountFrom(p);
-	const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
-	if (!(dt_ms > 0.0)) return 0.0;
-	return static_cast<double>(n_out) * 1000.0 / dt_ms;
+	// Delegate to the TD-free, unit-tested throughput() in RateModel.h.
+	return throughput(p, myCookDtMs.load(std::memory_order_relaxed));
 }
 
 bool
@@ -750,8 +723,13 @@ FFT::runJob(const AnalysisJob& job)
 	try {
 		myPipeline->process(job, res);
 	} catch (...) {
-		return;                        // the slot is not published: the previous result stays visible
+		// The slot is not published: the previous result stays visible. Record that an analysis
+		// failed so it surfaces instead of vanishing silently into the textport.
+		myPipelineErrors.fetch_add(1, std::memory_order_relaxed);
+		myLog.log("[FFT Plugin] [pipeline] analysis threw an exception; previous spectrum retained");
+		return;
 	}
+	myPlanFailed.store(myPipeline->planFailed(), std::memory_order_relaxed);
 	res.seq = job.seq;
 	myResults.publish();
 	myDspUs.store(myPipeline->lastUs(), std::memory_order_relaxed);
@@ -1143,6 +1121,8 @@ void
 FFT::getErrorString(OP_String* error, void* reserved1)
 {
 	if (!myErrorText.empty()) error->setString(myErrorText.c_str());
+	else if (myPlanFailed.load(std::memory_order_relaxed)) error->setString("FFTW plan creation failed for the current FFT size (see textport log); output is silent until a plan succeeds or the FFT size changes.");
+	else if (myPipelineErrors.load(std::memory_order_relaxed) > 0) error->setString((std::to_string(myPipelineErrors.load(std::memory_order_relaxed)) + " analysis pipeline error(s); see textport log.").c_str());
 	else if (mySampleRate <= 0.0) error->setString("Invalid or missing audio sample rate from input CHOP.");
 }
 
