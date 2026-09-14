@@ -38,7 +38,7 @@ td_plugin_optimize(FFT AVX2 FAST_MATH)       # /O2 /Oi /Ot /fp:fast /arch:AVX2 (
 option(FFT_BUILD_TESTS "Build the headless DSP unit tests" ON)
 option(FFT_BUILD_BENCH "Build the per-stage benchmark executable" ON)
 if(FFT_BUILD_TESTS)
-    td_plugin_add_test(FFT fft_tests SOURCES tests/dsp_tests.cpp)
+    td_plugin_add_test(FFT fft_tests SOURCES tests/dsp_tests.cpp source/AnalysisPipeline.cpp)
 endif()
 if(FFT_BUILD_BENCH)
     td_plugin_add_bench(FFT fft_bench SOURCES bench/bench.cpp)

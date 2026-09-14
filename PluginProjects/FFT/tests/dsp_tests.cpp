@@ -6,6 +6,7 @@
 
 #include "DSPModules.h"
 #include "RateModel.h"
+#include "AnalysisPipeline.h"
 
 #include <algorithm>
 #include <cmath>
@@ -515,6 +516,93 @@ static void test_pipeline_sine()
     CHECK(log.size() >= 1);
 }
 
+static void test_pipeline_process()
+{
+    const double sr = 44100.0, f0 = 1000.0;
+    const int win_samples = 3175;
+    const int N = 32768;
+    const int bins = N / 2 + 1;                         // 16385 → identity warp
+
+    Parameters::Values p;
+    p.scale     = Parameters::Scale::Linear;
+    p.warp      = 0.0;
+    p.bins      = bins;
+    p.padSize   = N;
+    p.winMode   = Parameters::WinMode::Samples;
+    p.winSamples = win_samples;
+    p.window    = Parameters::WindowType::Hann;
+    p.magNorm   = Parameters::MagNorm::CoherentGain;
+    p.loudness  = Parameters::Loudness::Off;
+    p.weighting = Parameters::Weighting::Off;
+    p.ballEnable = false;
+    p.eqEnable   = false;
+
+    PlanLog log;
+    AnalysisPipeline pipeline(&log);
+
+    AlignedVector sig(win_samples);
+    for (int i = 0; i < win_samples; ++i)
+        sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * f0 * i / sr));
+
+    AnalysisJob job;
+    job.numChannels = 1;
+    job.sampleRate  = sr;
+    job.winSamples  = win_samples;
+    job.dtMs        = 1000.0 / 60.0;
+    job.reset       = true;
+    job.p           = p;
+    job.windows.push_back(sig);
+    job.silent.push_back(0);
+
+    AnalysisResult res;
+    pipeline.process(job, res);
+
+    section("AnalysisPipeline::process() — 1 kHz sine, single channel");
+    CHECK(res.spectra.size() == 1);
+    CHECK(res.spectra[0].size() == static_cast<size_t>(bins));
+    CHECK(res.peakMag > 0.0f);
+    CHECK_NEAR(res.peakHz, f0, 2.0 * sr / N + 1.0);
+
+    AnalysisPipeline::Status st = pipeline.status();
+    CHECK(!st.plan.empty());
+    CHECK(st.fftSize == static_cast<size_t>(N));
+    CHECK(st.capacity == static_cast<size_t>(win_samples));
+    CHECK(st.outputBins == bins);
+    CHECK_NEAR(st.axisRate, sr, 1.0);                  // 2 * fmax, fmax clamped to Nyquist = sr/2 → sr
+    CHECK(st.linearGrid);                              // Linear + warp=0 + bins==nlin → identity
+
+    // Second pass: plan reused, no rebuild, peak stable.
+    job.seq = 2; job.reset = false;
+    pipeline.process(job, res);
+    CHECK_NEAR(res.peakHz, f0, 2.0 * sr / N + 1.0);
+
+    // Multi-channel: the parallel path (std::execution::par) must produce the same peak.
+    section("AnalysisPipeline::process() — multi-channel parallel fan-out");
+    job.numChannels = 3;
+    job.windows.assign(3, sig);
+    job.silent.assign(3, 0);
+    AnalysisResult res3;
+    pipeline.process(job, res3);
+    CHECK(res3.spectra.size() == 3);
+    for (size_t c = 0; c < 3; ++c)
+        CHECK_NEAR(res3.peakHz, f0, 2.0 * sr / N + 1.0);
+    CHECK(pipeline.parallelActive());
+
+    // Silence short-circuit: linear-magnitude path zeroes the output.
+    section("AnalysisPipeline::process() — silence short-circuit");
+    job.numChannels = 1;
+    job.silent[0] = 1;
+    AlignedVector zeros(win_samples, 0.0f);
+    job.windows.assign(1, zeros);
+    job.reset = false;
+    AnalysisResult res0;
+    pipeline.process(job, res0);
+    CHECK(res0.spectra.size() == 1);
+    bool all_zero = true;
+    for (float v : res0.spectra[0]) if (v != 0.0f) all_zero = false;
+    CHECK(all_zero);
+}
+
 // ------------------------------------------------------------------------------------------
 // The linear-grid ("no resampling") case is not a mode of its own: Scale = Linear + Warp Blend = 0
 // + Display Max >= Nyquist + Output Bins = nlin makes the warp come out as the identity, and
@@ -744,6 +832,7 @@ int main()
     test_triple_buffer_and_signal();
     test_background_plan();
     test_pipeline_sine();
+    test_pipeline_process();
     test_identity_grid_and_rate();
     test_rate_model();
     test_equal_loudness();
