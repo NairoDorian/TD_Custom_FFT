@@ -148,7 +148,7 @@ void setup(TD::OP_ParameterManager* manager)
 	appendMenu (manager, "Spectrum", WinmodeName,    WinmodeLabel,    kWinmodeNames, kWinmodeLabels, static_cast<int>(WinMode::Samples));
 	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768);
 	appendFloat(manager, "Spectrum", WinmsName,      WinmsLabel,      72.0, 1.0, 1000.0);
-	appendMenu (manager, "Spectrum", PadName,        PadLabel,        kPadNames,     kPadLabels,     5 /* 32768 */);
+	appendMenu (manager, "Spectrum", PadName,        PadLabel,        kPadNames,     kPadLabels,     4 /* 16384 */);
 	appendMenu (manager, "Spectrum", PlannerName,    PlannerLabel,    kPlannerNames, kPlannerLabels, static_cast<int>(Planner::Auto));
 	// (v2.8.0) "Raw Linear Bins (no resampling)" was removed: it was a fourth way to say what Scale +
 	// Display Max + Output Bins already say. Its only effect was to skip the frequency warp, and the

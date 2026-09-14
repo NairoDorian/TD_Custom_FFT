@@ -40,7 +40,7 @@ enum class WarpInterp : int { Linear = 0, Cubic, COUNT };
 // Zero-padded FFT transform lengths, indexed by the "Pad" menu (menu order in Parameters.cpp)
 inline constexpr int kPadValues[7] = { 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
 inline constexpr int kPadCount = 7;
-inline constexpr int kPadDefault = 32768;
+inline constexpr int kPadDefault = 16384;
 
 // Hard limits (defensive: the sliders are soft limits, typed values are not)
 inline constexpr int    kMinBins        = 8;
@@ -107,14 +107,14 @@ struct Values {
     ChanMode   chanMode     = ChanMode::MonoMix;   // mono is the 99 % use case: one analysis channel
     Scale      scale        = Scale::Log;
     double     displayMax   = 24000.0;
-    int        bins         = 16384;      // output bins; the FFT's own grid is pad/2 + 1 = 16385 at the default 32K pad
+    int        bins         = 16384;      // output bins; the FFT's own grid is pad/2 + 1 = 8193 at the default 16K pad
     double     warp         = 0.963;      // 0 = linear axis whatever Scale says, 1 = the Scale's own axis
     WarpInterp warpInterp   = WarpInterp::Linear;
     double     logFloor     = 20.0;
     WinMode    winMode      = WinMode::Samples;
     int        winSamples   = 3175;
     double     winMs        = 72.0;
-    int        padIndex     = 5;          // index into kPadValues
+    int        padIndex     = 4;          // index into kPadValues (16384)
     int        padSize      = kPadDefault;
     Planner    planner      = Planner::Auto;
     // EQ
