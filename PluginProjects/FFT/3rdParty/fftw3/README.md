@@ -72,6 +72,43 @@ Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** e
 times move with laptop thermals; the direction did not). oneMKL is the faster of the two on this
 Intel CPU, and it is the reason the toggle exists.
 
+### Why the oneMKL backend reports "FFTW 3.3.4", and why that is not out of date
+
+The `backend live:` line and the `fft_backend` Info DAT row say `FFTW 3.3.4 wrappers to Intel oneMKL`.
+That number is read from `fftwf_version` inside `mkl_rt.3.dll`, and it is **not** a version of FFTW
+that Intel has failed to keep up with — there is no newer one to move to:
+
+* FFTW's newest release is **3.3.11, Apr 21 2026** (it added `fftwf_copy_plan`, SVE and LoongArch
+  SIMD). That is the release vendored here, so the FFTW3 side is current.
+* oneMKL's newest release is **2026.1, Jul 7 2026**; `intelmkl.redist.win-x64` 2026.1.0.226 is the
+  newest package on nuget.org. That is the runtime installed here, so the oneMKL side is current too.
+* 3.3.4 is the FFTW release whose API Intel's compatibility layer implements, and Intel has never
+  rebumped it across 30+ oneMKL releases, because the FFTW3 public ABI has been stable since 3.0.
+  Intel's own documentation never claims a 3.3.x number at all — the Developer Guide says only that
+  the interfaces "correspond to the FFTW versions 2.x and 3.x".
+
+It is a real statement about the API surface, not just a stale string. Dumping exports from the two
+installed DLLs: `mkl_rt.3.dll` exports **95** `fftwf_*` symbols and `libfftw3f-3.3.11-avx2.dll`
+exports **78**, but oneMKL lacks every post-3.3.4 addition — `fftwf_copy_plan` (3.3.11),
+`fftwf_planner_nthreads` and `fftwf_threads_set_callback` (3.3.9) — while adding 27 Intel-only
+`fftwf_*_omp_offload` entry points for GPU offload. The kernels behind the wrapper are current:
+oneMKL 2026.0's release notes list DFT optimizations for power-of-two 1-D complex transforms, which
+is exactly this node's workload.
+
+**Nothing the plugin uses is missing.** All 19 real functions it resolves are exported by *both*
+DLLs, so the toggle cannot produce a null function pointer; the three symbols that appear only as
+type names (`fftwf_complex`, `fftwf_plan`, `fftwf_wisdom`) are typedefs in the header and are
+correctly exported by neither. `fftwf_cleanup` and `fftwf_forget_wisdom` are exported by both but
+appear only in a comment in `FftBackend.h` — deliberately, for the process-global reason given there.
+
+What the MKL backend *does* cost is plan control: oneMKL picks its own plan, so `FFT Planner`
+(Estimate / Measure / Patient) has no effect and `FFTW_WISDOM_ONLY` and the wisdom file are no-ops.
+The log says so on the `backend live:` line rather than leaving it to be discovered by A/B. The only
+way to get plan control *and* Intel's kernels would be oneMKL's native DFTI interface
+(`DftiCreateDescriptor` / `DftiComputeForward`), which is a separate engine behind `IFFTEngine` and a
+much larger change than the toggle — worth it only if the plan policy turns out to matter here more
+than the ~35 % stage win does.
+
 **oneMKL is not redistributed here.** It is **521 MB** of Intel-licensed binaries (16 `mkl_*.dll`
 plus `libimalloc.dll`, extracted from the 165.9 MB `intelmkl.redist.win-x64` 2026.1.0.226 package)
 and the ISSL requires its notice files to ship with it, which is the user's call to make, not a
