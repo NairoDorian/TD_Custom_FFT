@@ -236,7 +236,14 @@ Same binary, same bench invocation, only the library differing (`--backend fftw3
 | Intel oneMKL 2026.1.0 | 8.85 µs | 17.63 µs |
 
 Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** every time. That is the measured
-reason the `FFT Backend` toggle exists; the deployment notes, the OpenMP hazard it avoids and the list of DLLs
+reason the `FFT Backend` toggle exists; a re-run after a clean rebuild reproduced it (mkl 9.66 µs vs fftw3
+14.77 µs on fft+mag, 4/4 pairs, −35 %).
+
+**The A/B has to be interleaved, or it reports the opposite answer.** Each `fft_bench` process pays a cold
+first-plan and cold-cache cost on whatever library it loads, so a single fftw3 run followed by a single mkl run
+puts the *second* library ahead regardless of which is faster — measured here at 15.65 µs (fftw3, run second)
+against 16.82 µs (mkl, run first), inverting the table above. Alternate the two backends within one loop and
+re-run at least four pairs before believing any of it; the deployment notes, the OpenMP hazard it avoids and the list of DLLs
 it needs are in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 
 The FFT is 75–85 % of the default cost; `Zero-Pad Len` is the lever that matters. History (same bench on every commit):
