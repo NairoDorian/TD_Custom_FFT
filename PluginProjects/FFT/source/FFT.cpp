@@ -629,6 +629,10 @@ FFT::statusSnapshot()
 int32_t
 FFT::getNumInfoCHOPChans(void* reserved1)
 {
+	// Counted, not just returned: this callback is the first stop in the info chain, so whether it is
+	// entered at all is what separates "TD is not calling the chain" from "the text is not rendering".
+	// getInfoPopupString() reports the number in the popup itself.
+	myInfoChopChansCalls.fetch_add(1, std::memory_order_relaxed);
 	return 21;
 }
 
@@ -669,7 +673,11 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 bool
 FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
-	infoSize->rows = 19 + static_cast<int32_t>(myLog.size());
+	// Counted for the same reason as getNumInfoCHOPChans(): this runs immediately before
+	// getInfoPopupString in the documented cook order, so if this number climbs and the popup's does
+	// not, the chain is breaking between the two rather than never starting.
+	myInfoDatSizeCalls.fetch_add(1, std::memory_order_relaxed);
+	infoSize->rows = 20 + static_cast<int32_t>(myLog.size());
 	infoSize->cols = 2;
 	infoSize->byColumn = false;
 	return true;
@@ -772,9 +780,19 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 		row("channel_fanout", tempBuffer);
 		return;
 	}
+	case 19: {
+		// The same three counters the popup prints, readable without middle-clicking. They advance in
+		// lockstep with the node's cook count whenever the info chain is live, which is what makes them a
+		// usable signal: a row stuck at 0 while the node is visibly cooking means TouchDesigner is not
+		// entering the info callbacks at all, and no plugin-side string change can fix that.
+		row("info_callback_calls", "popup " + std::to_string(myInfoPopupCalls.load(std::memory_order_relaxed))
+		    + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
+		    + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed)));
+		return;
+	}
 	default: break;
 	}
-	size_t log_idx = static_cast<size_t>(index - 19);
+	size_t log_idx = static_cast<size_t>(index - 20);
 	if (log_idx < myLog.size()) {
 		snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
 		row(tempBuffer, myLog.entry(log_idx));
@@ -784,67 +802,98 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 void
 FFT::getInfoPopupString(OP_String* info, void* reserved1)
 {
-	const AnalysisPipeline::Status s = statusSnapshot();
-	char buf[256];
-	// Node identity first. Two things make this worth the three lines: the middle-click popup is the
-	// only place the node can name itself and its own binary, and "which FFT.dll answered" is a real
-	// question here - the plugin can be installed under Documents/Derivative/Plugins and also staged in
-	// the project's __Plugins__, and the two copies are indistinguishable in a textport log that does
-	// not say which process loaded which.
+	// --- is this callback even being called? -------------------------------------------------
+	// TouchDesigner calls the whole info chain inside a cook, so an empty popup can mean either "TD
+	// never called us" (the node is not cooking) or "TD called us and did not render the text". Those
+	// need opposite fixes and are indistinguishable from the popup itself, so the first entry is
+	// announced in the textport: if this line never appears, the problem is upstream of this string and
+	// no amount of rewriting it will help.
+	//
+	// Announced ONCE, not repeatedly. TouchDesigner enters this callback on every cook, so a periodic
+	// version of this line prints forever at 60 fps to confirm something already known - which is exactly
+	// what it did before it was cut down to this one-shot. The line is only ever wanted right after a
+	// load, when an empty popup is the symptom being chased; after that the same three counters are
+	// readable on demand from the popup's own "Info callbacks entered" line and, without a textport, from
+	// the `info_callback_calls` Info DAT row.
+	const uint32_t popupCall = myInfoPopupCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (popupCall == 1) {
+		myLog.log(std::string("[FFT Plugin] info chain live: TouchDesigner entered getInfoPopupString() (node cook #")
+		          + std::to_string(myNodeInfo ? myNodeInfo->cookCount : 0u)
+		          + ", " + ((myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>")
+		          + ") - middle-click info is being served by this plugin. Logged once per load.");
+	}
+
+	// The identity block is built and committed before anything that can fail, so a throw further down
+	// leaves TD with a populated popup instead of an empty one. Telemetry that can blank the whole
+	// popup is worse than telemetry that is missing: the popup exists to explain the node, and an empty
+	// one says nothing at all. Everything after this point is inside the try for that reason.
 	const char* nodePath = (myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>";
 	const char* dllPath  = (myNodeInfo && myNodeInfo->pluginPath) ? myNodeInfo->pluginPath : "<unknown>";
-	// cookCount is the node's own proof that it is cooking. Everything below it arrives through the
-	// info callbacks, which TouchDesigner only calls inside a cook - so if this number is not climbing,
-	// nothing else on this popup is live either. (That failure mode is why getGeneralInfo returns
-	// cookEveryFrame = true; see the comment there.)
+	// cookCount is the node's own proof that it is cooking; if it is not climbing, nothing else here is
+	// live. (That failure mode is why getGeneralInfo returns cookEveryFrame = true - see there.)
 	const uint32_t cooks = myNodeInfo ? myNodeInfo->cookCount : 0u;
 	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP, " + std::to_string(myAnalysisChannels) + " channel(s))\n";
 	text += "Plugin: TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
 	text += std::string("Binary: ") + dllPath + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + " | " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
-	text += "Engine & Plan: " + s.plan + "\n";
-	text += "FFT Size: N = " + std::to_string(s.fftSize) + " | Window: " + std::to_string(s.capacity) + " samples | magnitude bins computed: " + std::to_string(s.magnitudeBins) + "\n";
-	{
-		const double axis_rate = outputAxisRate(myParams, mySampleRate);
-		const int n_out = outputBinCountFrom(myParams);
-		snprintf(buf, sizeof(buf), "Spectrum axis: %d bins @ %.2f Hz = %.1f..%.1f Hz (input %.1f Hz%s)\n",
-		         n_out, hzPerSample(myParams, mySampleRate), s.axisBottom, axis_rate * 0.5, mySampleRate,
-		         s.linearGrid ? ", linear grid: identity warp, no resampling" : ", resampled onto the warp grid");
-		text += buf;
-	}
-	{
-		// The reported sample rate is bins x me.time.rate; the measured throughput is the same idea
-		// with the cook delta actually observed. Both are shown, plus the axis rate, because only the
-		// axis rate converts a bin index to Hz.
-		const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
-		const double rate = myCookRate.load(std::memory_order_relaxed);
-		const int n_out = outputBinCountFrom(myParams);
-		snprintf(buf, sizeof(buf), "Sample rate (to TouchDesigner): %.0f Hz = %d bins x %.2f frames/s (me.time.rate)\n",
-		         outputSampleRate(myParams), n_out, rate > 0.0 ? rate : 60.0);
-		text += buf;
-		snprintf(buf, sizeof(buf), "Measured throughput: %.0f samples/s (cook delta %.2f ms)\n",
-		         outputBandwidth(myParams),
-		         dt_ms);
-		text += buf;
-	}
-	// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel,
-	// channel count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the
-	// node's output can be compared without opening a CHOP viewer.
-	snprintf(buf, sizeof(buf), "Output: %d samples/channel x %d channel(s) @ %.0f Hz | window %zu samples of input\n",
-	         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams),
-	         static_cast<size_t>(s.capacity));
-	text += buf;
-	text += "Cook: " + std::to_string(myLastCookUs) + " us CPU (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us"
-	     + " | cooks: " + std::to_string(cooks) + "\n"
-	     // GPU cook time is deliberately not invented here: this node has no GPU stage at all, so
-	     // there is nothing for it to report. TouchDesigner's own Operator Info header carries the
-	     // node's CPU and GPU cook times for the frame; this line is the plugin's own measurement.
-	     + "GPU: none (all stages are CPU/AVX2; TD's Operator Info header reports the per-node GPU time)\n";
-	text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
-	auto logs = myLog.snapshot();
-	size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
-	for (size_t i = start_idx; i < logs.size(); ++i) text += logs[i] + "\n";
+	text += "Info callbacks entered: popup " + std::to_string(popupCall)
+	     + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
+	     + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed)) + "\n";
 	info->setString(text.c_str());
+
+	try {
+		const AnalysisPipeline::Status s = statusSnapshot();
+		char buf[256];
+		text += "Engine & Plan: " + s.plan + "\n";
+		text += "FFT Size: N = " + std::to_string(s.fftSize) + " | Window: " + std::to_string(s.capacity) + " samples | magnitude bins computed: " + std::to_string(s.magnitudeBins) + "\n";
+		{
+			const double axis_rate = outputAxisRate(myParams, mySampleRate);
+			const int n_out = outputBinCountFrom(myParams);
+			snprintf(buf, sizeof(buf), "Spectrum axis: %d bins @ %.2f Hz = %.1f..%.1f Hz (input %.1f Hz%s)\n",
+			         n_out, hzPerSample(myParams, mySampleRate), s.axisBottom, axis_rate * 0.5, mySampleRate,
+			         s.linearGrid ? ", linear grid: identity warp, no resampling" : ", resampled onto the warp grid");
+			text += buf;
+		}
+		{
+			// The reported sample rate is bins x me.time.rate; the measured throughput is the same idea
+			// with the cook delta actually observed. Both are shown, plus the axis rate, because only the
+			// axis rate converts a bin index to Hz.
+			const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
+			const double rate = myCookRate.load(std::memory_order_relaxed);
+			const int n_out = outputBinCountFrom(myParams);
+			snprintf(buf, sizeof(buf), "Sample rate (to TouchDesigner): %.0f Hz = %d bins x %.2f frames/s (me.time.rate)\n",
+			         outputSampleRate(myParams), n_out, rate > 0.0 ? rate : 60.0);
+			text += buf;
+			snprintf(buf, sizeof(buf), "Measured throughput: %.0f samples/s (cook delta %.2f ms)\n",
+			         outputBandwidth(myParams),
+			         dt_ms);
+			text += buf;
+		}
+		// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel,
+		// channel count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the
+		// node's output can be compared without opening a CHOP viewer.
+		snprintf(buf, sizeof(buf), "Output: %d samples/channel x %d channel(s) @ %.0f Hz | window %zu samples of input\n",
+		         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams),
+		         static_cast<size_t>(s.capacity));
+		text += buf;
+		text += "Cook: " + std::to_string(myLastCookUs) + " us CPU (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us"
+		     + " | cooks: " + std::to_string(cooks) + "\n"
+		     // GPU cook time is deliberately not invented here: this node has no GPU stage at all, so
+		     // there is nothing for it to report. TouchDesigner's own Operator Info header carries the
+		     // node's CPU and GPU cook times for the frame; this line is the plugin's own measurement.
+		     + "GPU: none (all stages are CPU/AVX2; TD's Operator Info header reports the per-node GPU time)\n";
+		text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
+		auto logs = myLog.snapshot();
+		size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
+		for (size_t i = start_idx; i < logs.size(); ++i) text += logs[i] + "\n";
+		info->setString(text.c_str());
+	} catch (const std::exception& e) {
+		text += std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n";
+		info->setString(text.c_str());
+	} catch (...) {
+		text += "(telemetry truncated after the identity block: unknown exception)\n";
+		info->setString(text.c_str());
+	}
 }
 
 void

@@ -191,6 +191,14 @@ private:
 	bool				myAsyncActive{ false };
 	int					myAnalysisChannels{ 0 };
 	int					myHoldFrames{ 0 };
+	// How many times TouchDesigner has actually entered each info callback. Nothing else in the plugin
+	// can answer "is the popup empty because TD never called us, or because it called us and did not
+	// render the text?", and the whole info chain runs inside a cook, so a node that is not cooking
+	// leaves these at 0 with no other visible symptom. Reported three ways: the first-call log line (once per
+	// load), the popup's own `Info callbacks entered:` line, and the `info_callback_calls` Info DAT row.
+	std::atomic<uint32_t> myInfoPopupCalls{ 0 };
+	std::atomic<uint32_t> myInfoDatSizeCalls{ 0 };
+	std::atomic<uint32_t> myInfoChopChansCalls{ 0 };
 };
 
 #endif // FFT_H

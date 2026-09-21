@@ -90,6 +90,20 @@ All notable changes to `Plugin_FFT` are documented here.
   telemetry on that popup is live.
 - **Reported version was `v2.8` while the changelog documented v2.9.0** - `kMinorVersion` was never bumped for the
   v2.9.0 work, so the popup under-reported its own version. Now 2.9.
+- **How the popup fix was confirmed, and what confirming it cost in log noise.** TouchDesigner's middle-click does
+  not call the plugin: the popup shows whatever the last cook left behind. So an empty popup has two opposite
+  causes - TD never entered the info callbacks, or it entered them and the string did not render - and nothing in
+  the plugin could tell them apart. Three counters (`myInfoPopupCalls`, `myInfoDatSizeCalls`,
+  `myInfoChopChansCalls`) were added, plus a line to the textport on the first entry. That settled it: the counters
+  advance **in lockstep with `OP_NodeInfo::cookCount`, one popup entry per cook** - popup #2100 at cook #2101,
+  #2400 at #2401, #2700 at #2701 - so TouchDesigner was calling the chain every frame, and the empty popup really
+  was the cooking flag. The counters stay, because they are the only signal that separates "the node stopped
+  cooking" from "the popup string broke"; they are now reported in the popup itself and in the new
+  `info_callback_calls` Info DAT row (rows 19 -> 20 before the plan log), so the diagnostic needs no textport.
+- **The instrumentation line no longer repeats.** It first printed on calls 1, 2 and every 300th, which at 60 fps
+  is a line forever, confirming something already known. It now prints **once per load** - the one moment it is
+  wanted, when an empty popup is the symptom being chased - and the state it used to announce on a timer is
+  readable on demand from the popup's `Info callbacks entered:` line and from `info_callback_calls`.
 
 ### Notes
 - `fftwf_cleanup` and `fftwf_forget_wisdom` are deliberately **not** in the resolved API table. They free
