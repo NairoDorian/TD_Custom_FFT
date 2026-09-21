@@ -51,7 +51,7 @@ PluginProjects/FFT/
 │   ├── FftBackend.h      <-- FFT library registry + runtime loader (FFTW3 / oneMKL, no import library)
 │   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, per-channel pipeline, telemetry)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook)
-├── tests/dsp_tests.cpp   <-- headless golden-vector tests (593 checks, incl. lock-free handoff stress)
+├── tests/dsp_tests.cpp   <-- headless golden-vector tests (607 checks, incl. lock-free handoff stress)
 ├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --info N, --backend fftw3|mkl)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
 └── 3rdParty/fftw3/       <-- vendored FFTW 3.3.11 AVX2 (VERSION record, header, .def/.lib, runtime DLL)
@@ -334,7 +334,7 @@ A blank popup is one of exactly two things, and they need opposite fixes:
 | | Chain **not** entered | Chain entered, text **not** rendered |
 |---|---|---|
 | `info_callback_calls` Info DAT row | counters **frozen** (they stop advancing while the node cooks) | counters **climb** — popup count tracks `cookCount` 1:1 |
-| The popup's own character count (same row) | stale, alongside a frozen call count | steady and ordinary; **~1100-1300** after the v2.9 string trim (~1660 before it) |
+| The popup's own character count (same row) | stale, alongside a frozen call count | steady and ordinary; **a constant now** (v2.9.1 clipped and bounded the tail, so the same node hands over the same number every cook; it was ~800-1300 before, and ~1660 in v2.8) |
 | Meaning | the node stopped cooking → fix the cook, not the popup | the string is fine and TouchDesigner did not draw it → **not a plugin problem** |
 | Fix | see *"Making sure the node is cooking"* below | report to Derivative with that evidence |
 
@@ -381,9 +381,9 @@ Measured with `fft_bench --info 2000`, which drives the same access pattern agai
 
 ```
 info-callback access cost (298 status reads + the 276-row log view, per cook, 2000 cooks):
-  re-lock + re-copy every call       60.7 us/cook
-  memoized + version-stamped          0.4 us/cook   -99%
-  saved                              60.3 us/cook   (0.36% of a 16.7 ms frame at 60 fps)
+  re-lock + re-copy every call       54.6 us/cook
+  memoized + version-stamped          0.6 us/cook   -99%
+  saved                              54.0 us/cook   (0.32% of a 16.7 ms frame at 60 fps)
 ```
 
 For scale, the analysis itself is ~88 µs/cook for one channel at these settings — so the *bookkeeping for reading
@@ -398,21 +398,35 @@ worker. It does **not** prove TouchDesigner's renderer was timing out; nothing o
 
 This is not a style preference; it is what broke the popup, twice in each direction, and it is the one change that
 was measured. The string that renders is a fixed identity block plus a telemetry body - a set of numbers whose
-length is dominated by the two paths - and then up to **three** plan-log lines. **The whole thing is now hard-bounded
-at 1600 characters** (`kMaxPopupChars` in `FFT.cpp`), enforced where the only unbounded input enters: the body is
-budgeted first and the tail is filled only while the total fits. Adding two diagnostic lines - `Info callbacks
-entered: ...` and `Cook stall: ...` -
-took it to roughly 1760 and the popup rendered **empty**; removing them brought it back. No size limit is documented
-anywhere in the SDK (`OP_String::setString` is a bare `virtual void setString(const char* val)`, no cap stated), so
-what TouchDesigner does above some undisclosed length is **not** established - but the correlation was reproduced in
-both directions, and it is enough to state the rule:
+length is dominated by the two paths - and then up to **three** plan-log lines, each clipped to **72 characters**.
+**The whole thing is hard-bounded at 1200 characters** (`kMaxPopupChars` in `FFT.cpp`), with every append past the
+identity block going through one `add` lambda that refuses a line which would not fit. That last part is a
+correction, not a detail: the bound used to guard **only the tail loop**, so the ~780-character body plus one
+240-character plan line could be handed over before anything was checked - the failure the bound existed to prevent,
+inside the bound's own implementation. Adding two diagnostic lines - `Info callbacks entered: ...` and
+`Cook stall: ...` -
+took the string to roughly 1760 and the popup rendered **empty**; removing them brought it back. No size limit is
+documented anywhere in the SDK (`OP_String::setString` is a bare `virtual void setString(const char* val)`, no cap
+stated), so what TouchDesigner does above some undisclosed length is **not** established - but the correlation was
+reproduced in both directions, and it is enough to state the rule:
 
 > **No diagnostic may ever be added to the popup string.** Diagnostic values go in the `info_callback_calls` Info DAT
 > row (row 19), which TouchDesigner reads as *a value*, not as the popup. A diagnostic that is rendered by the thing
 > it is measuring can change what it measures - and here it appears to have done exactly that.
 
-The same rule is why the popup carries a **character count** into that Info DAT row instead of printing it: a stable
-length on a blank popup says the text was never the problem.
+The same rule is why the popup carries a **character count** into that Info DAT row instead of printing it.
+
+### Rule: the popup's length is a constant
+
+A corollary of the above, and the other half of making the length signal worth reading. In v2.9.0 the popup's length
+swung by hundreds of characters between cooks: the body is fixed, but each rendered plan-log line runs to ~240
+characters because the engine's backend description embeds the absolute path of the FFT library, so a blank popup
+beside a length of 900 or 1300 meant the same thing - nothing. v2.9.1 clips each rendered line
+(`kMaxTailLineChars`, via `FFTDSP::clipLine`) and bounds the total, so the same node hands over the same number on
+every cook. That is what makes the row readable: a different number now means one of the *inputs* changed (the node
+path, the install path, or a plan line), never that the string outgrew something between one cook and the next.
+Clipping is for the popup only - the Info DAT's `plan_log_*` rows and the textport carry the line whole, because
+neither is a fixed-size surface and a clipped log line read as the log would be worse than a long popup.
 
 ### Making sure the node is cooking (branch 1)
 
@@ -455,8 +469,11 @@ Recorded honestly, because the confident version of this section was wrong three
 - **That any given blank popup is this node's fault.** Establish which branch it is from the table above before
   changing a line of code.
 - **That the info-chain cost was the *whole* cause of the slow popup.** What is measured is that the access pattern
-  cost 60.7 µs/cook and now costs 0.4 µs/cook. Whether TouchDesigner's own query was slow enough to be affected by
+  cost 60.7 µs/cook and now costs 0.6 µs/cook. Whether TouchDesigner's own query was slow enough to be affected by
   that - or whether it re-queries, caches, or times out at all - is not observable from inside a plugin.
+- **That the v2.9.1 length change fixed anything.** It removes a mechanism, it does not prove a cause. The popup
+  came back on a build compiled *before* those changes, which is the same "no code change in between" behaviour
+  recorded above - so what the change buys is a clean signal for the next report, not a demonstrated repair.
 
 ### What was tried, and what each attempt actually taught
 
@@ -468,6 +485,8 @@ Recorded honestly, because the confident version of this section was wrong three
 | Two diagnostic lines **in the popup string** | **Removed, and the rule above exists because of it.** This is the change that separated working from blank. |
 | Log line once per load, instead of every 300 cooks (`7b419b5`) | **Now removed entirely (v2.9.0).** It went one-shot, then went away: the call count and the character count it carried both live in the `info_callback_calls` Info DAT row, so the line was pure textport noise on the real-time path. |
 | Memoizing `statusSnapshot()` + `snapshotTail()` (v2.9.0) | **Kept, and measured.** 60.7 → 0.4 µs/cook (`fft_bench --info`). This is the only change in this table that was made against a number rather than against a correlation. |
+| Bounding the popup **whole** rather than only its tail, and clipping each rendered plan line (v2.9.1) | **Kept.** Fixes a real bug - `kMaxPopupChars` was documented as a bound on the string and implemented as a bound on the tail loop, so the body plus one long plan line could exceed it. The clip also makes the length a constant, which is what makes the character count in row 19 comparable between cooks. **Not** shown to fix a blank popup: the popup returned on a build compiled before this change. Enforces the rule above instead of explaining the failure. |
+| Removing the `getInfoPopupString() called (...)` textport line (v2.9.1) | **Kept, at the user's request.** Its two facts live in row 19. Worth recording what it cost: printed from *inside* the callback, its absence and the popup's absence looked like a single symptom when they are opposite branches of the table above. A diagnostic that shares a code path with the thing it monitors will eventually be read as a cause. |
 
 ## License / third party
 

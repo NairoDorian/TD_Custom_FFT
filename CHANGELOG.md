@@ -4,6 +4,71 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.9.1] - 2026-09-21 — the popup's length is now a constant, and the log line is gone
+
+### Fixed
+- **`kMaxPopupChars` was not a bound on the popup string.** It was named as one, documented as one ("everything
+  the popup can say, including the tail, is held under 1600 characters"), and it guarded exactly one of the four
+  places that append: the plan-log tail loop. The fixed body could sit at ~780 characters and the **first** tail
+  line - 240 characters, because a backend description embeds the absolute path of the FFT library - could be
+  appended before anything was checked, so the string could exceed the bound the code claimed to enforce. This is
+  the failure mode the bound existed to prevent, sitting inside the bound's own implementation. The bound now
+  applies to the whole string: every append past the identity block goes through one `add` lambda that refuses a
+  line which would not fit, whole lines only, so a line of numbers can never be handed over half-written.
+- **The popup's length moved by hundreds of characters from cook to cook, which is what made a length-dependent
+  failure read as a random one.** The fixed body is ~780 characters; the tail was three plan-log lines of up to
+  240 each, so the total swung between about 800 and 1300 depending on which plan events happened to be last - and
+  the character count in the `info_callback_calls` row, which exists to be compared, could not be compared with
+  anything. Each rendered line is now clipped to 72 characters (`kMaxTailLineChars`, via the new, unit-tested
+  `FFTDSP::clipLine`), so the total is a constant the reader can predict. The full line is untouched in the Info
+  DAT's `plan_log_*` rows and in the textport: neither is a fixed-size surface, and a clipped log line read as the
+  log would be worse than a long popup.
+- **`kMaxPopupChars` moved 1600 → 1200**, which is the headroom the ~1660-rendered / ~1760-empty measurement
+  supports. At ~700 characters typical against a 1200 bound, the bound now never binds in a normal configuration -
+  it is there for an unusual one (a very long node path, a very long install path) rather than being a ceiling the
+  string routinely sits under.
+- The string was also trimmed where the length was pure prose, with every number kept: `Engine & Plan:` → `Engine:`
+  (`FFT: N=…, window …, … magnitude bins` and `Axis:` replace the `Spectrum axis:` sentence), `Rate:` and
+  `Throughput:` are one line - they are the declared and measured form of the same quantity and were two lines of
+  label for six numbers - `Output: … samples x … channel(s)` → `Output: … x … ch`, and `GPU: none (CPU/AVX2 only;
+  TD reports per-node GPU time)` merged into the `SIMD:` line as `| GPU: none (CPU only)`.
+
+### Changed
+- **The popup reports a patch version** (`v2.9.1`), because it is the only place in TouchDesigner that says which
+  build is answering. That matters for this surface specifically: the popup is the thing that goes blank, so when
+  it comes back the first question is which DLL produced it - `Binary:` gives the path, the `Plugin:` line now
+  gives the build.
+- **The textport announcement line is gone**, at the user's request. It printed from *inside* `getInfoPopupString`
+  (`getInfoPopupString() called (#4800, node cook #4801) - TD is reading this node's custom popup text (1218 chars
+  handed over)`), which meant its absence and the popup's absence looked like one symptom. They are not: the line's
+  two facts - the call count and the characters handed over - are in the `info_callback_calls` Info DAT row, where
+  they are values rather than rendered text, and the question it answered ("is TouchDesigner entering this callback
+  at all?") is read from row 19 by comparing the counters against `cookCount`.
+
+### Verified
+- `fft_tests`: **607 checks, 0 failures** (was 593). The new `test_clip_line` asserts the `clipLine` contract in
+  both directions - a line that fits is handed through byte for byte, one character over is trimmed to exactly the
+  bound and marked, and the real 240-character backend description keeps its identifying head while losing the
+  library path (which is what made the line's length unbounded, and which the `Binary:` line already carries).
+- `fft_bench --info 2000`: **54.6 µs/cook → 0.6 µs/cook, −99 %** (0.32 % of a 16.7 ms frame). The bench mirrors
+  the clip so the one part of the "after" path the "before" path never paid for - truncating each rendered line -
+  is measured rather than hidden inside the saving.
+- `build/bin/Release/FFT.dll` and `__Plugins__/FFT/FFT.dll` are byte-identical (SHA-256
+  `B9E0C2E5…D26EF787`), and the new popup literals (`GPU: none (CPU only)`, `--- Plan log (last `) were confirmed
+  present **in the built binary** rather than assumed from the build succeeding.
+
+### Still open, and recorded as open
+The popup came back on this build before these changes were compiled, and went blank earlier on a build with **no
+code change in between** - which is what rules the DLL, and the string, out as the variable that flips it. What
+this release does is remove the one mechanism that has ever been *measured* for this failure (length, and length
+that moved), so that the next blank popup is a clean signal instead of an ambiguous one: with the length now a
+constant, `info_callback_calls` reading an ordinary character count beside a blank popup means TouchDesigner was
+handed a well-formed string and did not draw it, while counters frozen against `cookCount` mean the callback never
+ran. Both are read without a rebuild. The cook-driven mechanism, the two installs, and the five causes in the order
+they actually occur are in *"The middle-click info popup"* in `README.md`.
+
+---
+
 ## [v2.9.0] - 2026-09-21 — two FFT libraries in one node, and an Async toggle that really means one thread
 
 ### Added
@@ -214,6 +279,11 @@ All notable changes to `Plugin_FFT` are documented here.
     ~1660 characters before this change, roughly **1100-1300** now, with the ceiling no longer reachable by a long
     log line. The actual length is reported in the `info_callback_calls` Info DAT row, so if the bound is ever the
     thing that is wrong, it says so rather than being silent.
+    **Corrected in v2.9.1: this bound did not do what the paragraphs above say it did.** It was implemented on the
+    tail loop only, so the fixed body plus the first tail line could be handed over before the total was compared
+    against it - so "the ceiling is no longer reachable by a long log line" was not true when it was written. The
+    bound is enforced on the whole string from v2.9.1, and the number is 1200. Left as written rather than rewritten,
+    because that release's measurement (~1660 rendered, ~1760 empty) is still the evidence the bound is sized from.
 
 ### Confirmed in TouchDesigner, and what that confirmation cost
 The middle-click popup was watched rendering **in full** from this plugin, in TouchDesigner, on the build this

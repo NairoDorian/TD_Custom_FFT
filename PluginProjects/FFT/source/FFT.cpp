@@ -57,24 +57,38 @@ const char* kOpIcon    = "FFT";
 const int   kMajorVersion = 2;
 const int   kMinorVersion = 9;   // keep in step with CHANGELOG.md - the v2.9.0 work landed without this bump,
                                  // so the popup and the Info DAT reported v2.8 for a v2.9 node
+// Reported in the popup's `Plugin:` line, which is the only place in TouchDesigner that says which build is
+// answering. That matters here more than usual: the popup is the surface that goes blank, so the first thing
+// to establish when it comes back is *which* DLL produced it - the `Binary:` line gives the path, and this
+// gives the build. It is also how a fix to the popup's own text can be confirmed as loaded at a glance.
+const int   kPatchVersion = 1;
 
-// Upper bound on the middle-click popup string, and how many plan-log lines may be appended into it.
+// Upper bound on the middle-click popup string, how many plan-log lines may be appended into it, and how much
+// of each of those lines may be shown.
 //
 // The popup is the one string this plugin hands to TouchDesigner whose rendering has been observed to depend
 // on its length: ~1660 characters rendered, ~1760 came up empty (measured, both directions - see README,
-// "The middle-click info popup"). No cap is documented anywhere in the SDK, so no theory of the real limit is
-// available to design against. What *is* available is the shortest length known to have failed, and the bound
-// is set clear of it: everything the popup can say, including the tail, is held under 1600 characters.
+// "The middle-click info popup"). No cap is documented anywhere in the SDK - OP_String::setString takes a
+// NUL-terminated const char* and says only that it is UTF-8 - so there is no limit to design against, only
+// lengths that are known to have worked and known to have failed.
 //
-// The bound only has to bind the tail. The body above it is a fixed set of numbers - the only variable-length
-// pieces are the node path and the plugin path - so it cannot grow on its own; a plan-log entry can, because
-// it carries whatever the engine logged. Bounding where the unbounded input enters is what makes the total
-// bounded without the body having to truncate a number, which would be worse than a long string.
-constexpr size_t kMaxPopupChars     = 1600;
+// The previous bound was 1600, which was not a bound on this string at all: it guarded the tail loop only, so
+// the fixed body could sit at ~780 characters and the first tail line could add 240 more before anything was
+// checked. It was also within ~60 characters of the shortest length known to fail. Both are fixed here by
+// making the bound apply to the whole string (see the `add` lambda in getInfoPopupString) and by moving it
+// well clear of the observed break, so the popup's length is now a constant the reader can predict rather
+// than a number that drifts with whatever the engine last logged.
+constexpr size_t kMaxPopupChars     = 1200;
 // How many plan-log lines the popup renders. Named because two more places depend on the number: the
 // Info DAT's row count is derived from what is left after the fixed rows, and bench.cpp's --info
 // measurement mirrors this value (it is file-local here, so it is repeated there with a note).
 constexpr size_t kTailPlanLogLines  = 3;
+// Characters of each plan-log line the popup shows. A plan line is ~240 characters because the engine's
+// backend description embeds the absolute path of the FFT library (see describeBackend), and three of those
+// were 70 % of this string: the popup's length moved by hundreds of characters depending on which plan events
+// happened to be last, which is exactly the variation that makes a length-dependent failure look random. The
+// full line is in the Info DAT's plan_log_* rows; the popup shows which events happened and the head of each.
+constexpr size_t kMaxTailLineChars  = 72;
 
 using clk = std::chrono::steady_clock;
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
@@ -888,6 +902,13 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 		// not rendered as the popup, so whatever the popup does with its text cannot change this number.
 		// Read it as: counters at 0 while the node cooks = the chain never reaches these callbacks; a
 		// healthy character count on a blank popup = a real string was handed over and not rendered.
+		//
+		// The count is now a constant, which is what makes it readable at all. It used to drift by hundreds
+		// of characters with whatever the engine last logged, so "the popup is blank and the length is 1400"
+		// could not be compared against anything; the tail is clipped and the total bounded (see
+		// getInfoPopupString), so the same node hands over the same number on every cook. A different
+		// number therefore means one of the inputs changed - the node path, the DLL path, or a plan line -
+		// and never that the popup outgrew something between one cook and the next.
 		const double gap_ms = myMaxCookGapMs.load(std::memory_order_relaxed);
 		row("info_callback_calls", "popup " + std::to_string(myInfoPopupCalls.load(std::memory_order_relaxed))
 		    + " (" + std::to_string(myInfoPopupLen.load(std::memory_order_relaxed)) + " chars)"
@@ -919,91 +940,92 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 
 	// The text is built whole and handed to TouchDesigner exactly once, at the very end of this function,
 	// on every path - see the note above the setString call for why the single call is load-bearing.
-	// Everything between here and there only appends to `text`.
+	// Everything between here and there only appends to `text` through `add` below.
 	const char* nodePath = (myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>";
 	const char* dllPath  = (myNodeInfo && myNodeInfo->pluginPath) ? myNodeInfo->pluginPath : "<unknown>";
+	// The identity block is built with += and never routed through the bound below: it is ~250 characters,
+	// appended first, and it is the part that must survive whole - it names the node and the exact binary
+	// answering for it, which is the first thing to check when a popup looks wrong (a stale second install
+	// does exactly this; see README). Nothing below can reach it because the bound can only refuse appends
+	// that would make the string longer, never shorten it.
 	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP)\n";
-	text += "Plugin: TouchDesigner Custom FFT v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
+	text += "Plugin: TouchDesigner Custom FFT v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion)
+	      + "." + std::to_string(kPatchVersion) + "\n";
 	text += std::string("Binary: ") + dllPath + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + ", " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
-	// The identity block above is the part that must survive at any cost: it is built before the try, so
-	// nothing below can leave the popup empty. It also carries the two facts that identify *which* binary
-	// is answering - the node path and the DLL path - which is the first thing to check when a popup looks
-	// wrong, because a stale second install (see README) produces exactly that.
+	// Every append past the identity block goes through here, which is what makes kMaxPopupChars a bound on
+	// the *string* rather than on one part of it. Whole lines only: a line that does not fit is dropped, not
+	// clipped, because half a line of numbers reads as a bug in the numbers. Nothing here is load-bearing -
+	// the identity block above already names the node and the binary - so dropping the tail under pressure
+	// is the right trade, and at the current sizes (~700 characters typical against a 1200 bound) it does
+	// not happen at all.
+	auto add = [&text](const std::string& s) {
+		if (text.size() + s.size() <= kMaxPopupChars) text += s;
+	};
 	try {
 		const AnalysisPipeline::Status& s = statusSnapshot();
 		char buf[256];
-		text += "Engine & Plan: " + s.plan + "\n";
-		text += "FFT: N = " + std::to_string(s.fftSize) + " | window " + std::to_string(s.capacity) + " samples | " + std::to_string(s.magnitudeBins) + " magnitude bins\n";
+		add("Engine: " + s.plan + "\n");
+		add("FFT: N=" + std::to_string(s.fftSize) + ", window " + std::to_string(s.capacity)
+		    + ", " + std::to_string(s.magnitudeBins) + " magnitude bins\n");
 		{
 			const double axis_rate = outputAxisRate(myParams, mySampleRate);
-			const int n_out = outputBinCountFrom(myParams);
-			snprintf(buf, sizeof(buf), "Spectrum axis: %d bins @ %.2f Hz = %.1f..%.1f Hz (input %.1f Hz%s)\n",
-			         n_out, hzPerSample(myParams, mySampleRate), s.axisBottom, axis_rate * 0.5, mySampleRate,
-			         s.linearGrid ? ", linear grid, no resampling" : ", warped grid");
-			text += buf;
+			snprintf(buf, sizeof(buf), "%.2f Hz", hzPerSample(myParams, mySampleRate));
+			std::string line = "Axis: " + std::to_string(outputBinCountFrom(myParams)) + " bins @ " + buf + ", ";
+			snprintf(buf, sizeof(buf), "%.1f-%.1f Hz (input %.1f Hz, %s)\n",
+			         s.axisBottom, axis_rate * 0.5, mySampleRate,
+			         s.linearGrid ? "linear grid, no resample" : "warped grid");
+			line += buf;
+			add(line);
 		}
 		{
-			// The reported sample rate is bins x me.time.rate; the measured throughput is the same idea
-			// with the cook delta actually observed. Both are shown, plus the axis rate, because only the
-			// axis rate converts a bin index to Hz.
+			// Rate and throughput share a line because they are the declared and the measured form of the same
+			// quantity (see outputSampleRate / outputBandwidth), and reading them apart cost two lines of prose
+			// for six numbers on a string that has to stay short. Both stay, with their two denominators, since
+			// the whole point of reporting both is that they can differ: fps and the observed cook delta.
 			const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
 			const double rate = myCookRate.load(std::memory_order_relaxed);
-			const int n_out = outputBinCountFrom(myParams);
-			snprintf(buf, sizeof(buf), "Rate: %.0f Hz = %d bins x %.2f fps (me.time.rate)\n",
-			         outputSampleRate(myParams), n_out, rate > 0.0 ? rate : 60.0);
-			text += buf;
-			snprintf(buf, sizeof(buf), "Throughput: %.0f samples/s (cook delta %.2f ms)\n",
-			         outputBandwidth(myParams),
-			         dt_ms);
-			text += buf;
+			snprintf(buf, sizeof(buf), "Rate: %.0f Hz = %d bins x %.2f fps | measured %.0f samples/s (cook %.2f ms)\n",
+			         outputSampleRate(myParams), outputBinCountFrom(myParams), rate > 0.0 ? rate : 60.0,
+			         outputBandwidth(myParams), dt_ms);
+			add(buf);
 		}
-		// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel,
-		// channel count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the
-		// node's output can be compared without opening a CHOP viewer. The window length that used to trail
-		// this line is gone: the FFT line above already reports it.
-		snprintf(buf, sizeof(buf), "Output: %d samples x %d channel(s) @ %.0f Hz\n",
+		// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel, channel
+		// count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the node's output
+		// can be compared without opening a CHOP viewer.
+		snprintf(buf, sizeof(buf), "Output: %d x %d ch @ %.0f Hz\n",
 		         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams));
-		text += buf;
-		// One decimal, not std::to_string's six. std::to_string(double) is %f, so a cook time of 13 us
-		// printed as "13.000000" - six digits of noise on a microsecond figure, and eleven wasted
-		// characters per number on a string that has to stay short. The cook count that used to end this
-		// line is gone; proving the node is cooking is the identity block's job, and the count is in the
-		// info_callback_calls Info DAT row where reading it costs the popup nothing.
+		add(buf);
+		// One decimal, not std::to_string's six: std::to_string(double) is %f, so a cook time of 13 us printed
+		// as "13.000000" - six digits of noise on a microsecond figure, and eleven wasted characters per number
+		// on a string that has to stay short. The cook count that used to end this line is gone; proving the node
+		// is cooking is the identity block's job, and the count is in the info_callback_calls Info DAT row where
+		// reading it costs the popup nothing.
 		snprintf(buf, sizeof(buf), "Cook: %.1f us CPU (params %.1f us) | DSP: %.1f us\n",
 		         myLastCookUs, myParamUs, myDspUs.load(std::memory_order_relaxed));
-		text += buf;
-		// GPU cook time is deliberately not invented here: this node has no GPU stage at all, so there is
-		// nothing for it to report. TouchDesigner's own Operator Info header carries the node's CPU and GPU
-		// cook times for the frame; this line is the plugin's own measurement.
-		text += "GPU: none (CPU/AVX2 only; TD reports per-node GPU time)\n";
-		text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
-		// The tail is the only part of this string with no fixed size. Everything above is a fixed set of
-		// numbers (the only variable-length pieces are the two paths), but a plan-log entry is arbitrary
-		// text - a plan line carries the FFTW wisdom note, a backend name, timing - and there can be several
-		// of them. So the total length is bounded here, where the unbounded input is: the body is budgeted
-		// first and the tail is filled only while it fits.
-		//
-		// The bound is kMaxPopupChars, and the number is chosen to stay under the smallest length this popup
-		// is *known* to have failed at rather than picked from a theory of what the real limit is. Measured:
-		// ~1660 characters rendered, ~1760 came up empty (see README, "The middle-click info popup"). No
-		// limit is documented on OP_String::setString, so rather than guess at it, the string is held well
-		// clear of the shortest length observed to break - and the actual length is reported in the
-		// info_callback_calls Info DAT row, so if this bound is ever the thing that is wrong, it says so.
+		add(buf);
+		// SIMD and GPU on one line, and the GPU half says only what is true of this node: it has no GPU stage,
+		// so there is nothing for it to report. TouchDesigner's own Operator Info header carries the node's CPU
+		// and GPU cook times for the frame; this line is the plugin's own measurement.
+		add(std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + " | GPU: none (CPU only)\n");
+		add("--- Plan log (last " + std::to_string(kTailPlanLogLines) + ") ---\n");
+		// The tail is the only part of this string whose content is not fixed, and it used to be the only part
+		// whose *length* was not fixed either: a plan line carries the absolute path of the FFT library and runs
+		// to ~240 characters, so three of them moved the total by up to 700 depending on which events were last.
+		// Each line is clipped here instead, which is what makes the popup's length predictable - the reason the
+		// character count in the info_callback_calls row is worth reading at all is that it is now a constant.
 		//
 		// snapshotTail, not snapshot: only the last kTailPlanLogLines entries are ever shown, and snapshot()
-		// copied the entire history - up to 256 strings and their allocations - to throw all but three
-		// away, on every cook. The scratch vector is reused, so once it has reached its size this costs no
-		// allocation at all.
+		// copied the entire history - up to 256 strings and their allocations - to throw all but three away, on
+		// every cook. The scratch vector is reused, so once it has reached its size this costs no allocation.
 		myLog.snapshotTail(kTailPlanLogLines, myPopupTail);
 		for (size_t i = 0; i < myPopupTail.size(); ++i) {
-			if (text.size() + myPopupTail[i].size() + 1 > kMaxPopupChars) break;
-			text += myPopupTail[i] + "\n";
+			add(FFTDSP::clipLine(myPopupTail[i], kMaxTailLineChars) + "\n");
 		}
 	} catch (const std::exception& e) {
-		text += std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n";
+		add(std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n");
 	} catch (...) {
-		text += "(telemetry truncated after the identity block: unknown exception)\n";
+		add("(telemetry truncated after the identity block: unknown exception)\n");
 	}
 
 	// ONE setString per call, at the end, reached on every path including both catches above. The
@@ -1016,12 +1038,12 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	// popup. It cannot come up empty because the callback ran and threw - only because TouchDesigner never
 	// called it, which myInfoPopupCalls answers separately.
 	info->setString(text.c_str());
-	// The length actually handed over, for the announcement below and the Info DAT row. It is recorded
-	// because a destination with a fixed capacity that is given more than it holds looks exactly like a
-	// popup that was never filled, and every measurement of that failure so far has been blind to the one
-	// number that would confirm it: a blank popup alongside a length that has grown past its previous
-	// values says the text outgrew something, while a blank popup alongside an ordinary length says the
-	// text is not the problem.
+	// The length actually handed over, reported through the info_callback_calls Info DAT row. It used to be a
+	// variable - the tail could add up to ~700 characters depending on which plan events were last - and that
+	// made it worthless as a signal: a blank popup alongside any length in that range said nothing. It is a
+	// constant now (the body is fixed and every tail line is clipped), so the reading is unambiguous: an
+	// ordinary length beside a blank popup means a real, well-formed string was handed over and not rendered,
+	// while a frozen call count means the callback never ran at all.
 	myInfoPopupLen.store(static_cast<uint32_t>(text.size()), std::memory_order_relaxed);
 
 	// No textport announcement on entry any more. It existed to answer one question - "is TouchDesigner

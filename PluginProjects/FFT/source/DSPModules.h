@@ -212,6 +212,22 @@ resolved once from the python DLL already loaded in the TouchDesigner process.
 */
 constexpr size_t kMaxPlanLogEntries = 256;
 
+// Clips one plan-log line to at most maxChars characters, appending "..." to mark that it was trimmed.
+//
+// It exists for the middle-click popup, which is the only surface in this plugin whose *rendering* has been
+// observed to depend on the length of what it is given (~1660 characters rendered, ~1760 came up empty; no
+// cap is documented on OP_String::setString). A backend description embeds the absolute path of the FFT
+// library and runs to ~240 characters, so three of them made the popup's total length move by hundreds of
+// characters between one cook and the next - a length-dependent failure that reads as a random one. Clipping
+// here is what makes that length a constant.
+//
+// Only the popup clips. The Info DAT's plan_log_* rows and the textport carry the line whole, because neither
+// is a fixed-size surface and a clipped log line read as the log would be worse than a long popup.
+inline std::string clipLine(const std::string& s, size_t maxChars)
+{
+    return s.size() <= maxChars ? s : s.substr(0, maxChars) + "...";
+}
+
 #ifdef _WIN32
 namespace python_logger {
 

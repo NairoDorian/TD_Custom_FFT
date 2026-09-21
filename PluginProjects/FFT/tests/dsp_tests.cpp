@@ -657,6 +657,63 @@ static void test_plan_log_tail()
 }
 
 // ------------------------------------------------------------------------------------------
+// clipLine: the popup's per-line bound.
+//
+// The middle-click popup is the one surface whose rendering has been observed to depend on the
+// length of what it is given (~1660 characters rendered, ~1760 came up empty), and a backend
+// description - which embeds the absolute path of the FFT library - runs to ~240 characters. Three
+// of those made the popup's total length move by hundreds of characters from cook to cook, which is
+// what made a length-dependent failure look like a random one. So the contract worth asserting is
+// not only that a long line is shortened but that a short one is handed through *byte for byte*:
+// the clipped text is what a user reads, and silently altering a line that already fits would be a
+// worse bug than a long popup.
+// ------------------------------------------------------------------------------------------
+static void test_clip_line()
+{
+    section("clipLine (popup tail bound)");
+
+    // Fits exactly: unchanged, and no marker added.
+    const std::string exact(72, 'x');
+    CHECK(FFTDSP::clipLine(exact, 72) == exact);
+    CHECK(FFTDSP::clipLine(exact, 72).size() == 72);
+
+    // Shorter than the bound: unchanged.
+    CHECK(FFTDSP::clipLine("short", 72) == "short");
+    CHECK(FFTDSP::clipLine("", 72).empty());
+
+    // One over the bound: trimmed to exactly the bound, then marked.
+    const std::string over(73, 'y');
+    const std::string cut = FFTDSP::clipLine(over, 72);
+    CHECK(cut.size() == 72 + 3);
+    CHECK(cut.compare(0, 72, std::string(72, 'y')) == 0);
+    CHECK(cut.substr(72) == "...");
+
+    // The real shape of the input: a backend description, 240 characters, whose head is what
+    // identifies the library. Whatever comes back must start with that head.
+    const std::string plan =
+        "fftw-3.3.11-sse2-avx-avx2-avx2_128 [C:\\Users\\Z\\Downloads\\PROJECTS\\TD_PROJECTS\\"
+        "PluginBuilder\\Plugin_FFT\\__Plugins__\\FFT\\libfftw3f-3.3.11-avx2.dll, wisdom on] - plan "
+        "kernels: AVX2 (256-bit vectors, FMA-capable codelets)";
+    CHECK(plan.size() > 200);
+    const std::string clipped = FFTDSP::clipLine(plan, 72);
+    CHECK(clipped.size() == 75);
+    CHECK(clipped.compare(0, 72, plan.substr(0, 72)) == 0);
+    CHECK(clipped.compare(0, 12, "fftw-3.3.11-") == 0);
+    // The path is no longer in the popup's view of the line - which is the point: the same path is on
+    // the Binary: line, and it is what made this line's length unbounded.
+    CHECK(clipped.find("__Plugins__") == std::string::npos);
+
+    // maxChars == 0 is degenerate but must not read past the string or return the whole thing.
+    CHECK(FFTDSP::clipLine("abc", 0) == "...");
+
+    // Three real lines at the real bound: the popup's tail contribution is now a constant, which is
+    // what makes the character count in the info_callback_calls row comparable between cooks.
+    size_t total = 0;
+    for (int i = 0; i < 3; ++i) total += FFTDSP::clipLine(plan, 72).size() + 1;
+    CHECK(total == 3 * 76);
+}
+
+// ------------------------------------------------------------------------------------------
 static void test_triple_buffer_and_signal()
 {
     section("TripleBuffer / WorkerSignal (v2.4 lock-free handoff)");
@@ -1107,6 +1164,7 @@ int main()
     test_eq_streaming();
     test_v23_helpers();
     test_plan_log_tail();
+    test_clip_line();
     test_triple_buffer_and_signal();
     test_background_plan();
     test_backend_selection();

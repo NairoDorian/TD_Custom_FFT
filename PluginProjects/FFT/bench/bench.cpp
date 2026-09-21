@@ -75,6 +75,12 @@ static void infoPathBench(int cooks)
     // Mirrors FFT.cpp's kTailPlanLogLines, which the popup renders. It is file-local there (the DAT
     // rows and this bench are the only other things that read the log), so it is repeated here.
     const size_t kTail = 3;
+    // ...and its kMaxTailLineChars, the width each of those lines is clipped to. The clip is mirrored
+    // because it is the one part of the "after" path that the "before" path did not pay for at all: the
+    // popup now truncates every rendered line rather than handing over a 240-character backend
+    // description whole. It is a copy of at most 72 characters per line, so it must not be allowed to
+    // hide inside the -99 % this prints - if it ever does, the number below will say so.
+    const size_t kTailLineChars = 72;
 
     PlanLog log;
     for (size_t i = 0; i < kMaxPlanLogEntries; ++i)
@@ -125,7 +131,7 @@ static void infoPathBench(int cooks)
         if (logVer != datVersion) { datRows = log.snapshot(); datVersion = logVer; }
         for (const auto& r : datRows) acc += r.size();
         log.snapshotTail(kTail, tail);
-        for (const auto& r : tail) acc += r.size();
+        for (const auto& r : tail) acc += clipLine(r, kTailLineChars).size();
         sink = acc;
     }
     const double us_new = std::chrono::duration<double, std::micro>(clk::now() - t1).count() / cooks;
