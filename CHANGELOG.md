@@ -4,6 +4,77 @@ All notable changes to `Plugin_FFT` are documented here.
 
 ---
 
+## [v2.9.0] - 2026-09-21 — two FFT libraries in one node, and an Async toggle that really means one thread
+
+### Added
+- **`FFT Backend` (Performance page): the node plans and transforms with either the vendored FFTW3 build or
+  Intel oneMKL's FFTW3 interface, switched at run time.** Neither library is *linked*: FFTW3 and oneMKL export
+  the identical `fftwf_*` symbol set, so a link would freeze the choice at build time and make a runtime toggle
+  impossible. `source/FftBackend.h` resolves the selected library with `LoadLibraryEx` + `GetProcAddress` and the
+  engine calls through that function-pointer table; `dumpbin /dependents FFT.dll` shows no FFT library among its
+  imports, which is the check that this is really dynamic. The registry is a pair of `constexpr` descriptors
+  indexed by the parameter's menu value, and four `static_assert`s in `Parameters.cpp` (count, menu values,
+  wisdom support, unpinned MKL version) make a third library a compile error everywhere it has to be added rather
+  than a silent mismatch. A selected-but-missing library logs its reason at error level and falls back to the
+  vendored FFTW3 for that node - it never leaves the node without a plan. The Info DAT row `fft_backend` and the
+  plan log name the library, its path and the version it reports, so there is never a doubt about which one ran.
+  Retires the `FFTW_DLL` / `__declspec(dllimport)` trap as a side effect: with `GetProcAddress`, the data symbols
+  `fftwf_version` and `fftwf_cc` resolve to the real arrays instead of to an import-library jump thunk.
+- **Intel oneMKL support, measured on the real library.** `mkl_rt.3.dll` (oneMKL 2026.1.0) exports 95 `fftwf_*`
+  symbols directly, so the wrapper library from Intel's "Building the FFTW3 interface" notes is not needed - that
+  was verified on the binary, not taken from the documentation. On the development machine (i9-13900H, AVX2, no
+  AVX-512), same binary, N = 16384, only the library differing, four paired runs: **oneMKL is 13-34 % faster on
+  the fft+mag stage** (8.85 µs vs 11.94 µs in the first pair), winning every pair. Two deliberate decisions came
+  out of that work: `MKL_Set_Threading_Layer(MKL_THREADING_SEQUENTIAL)` is called the moment the library loads,
+  because oneMKL otherwise pulls its Intel OpenMP layer (`libiomp5md.dll`) into a process where TouchDesigner has
+  already loaded its own copy - the documented *"Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll
+  already initialized"* abort - and because the ISSL forbids modifying the DLLs, choosing a layer at load is the
+  only fix a plugin has; and the planner policy and wisdom cache are reported as **inapplicable** rather than
+  silently ignored, since oneMKL accepts `FFTW_MEASURE` / `PATIENT` / `WISDOM_ONLY` and does nothing with them
+  (measured: no wisdom file is created, the calls return 0). The library is not redistributed with the project.
+- **`Async` off is now a real single-thread contract.** The background `FFTW_MEASURE` / `FFTW_PATIENT` upgrade was
+  the one piece of work that still ran off the cook thread with the worker disabled. `IFFTEngine::setBackgroundAllowed`
+  is handed the toggle every cook, before the engine is polled; with Async off the upgrade is not started, the plan
+  status says `FFTW_ESTIMATE (measured upgrade deferred: Async is off)` instead of promising an upgrade that is not
+  coming, and the engine remembers it is owed one - so flipping Async back on starts the measurement then rather
+  than stranding the node on ESTIMATE forever (`prepare()`'s early-out would otherwise never re-plan).
+  `dsp_tests` asserts both halves: no background thread over 20 cooks with Async off, then the upgrade arriving
+  after it is re-enabled.
+
+### Changed
+- **The vendored FFTW is now 3.3.11, built for AVX2 + FMA, and every file carries the version and SIMD level in
+  its name** (`libfftw3f-3.3.11-avx2.dll` / `.lib` / `.exp` / `.pdb`, `fftw3-3.3.11-avx2.h`, `VERSION`).
+  Two FFTW builds that differ only in SIMD produce identical results and identical `fftwf_version` prefixes, so
+  the file name is the only thing on disk that says which one is in play - and the plugin's plan line reports the
+  version the library actually returns, with a `** MISMATCH` warning when it is not the pinned one (it caught the
+  3.3.10-class DLL still staged in `__Plugins__/FFT` during this work). There is no official AVX2 Windows binary
+  from fftw.org - its prebuilt DLLs are 3.3.5/SSE2 - so the DLL is built from source, and the record (source URL,
+  tarball MD5, DLL SHA-256, build flags, the one upstream patch) lives in `3rdParty/fftw3/VERSION`. That patch is
+  needed because upstream's contributed `CMakeLists.txt` still says `set (FFTW_VERSION 3.3.10)` in the 3.3.11
+  tarball; that value becomes `PACKAGE_VERSION`, which is what `fftwf_version` returns *and* the version header
+  FFTW stamps into wisdom files, so an unpatched build self-reports 3.3.10 forever.
+- **`fft_bench --backend fftw3|mkl`** (names, not indices) and a `backend live:` line naming the library, path and
+  version - the attribution line for every number the bench prints.
+- **Both binaries set stdout unbuffered.** Piped MSVC stdout is block-buffered and a crash does not flush it, so a
+  crash used to swallow every line printed before it and look like a run that produced nothing. `fft_tests` and
+  `fft_bench` now lose nothing, and the last line printed is the crash site. This was added after exactly that
+  happened: a `STATUS_HEAP_CORRUPTION` abort with zero output that a clean rebuild then did not reproduce.
+- Tests: **547 checks** (was 493) - backend selection producing the same transform to float precision on both
+  libraries and surviving six switches in one engine, the OpenMP check, and the Async single-thread contract.
+
+### Notes
+- `fftwf_cleanup` and `fftwf_forget_wisdom` are deliberately **not** in the resolved API table. They free
+  process-global state - every plan and every cached trigonometric table - so there is no such thing as cleaning
+  up one node's FFTW state in a host that can hold several FFT CHOPs.
+- FFTW's planner is serialised under one process-wide mutex, on both the cook thread and the background
+  measurement thread, including `destroy_plan` and the wisdom import/export. That is FFTW's own recommended
+  pattern: the manual states `fftw_execute` (and the new-array variants) are the only thread-safe routines and
+  that everything else "should only be called from one thread at a time" because planner calls share wisdom and
+  trigonometric tables. `fftwf_make_planner_thread_safe` is not used - the manual calls it "the worst of all
+  worlds" and the engine's own lock already does its job with the project's priority ordering.
+
+---
+
 ## [v2.8.1] - 2026-09-14
 
 ### Changed

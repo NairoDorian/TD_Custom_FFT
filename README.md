@@ -13,9 +13,14 @@ standalone with CMake + Ninja and ships headless tests and a per-stage benchmark
 
 ## Features
 
-- **FFTW3 R2C engine** with a selectable planner policy (`Auto` / `Fast` / `Measured` / `Patient`) and **wisdom caching**
+- **FFTW3 R2C engine**, vendored as **3.3.11 built with AVX2 + FMA** (see `3rdParty/fftw3/VERSION`), with a
+  selectable planner policy (`Auto` / `Fast` / `Measured` / `Patient`) and **wisdom caching**
   (`%LOCALAPPDATA%\TD_Custom_FFT\fftwf_wisdom.txt`): measured plans are ~40 % faster than estimated ones and
   only cost time the first time a size is used on the machine.
+- **Two FFT libraries, one node, switchable at run time**: the vendored FFTW3 build or **Intel oneMKL's FFTW3
+  interface** (Performance page, `FFT Backend`). Neither is linked — both export the same `fftwf_*` symbols, so
+  the plugin resolves whichever is selected with `LoadLibraryEx` + `GetProcAddress` and calls through that table.
+  oneMKL is not redistributed here; see [Using Intel oneMKL instead](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 - **AVX2 / FMA** everywhere it pays: windowing, magnitude (rsqrt + Newton step, 2.2e-7 rel. error),
   warp interpolation (`vgatherdps`), weighting, single-gather 2048-entry LUT `20·log10` (0.002 dB error), ballistics, peak search.
 - **Psychoacoustic scales**: Logarithmic, Mel, ERB, Bark, Chroma, Linear, Mel+Log blend, with a `Warp Blend`
@@ -43,12 +48,13 @@ PluginProjects/FFT/
 ├── plugin.json           <-- manifest read by PluginBuilder (family, optype, deps)
 ├── source/
 │   ├── DSPModules.h      <-- TouchDesigner-independent DSP (FIFO, EQ, window, warp, weighting, dB, ballistics, FFTW engine)
+│   ├── FftBackend.h      <-- FFT library registry + runtime loader (FFTW3 / oneMKL, no import library)
 │   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, per-channel pipeline, telemetry)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook)
-├── tests/dsp_tests.cpp   <-- headless golden-vector tests (432 checks, incl. lock-free handoff stress)
-├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N)
+├── tests/dsp_tests.cpp   <-- headless golden-vector tests (547 checks, incl. lock-free handoff stress)
+├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --backend fftw3|mkl)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
-└── 3rdParty/fftw3/       <-- vendored libfftw3f-3 (header, .def/.lib, runtime DLL)
+└── 3rdParty/fftw3/       <-- vendored FFTW 3.3.11 AVX2 (VERSION record, header, .def/.lib, runtime DLL)
 ```
 
 ## Building
@@ -68,7 +74,8 @@ build\bin\Release\fft_bench.exe --channels 8        # per-stage timings
 build\bin\Release\fft_bench.exe --channels 1 --db 0 --weight 0 --ball 0 --cook 300   # cook-thread cost (async / inline)
 ```
 `PLUGIN_BUILDER_DIR` defaults to the sibling `../../../PluginBuilder_V2`; pass `-DPLUGIN_BUILDER_DIR=` otherwise.
-A standalone build deploys `FFT.dll` + `libfftw3f-3.dll` into `__Plugins__/FFT/` (rename-in-place).
+A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
+The oneMKL DLLs are never deployed by the build: they are the user's to install, and the plugin only looks for them.
 
 Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.21, Ninja, a CPU with AVX2 + FMA.
 
@@ -103,11 +110,15 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Loudness & Ballistics | Attack / Release Speed | Float | 0 / 0 | per-frame coefficients 0…0.99 |
 | Loudness & Ballistics | Attack / Release ms | Float | 50 / 200 | used when mode = Milliseconds |
 | Loudness & Ballistics | Reset | Pulse | | clears ballistics, AGC and EQ state |
-| Performance | Async Analysis | Toggle | **On** | FFT & post-processing on a worker thread; the cook only ingests and copies (≈ 11 µs at 16384 bins, 7 µs at 4096, measured). Off = inline |
+| Performance | Async Analysis | Toggle | **On** | FFT & post-processing on a worker thread; the cook only ingests and copies (≈ 11 µs at 16384 bins, 7 µs at 4096, measured). Off = inline, and **one thread for the whole node**: no worker, and no background plan measurement either |
+| Performance | FFT Backend | Toggle | **Off** | Off = the vendored FFTW3 3.3.11 AVX2 build. On = Intel oneMKL's FFTW3 interface (`mkl_rt.3.dll`), which is 13–34 % faster on this CPU but has to be installed by the user. Missing DLL = logs and falls back to FFTW3, never a planless node. A toggle rather than a menu because there are two libraries; the registry in `FftBackend.h` and the `static_assert`s in `Parameters.cpp` are what a third would extend |
 
 Defaults (Coherent Gain, Frame Peak, Samples, Coefficient; EQ and Ballistics **off**) reproduce the spectrum of the
 early builds, in which the EQ was inactive. Every optional section is bypassed entirely — code *and* parameter
-reads — when disabled: 18 `getPar*` calls per cook in the default configuration instead of 30. Every parameter is
+reads — when disabled: `eval()` reads **20** parameters per cook in the default configuration, against **33** with
+every optional section on (EQ, dB, weighting, ballistics). The count is not an estimate: `eval()` increments it and
+hands it back, and it is reported live as the Info CHOP channel `param_reads`, so the number in this paragraph can
+be checked against a running node. Every parameter is
 read on every cook, so a change takes effect on the next frame.
 
 ## How the resampling works
@@ -180,7 +191,15 @@ how many `Output Bins` you chose: resampling changes how a band is described, no
 `getInfoPopupString` (middle-click the node) prints all of them, plus the cook delta the throughput
 was measured over.
 
-## Performance (fft_bench, i7-class desktop, 1 channel, N = 32768, 16384 bins, Log)
+## Performance (fft_bench, 1 channel, N = 32768, 16384 bins, Log)
+
+**Which machine a row came from matters more than the row does**, so each block names one. Absolute times on a
+laptop move with thermals and with the plan that is live; the direction of a comparison is the durable part.
+
+The table below is the historical record from the original development run ("i7-class desktop", earlier commits,
+plans as built then). It is kept because the *ratios* between configurations are what the parameters are tuned
+against, and because the history paragraph after it refers to it. It is **not** comparable to the i9 numbers
+that follow it.
 
 | Configuration | FFT+mag | warp | EQ | dB | total / channel |
 |---|---|---|---|---|---|
@@ -191,6 +210,34 @@ was measured over.
 | N = 16384 + **Warp Interpolation = Cubic** (visually equivalent to 32K linear) | 15–16 µs | 9 µs | – | – | **24–27 µs** |
 | N = 8192 | 6.4 µs | 4.7 µs | – | – | **~15 µs** |
 | **Async on** (default): cost on the cook thread, any N, measured with `fft_bench --cook` (caches evicted between cooks) | – | – | – | – | **≈ 11 µs mean / 17 µs p99** at 16384 bins, **≈ 7 µs** at 4096 bins (ingest 2 + snapshot 2 + result copy 2–7; DSP runs on the worker) |
+
+Re-measured on the development machine — **i9-13900H** (6 core / 12 thread Raptor Lake, AVX2 + FMA, no AVX-512),
+FFTW3 3.3.11 AVX2 with a `FFTW_MEASURE` plan from wisdom, same 300-iteration `fft_bench` invocation:
+
+| Configuration | FFT+mag | warp | dB | ballistics | total / channel |
+|---|---|---|---|---|---|
+| Default TD config, measured plan from wisdom | 22.45 µs | 4.66 µs | – | – | **28.96 µs** |
+| Everything on (dB + A-weighting + ballistics; EQ unchanged) | 23.57 µs | 4.74 µs | 3.53 µs | 1.29 µs | **39.45 µs** |
+
+Two honest notes on that block. First, `+ EQ Enable` re-measured at **0.01 µs**, i.e. it does not reproduce the
+historical "+4 µs EQ" row on this machine — treat the EQ as free at the default shelf settings until a run says
+otherwise. Second, the historical default row is 44–51 µs against this machine's 28.96 µs, but the two ran on
+different builds, plans and CPUs, so that is **not** a speed-up claim; the controlled comparisons are the
+library A/B below and the `--cook` Async numbers, which hold everything but the variable under test constant.
+
+### Which FFT library is faster: FFTW3 vs Intel oneMKL
+
+Same binary, same bench invocation, only the library differing (`--backend fftw3` vs `--backend mkl`), N = 16384,
+16384 bins, i9-13900H:
+
+| library | fft+mag | total per cook |
+|---|---|---|
+| FFTW3 3.3.11 AVX2, `FFTW_MEASURE` plan from wisdom | 11.94 µs | 21.06 µs |
+| Intel oneMKL 2026.1.0 | 8.85 µs | 17.63 µs |
+
+Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** every time. That is the measured
+reason the `FFT Backend` toggle exists; the deployment notes, the OpenMP hazard it avoids and the list of DLLs
+it needs are in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 
 The FFT is 75–85 % of the default cost; `Zero-Pad Len` is the lever that matters. History (same bench on every commit):
 the July builds measured 47 µs (measured plan, EQ dead), `d60b7e3` turned the EQ on (+16 µs), `2daf9f1` switched to
@@ -218,7 +265,24 @@ channel loop under `std::execution::par` (see below). Run the probe on your own 
 
 **Where the threading actually is: not in this node.** This node is one mono channel per instance. Several
 channels means several node instances, each with its own `FFT Custom CHOP analysis` worker — that is what spreads
-across cores, and it needs no parameter. `Performance` has one control, `Async`.
+across cores, and it needs no parameter. `Performance` has two controls: `Async`, and `FFT Backend` (which library,
+not how many threads).
+
+**`Async` off really does mean one thread for the whole node.** No worker is started, and the background plan
+measurement — the only other thing that would run off the cook thread — is not started either: `prepare()` leaves
+the node on `FFTW_ESTIMATE`, says so in the plan line ("measured upgrade deferred: Async is off") instead of
+promising an upgrade, and remembers that it is owed one, so turning `Async` back on starts the measurement then
+rather than leaving the node on ESTIMATE forever. `fft_tests` asserts both halves (no background thread over 20
+cooks with Async off, and the upgrade arriving after it is turned back on).
+
+**FFTW's planner is serialised, on purpose.** The manual is explicit that `fftwf_execute` (and the new-array
+variants) are the *only* thread-safe routines and that everything else — the planner — "should only be called from
+one thread at a time", because planner calls share wisdom and trigonometric tables. So the engine holds one
+process-wide mutex around every planner call, on both threads: the cook thread's `prepare()` and the background
+measurement take the same lock, as do every `destroy_plan` and the wisdom import/export. That is FFTW's own
+recommended pattern (a semaphore around planner calls) and it is what makes the Async worker and the background
+planner legal at all. `fftwf_make_planner_thread_safe` is deliberately not used: the manual calls it "the worst of
+all worlds" and our mutex already does its job with our own priority ordering.
 
 The internal channel loop does run under `std::execution::par` when a job has more than one channel, with no knob
 either way: each channel owns its `DspState` (padded frame, magnitude, scratch, ballistics history) and the only
@@ -228,5 +292,15 @@ channels: **38 % / 65 % / 76 % faster** than serial, outputs identical bin for b
 
 ## License / third party
 
-FFTW3 is GPL. `FFT.dll` links `libfftw3f-3.dll`; distributing the plugin therefore falls under the GPL unless the
-FFT backend is swapped (the `IFFTEngine` interface exists for that purpose — e.g. pffft/KissFFT (BSD) or oneMKL).
+**FFTW3 is GPL.** The build vendors FFTW 3.3.11 (single precision, AVX2) as `libfftw3f-3.3.11-avx2.dll` and ships
+it beside `FFT.dll`; distributing the plugin therefore falls under the GPL. `3rdParty/fftw3/VERSION` records the
+source URL, the MD5 of the tarball, the SHA-256 of the built DLL, and the one upstream patch (upstream's CMake
+build still stamps 3.3.10). If GPL is a problem for a project, the FFT backend is a swap: the `IFFTEngine`
+interface and the registry in `FftBackend.h` exist for that.
+
+**Intel oneMKL is not distributed with this project.** It is under the Intel Simplified Software License —
+redistribution allowed, no royalty, but the DLLs may not be modified or renamed and the license notices have to
+ship with them, which is the user's call and not a build script's. The `FFT Backend` toggle loads it from wherever
+the user installs it; if it is not there the node logs which file it looked for and uses FFTW3. This is also why
+neither library is *linked*: both export the same `fftwf_*` symbols, so a link would freeze the choice at build
+time and make the toggle impossible.

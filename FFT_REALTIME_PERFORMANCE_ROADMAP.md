@@ -121,12 +121,21 @@ linear interpolation on N = 32768, at a third of the total cost. Keep `Zero-Pad 
 #### 1.8 FFT library options
 | option | expected FFT stage | notes |
 |---|---|---|
-| FFTW 3.3.5 dll64 (current), measured plan | 36 µs | MinGW build, **no AVX2/FMA codelets** |
+| FFTW 3.3.5 dll64 (the option at the time of writing), measured plan | 36 µs | fftw.org's prebuilt Windows DLL: SSE2 only, **no AVX2/FMA codelets** |
 | FFTW 3.3.10 built with `-DENABLE_AVX2=ON` (vcpkg `fftw3[avx2]`) | *≈ 28–32 µs* | same API, GPL |
 | pffft (BSD, single header, AVX-capable fork) | *≈ 30–38 µs* | no DLL to ship, no GPL |
 | Intel IPP `ippsFFTFwd_RToCCS_32f` / oneMKL DFTI | *≈ 20–28 µs* | fastest on Intel; ~30 MB redistributable |
 | `fftwf_plan_many_dft_r2c` (all channels in one call) | −1 µs / channel | batched execution, better cache use |
 | `FFTW_PATIENT` via wisdom (background, once, ~3 s) | −2–5 % | free after 1.1's background planner |
+
+**Resolved since (v2.9.0).** The first two rows are one decision now: the project vendors **FFTW 3.3.11
+built with AVX2 + FMA** (there is no official AVX2 Windows binary from fftw.org, so it is built from
+source — see `3rdParty/fftw3/VERSION`), and the Intel row is the `FFT Backend` toggle, which loads
+**oneMKL 2026.1.0** instead. Measured on the development machine at N = 16384, same binary, only the
+library differing: FFTW3 3.3.11 AVX2 **11.94 µs** vs oneMKL **8.85 µs** on fft+mag, oneMKL ahead in
+every one of four paired runs (13–34 %). The rewrite this table was planning for was therefore not
+needed to get the Intel kernels: `mkl_rt.3.dll` exports the FFTW3 interface directly, so the plugin
+resolves it through the same function-pointer table with no wrapper library and no second code path.
 
 #### 1.9 Magnitude only where it is needed
 *Expected: 3 µs → 2 µs when Display Max < Nyquist.* `computeMagnitude` runs over all N/2+1 bins; the warp only reads
