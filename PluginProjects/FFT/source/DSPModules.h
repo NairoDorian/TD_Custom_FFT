@@ -66,7 +66,8 @@ not a performance change.
 #endif
 #include <condition_variable>
 
-#include <fftw3.h>     // FFTW3 Fast Fourier Transform Library (Single Precision: fftwf_*)
+#include <fftw3.h>         // FFTW3 types only (fftwf_plan, fftwf_complex); nothing is linked here
+#include "FftBackend.h"    // which FFT library is loaded, how it is chosen, and how it reports itself
 
 /*
 ===========================================================================
@@ -1278,7 +1279,11 @@ enum class PlannerPolicy : int {
 class IFFTEngine {
 public:
     virtual ~IFFTEngine() = default;
-    virtual void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) = 0;
+    // backend: which FFTW3-ABI library to plan against (see FftBackend.h). nullptr keeps whatever
+    // backend is already selected, or the default when there is none. The library is loaded on first
+    // use and kept for the process lifetime, so switching back and forth only re-plans.
+    virtual void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log,
+                         const FftBackendInfo* backend = nullptr) = 0;
     // n_mag: how many magnitude bins the caller will read (0 = all N/2+1). It is a lower bound on
     // what gets written, not an exact count: the AVX2 kernel works in 16-bin blocks, so an
     // implementation is free to produce up to 15 bins more than asked (see the FFTW override). The
@@ -1292,6 +1297,15 @@ public:
     virtual bool hasPlan() const noexcept = 0;
     // Called once per cook on the cooking thread; returns true if a better plan was swapped in.
     virtual bool pollBackgroundPlan() { return false; }
+    // Whether this engine may start a background planner thread. The node's Async toggle is the only
+    // caller: with Async off the node must stay single-threaded (the whole point of the toggle), so
+    // the deferred MEASURE/PATIENT upgrade is not started while it is off. Called once per cook
+    // *before* pollBackgroundPlan(), from the pipeline owner, so it never races with the engine.
+    virtual void setBackgroundAllowed(bool allowed) { (void)allowed; }
+    // One line describing the live FFT library (version, path, wisdom/threads support, and whether it
+    // honours the planner policy). Empty for an engine that does not use an external library. For the
+    // Info DAT, so it is built on demand and never per cook.
+    virtual std::string backendReport() const { return std::string(); }
 };
 
 // |X| for n_complex interleaved complex floats (raw_c and mptr 32-byte aligned).
@@ -1343,12 +1357,21 @@ inline void computeMagnitudeAVX2_FMA(const float* __restrict raw_c, float* __res
 
 /*
 ===========================================================================
- 9. FFTW3 ENGINE (single precision, wisdom-cached plans)
+ 9. FFT ENGINE (FFTW3 ABI, backend chosen at runtime, wisdom-cached plans)
 ===========================================================================
-Wisdom is imported once per process from %LOCALAPPDATA%/TD_Custom_FFT/fftwf_wisdom.txt and
-exported after every MEASURE plan, so measured plans cost time only the first time a size
-is used on this machine. The FFTW planner is not thread-safe: prepare() is guarded by a
-process-wide mutex; fftwf_execute_dft_r2c on distinct arrays is thread-safe.
+The transform is computed by whichever FFTW3-ABI library the node selects - the vendored FFTW3
+build or Intel oneMKL's FFTW3 interface (see FftBackend.h). Nothing here is linked against either:
+the entry points are resolved once and called through the backend table, which is what lets the
+choice be a parameter rather than a build decision.
+
+Wisdom is FFTW3-specific. When the active backend supports it, it is imported once per process from
+%LOCALAPPDATA%/TD_Custom_FFT/fftwf_wisdom.txt and exported after every MEASURE plan, so measured
+plans cost time only the first time a size is used on this machine. A backend that reports no wisdom
+support is described as such in the log instead of quietly re-planning every run.
+
+The FFTW planner is not thread-safe: every call that creates or destroys a plan is guarded by a
+process-wide mutex, which also covers a second FFT CHOP in the same project. Executing a plan on
+distinct arrays is thread-safe and is not guarded.
 */
 class FFTWEngine : public IFFTEngine {
 public:
@@ -1381,38 +1404,86 @@ public:
 #endif
     }
 
-    static bool importWisdomOnce(PlanLog* log) {
-        static std::once_flag once;
-        static bool ok = false;
-        std::call_once(once, [log] {
-            std::string path = wisdomPath();
+    // Wisdom is per library, so the file has to be too. A wisdom file carries a header naming the
+    // library and version that wrote it, and FFTW refuses one that does not match - so sharing a
+    // single file between two backends would either be rejected on read or, on write, replace one
+    // library's measured plans with the other's. The FFTW3 name is left as it was so existing
+    // wisdom files keep being found; the others get the backend id appended.
+    static std::string wisdomPathFor(const FftBackendInfo& info) {
+        std::string base = wisdomPath();
+        if (base.empty() || &info == &defaultBackend()) return base;
+        const size_t dot = base.find_last_of('.');
+        const std::string tag = std::string("_") + info.id;
+        return (dot == std::string::npos) ? (base + tag) : (base.substr(0, dot) + tag + base.substr(dot));
+    }
+
+    // Wisdom is a property of the library, not of this node, so the import runs once per process per
+    // backend even when several FFT CHOPs each build their own engine. Per backend and not once
+    // globally: the two libraries keep separate planner state and separate wisdom files, so a single
+    // process-wide latch would let whichever backend went first suppress the other's import. Only
+    // meaningful for a backend that reports wisdom support; oneMKL accepts the calls but has nothing
+    // to save, and says so through hasWisdom().
+    bool importWisdomOnce(const FftApi& api, PlanLog* log) {
+        static std::once_flag once[kMaxBackends];
+        static bool ok[kMaxBackends] = {};
+        const FftBackendInfo& info = m_backend.info ? *m_backend.info : defaultBackend();
+        // Two separate reasons not to import, and only one of them is "it failed".
+        if (!api.hasWisdom()) return false;
+        // oneMKL exports the wisdom functions and ignores them: verified on the real mkl_rt.3.dll
+        // (both symbols are in the export table) and documented by Intel, which lists the wisdom
+        // save/load functions as "empty". Calling one returns 0 without creating or reading a file,
+        // so importing would only produce a misleading "wisdom not found at <path>" once per
+        // process - and, worse, would invite the reader to go create that file. Say what is true
+        // instead, once.
+        if (!info.honoursPolicy) {
+            const int slot = backendIndex(info);
+            std::call_once(once[slot], [this, log, &info] {
+                if (log) log->log(std::string("[FFT Plugin] [") + info.logTag +
+                                  "] this library has no wisdom cache: the FFTW wisdom functions are "
+                                  "accepted and ignored, so there is nothing to import or export");
+            });
+            return false;
+        }
+        const int slot = backendIndex(info);
+        std::call_once(once[slot], [this, &api, log, slot, &info] {
+            std::string path = wisdomPathFor(info);
             if (path.empty()) return;
             {
                 std::lock_guard<std::mutex> lock(plannerMutex());   // wisdom import touches planner state
-                ok = fftwf_import_wisdom_from_filename(path.c_str()) != 0;
+                ok[slot] = api.importWisdom(path.c_str()) != 0;
             }
-            if (log) log->log(std::string("[FFT Plugin] [FFTW3] wisdom ") + (ok ? "loaded from " : "not found at ") + path, ok);
+            if (log) log->log(std::string("[FFT Plugin] [").append(tag()) + "] wisdom " + (ok[slot] ? "loaded from " : "not found at ") + path, ok[slot]);
         });
-        return ok;
+        return ok[slot];
     }
 
-    static void exportWisdom() {
-        std::string path = wisdomPath();
-        if (!path.empty()) fftwf_export_wisdom_to_filename(path.c_str());
+    void exportWisdom(const FftApi& api) {
+        if (!api.hasWisdom()) return;
+        std::string path = wisdomPathFor(m_backend.info ? *m_backend.info : defaultBackend());
+        if (!path.empty()) api.exportWisdom(path.c_str());
     }
+
+    // Tag used in every log line this engine writes, so a project with two FFT CHOPs on different
+    // backends can be read apart. Short on purpose: it repeats on every plan message.
+    const char* tag() const { return m_backend.info ? m_backend.info->logTag : "FFT"; }
+
+    std::string backendReport() const override { return describeBackend(m_backend); }
 
     void destroyPlan() noexcept {
         joinBackground();
         if (m_plan) {
             std::lock_guard<std::mutex> lock(plannerMutex());
-            fftwf_destroy_plan(m_plan);
+            if (m_backend.api.destroyPlan)
+                m_backend.api.destroyPlan(m_plan);
             m_plan = nullptr;
         }
         m_fft_size = 0;
-        m_planStatus = "FFTW3 (Uninitialized)";
+        m_planStatus = std::string(tag()) + " (Uninitialized)";
     }
 
-    std::string getPlanStatus() const override { return m_planStatus.empty() ? "FFTW3 (Uninitialized)" : m_planStatus; }
+    std::string getPlanStatus() const override {
+        return m_planStatus.empty() ? (std::string(tag()) + " (Uninitialized)") : m_planStatus;
+    }
     size_t fftSize() const noexcept override { return m_fft_size; }
     // A plan exists iff prepare() produced m_plan. Fast/ESTIMATE policy always does; MEASURE/Patient
     // can fail to create one (rare), in which case the pipeline must surface the failure rather than
@@ -1438,42 +1509,94 @@ public:
                    the planner lock for the rest of that ~2.7 s. What waits is whoever asked next - the
                    patient node itself already has its ESTIMATE plan and keeps cooking through it.
     */
-    void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log) override {
-        // Re-planning is not free even when the size looks unchanged: it destroys the plan under the
+    void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log,
+                 const FftBackendInfo* backend = nullptr) override {
+        const FftBackendInfo* want =
+            backend ? backend : (m_backend.info ? m_backend.info : &defaultBackend());
+
+        // Re-planning is not free even when nothing looks changed: it destroys the plan under the
         // process-wide planner lock, and a synchronous policy then re-measures and re-exports wisdom.
-        // So the early-out compares the policy too, and returns before any of that.
-        if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy) return;
+        // So the early-out compares the policy and the backend too, and returns before any of that.
+        if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy && m_backend.info == want)
+            return;
+
+        // Destroy the outgoing plan with the outgoing library, before switching. A plan belongs to
+        // the library that created it; passing it to the other library's destroy_plan is undefined.
         destroyPlan();
         if (fft_size == 0) return;
+
+        // Selecting a backend costs nothing after the first time: the library is loaded once per
+        // process and cached, so this only re-points at it. Toggling back and forth re-plans, which
+        // is the real cost of a switch, and is why the early-out above compares m_backend.info.
+        if (m_backend.info != want) {
+            const FftBackendInfo* previous = m_backend.info;
+            m_backend = cachedBackend(*want);
+            if (log && previous != m_backend.info) {
+                log->log(std::string("[FFT Plugin] [") + want->logTag + "] backend: " +
+                             (m_backend.loaded() ? (m_backend.name() + std::string(" from ") + m_backend.path)
+                                                 : m_backend.error),
+                         m_backend.loaded());
+            }
+        }
+        // A selected library that is not installed must not leave the node without a plan - the node
+        // would then publish a flat spectrum and look broken rather than misconfigured. Fall back to
+        // the vendored FFTW3 build, which ships beside the plugin, and say so at error level: the
+        // user asked for something this machine does not have.
+        if (!m_backend.loaded() && want != &defaultBackend()) {
+            if (log) {
+                log->log(std::string("[FFT Plugin] [") + want->logTag + "] ERROR: " + m_backend.error);
+                log->log(std::string("[FFT Plugin] [") + want->logTag +
+                         "] falling back to " + defaultBackend().display +
+                         " for this node; install the selected library next to FFT.dll to use it");
+            }
+            want = &defaultBackend();
+            m_backend = cachedBackend(*want);
+        }
+        if (!m_backend.loaded()) {
+            m_planStatus = std::string(want->logTag) + " (no library)";
+            if (log) log->log(std::string("[FFT Plugin] [") + want->logTag + "] ERROR: " + m_backend.error);
+            return;
+        }
+        const FftApi& api = m_backend.api;
         m_fft_size = fft_size;
         m_policy = policy;
         m_log = log;
 
-        importWisdomOnce(log);
+        importWisdomOnce(api, log);
 
         auto t0 = std::chrono::high_resolution_clock::now();
         const char* used = "FFTW_ESTIMATE";
         bool start_background = false;
         unsigned bg_rigor = FFTW_MEASURE;
+        // Reset with the plan it describes: a plan built from wisdom needs no upgrade, and leaving a
+        // stale true here would let setBackgroundAllowed() re-arm a measurement for a plan that is
+        // already the measured one.
+        m_wants_upgrade = false;
         {
             std::lock_guard<std::mutex> lock(plannerMutex());
-            Buffers b(fft_size);
-            if (!b.ok()) { m_planStatus = "FFTW3 (allocation failed)"; return; }
-            switch (policy) {
+            Buffers b(api, fft_size);
+            if (!b.ok()) { m_planStatus = std::string(tag()) + " (allocation failed)"; return; }
+            if (!want->honoursPolicy) {
+                // The library plans by its own rules and ignores FFTW's rigour flags, so there is no
+                // wisdom lookup, no background measurement, and no claim in the status that a policy
+                // was applied. The flag is still passed because it is part of the call signature.
+                m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                used = "library default plan (FFT planner policy does not apply)";
+            } else switch (policy) {
                 case PlannerPolicy::Measured:
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE);
+                    m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE);
                     used = "FFTW_MEASURE";
-                    if (m_plan) exportWisdom();
+                    if (m_plan) exportWisdom(api);
                     break;
                 case PlannerPolicy::Fast:
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                    m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
                     break;
                 case PlannerPolicy::Patient:
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_PATIENT | FFTW_WISDOM_ONLY);
+                    m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_PATIENT | FFTW_WISDOM_ONLY);
                     if (m_plan) {
                         used = "FFTW_PATIENT (from wisdom)";
                     } else {
-                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                        m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
                         used = "FFTW_ESTIMATE (patient measure in background)";
                         start_background = true;
                         bg_rigor = FFTW_PATIENT;
@@ -1481,31 +1604,67 @@ public:
                     break;
                 case PlannerPolicy::Auto:
                 default:
-                    m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE | FFTW_WISDOM_ONLY);
+                    m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE | FFTW_WISDOM_ONLY);
                     if (m_plan) {
                         used = "FFTW_MEASURE (from wisdom)";
                     } else {
-                        m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                        m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
                         used = "FFTW_ESTIMATE (measuring in background)";
                         start_background = true;
                     }
                     break;
             }
-            if (!m_plan && policy != PlannerPolicy::Fast) {
-                m_plan = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+            if (!m_plan && want->honoursPolicy && policy != PlannerPolicy::Fast) {
+                m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
                 used = "FFTW_ESTIMATE (fallback)";
             }
         }
+        // Say what actually happened, not what the policy would have liked: with Async off there is no
+        // background thread to measure on, so the status must not keep claiming "measuring in
+        // background". That string is what the Info DAT and the plan row show, and a user reading it
+        // would wait for an upgrade that is never coming.
+        const bool defer_upgrade = start_background && !m_bg_allowed;
+        if (defer_upgrade) used = "FFTW_ESTIMATE (measured upgrade deferred: Async is off)";
         double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
         if (m_plan) {
-            m_planStatus = "FFTW3 (" + std::string(used) + " - " + std::to_string(ms) + " ms, N=" + std::to_string(fft_size) + ")";
-            if (log) log->log("[FFT Plugin] [FFTW3] plan N=" + std::to_string(fft_size) + " " + used + " in " + std::to_string(ms) + " ms");
+            m_planStatus = std::string(tag()) + " (" + used + " - " + std::to_string(ms) + " ms, N=" + std::to_string(fft_size) + ")";
+            if (log) {
+                log->log(std::string("[FFT Plugin] [") + tag() + "] plan N=" + std::to_string(fft_size) + " " + used + " in " + std::to_string(ms) + " ms");
+                // Which library is doing the work, and which SIMD kernels it chose for this plan.
+                // Reported once per plan (i.e. per size or backend change), never per cook: it costs
+                // one plan serialisation, and it is the only way to tell an AVX2 build from an SSE2
+                // one, or FFTW from oneMKL, at runtime — they produce identical results and accept
+                // identical calls.
+                log->log(std::string("[FFT Plugin] [") + tag() + "] " +
+                             describeBackend(m_backend) + " - " + describePlanSimd(api, m_plan),
+                         backendVersionMatches(m_backend));
+            }
         } else {
-            m_planStatus = "FFTW3 (plan creation FAILED)";
-            if (log) log->log("[FFT Plugin] [FFTW3] ERROR: plan creation failed for N=" + std::to_string(fft_size));
+            m_planStatus = std::string(tag()) + " (plan creation FAILED)";
+            if (log) log->log(std::string("[FFT Plugin] [") + tag() + "] ERROR: plan creation failed for N=" + std::to_string(fft_size));
             return;
         }
-        if (start_background) startBackgroundMeasure(fft_size, bg_rigor);
+        if (start_background) {
+            m_wants_upgrade = true;
+            if (!defer_upgrade) {
+                startBackgroundMeasure(fft_size, bg_rigor);
+            } else if (log) {
+                // Async is off, so the node is deliberately single-threaded: the measured upgrade is
+                // deferred rather than run on the cook thread, where the same measurement costs
+                // 0.7-2.7 s at the sizes this plugin uses (measured: N=65536 FFTW_MEASURE 805 ms,
+                // N=2048 FFTW_PATIENT 675 ms) and would stall the whole TouchDesigner frame. The
+                // plan in use stays a correct ESTIMATE one; it is only a few percent slower to
+                // execute, and the node keeps cooking at full rate throughout. Two ways to get the
+                // upgrade: turn Async on (it then measures off the cook thread and swaps itself in),
+                // or set Planner Policy = Measured, which takes the stall deliberately, once.
+                log->log(std::string("[FFT Plugin] [") + tag() + "] Async is off, so the " +
+                             ((bg_rigor == FFTW_PATIENT) ? "FFTW_PATIENT" : "FFTW_MEASURE") +
+                             " upgrade for N=" + std::to_string(fft_size) +
+                             " is deferred (planning stays on the cook thread, nothing runs off it). "
+                             "Turn Async on to measure in the background, or set Planner Policy = "
+                             "Measured to measure once synchronously");
+            }
+        }
     }
 
     void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
@@ -1514,10 +1673,10 @@ public:
         size_t n_complex = n / 2 + 1;
         if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
         if (scratch_complex.size() != n_complex) scratch_complex.resize(n_complex);
-        if (m_plan && n == m_fft_size) {
+        if (m_plan && n == m_fft_size && m_backend.api.executeR2C) {
             float* in_ptr = const_cast<float*>(padded_signal.data());
             fftwf_complex* out_ptr = reinterpret_cast<fftwf_complex*>(scratch_complex.data());
-            fftwf_execute_dft_r2c(m_plan, in_ptr, out_ptr);
+            m_backend.api.executeR2C(m_plan, in_ptr, out_ptr);
         } else {
             std::memset(scratch_complex.data(), 0, n_complex * sizeof(std::complex<float>));
         }
@@ -1529,13 +1688,24 @@ public:
     }
 
 private:
+    // Scratch for plan creation, allocated and freed by the active library's own allocator. FFTW
+    // plans are built against buffers whose alignment and ownership the planner is told about, and
+    // oneMKL allocates through its own runtime; the api is held so the destructor returns the memory
+    // to the same library that handed it out. That is why this is not a wrapper around new[].
     struct Buffers {
-        float* in{ nullptr }; fftwf_complex* out{ nullptr };
-        explicit Buffers(size_t n) {
-            in = static_cast<float*>(fftwf_malloc(sizeof(float) * n));
-            out = static_cast<fftwf_complex*>(fftwf_malloc(sizeof(fftwf_complex) * (n / 2 + 1)));
+        const FftApi& api;
+        float* in{ nullptr };
+        fftwf_complex* out{ nullptr };
+        Buffers(const FftApi& a, size_t n) : api(a) {
+            in  = static_cast<float*>(api.alloc(sizeof(float) * n));
+            out = static_cast<fftwf_complex*>(api.alloc(sizeof(fftwf_complex) * (n / 2 + 1)));
         }
-        ~Buffers() { if (in) fftwf_free(in); if (out) fftwf_free(out); }
+        Buffers(const Buffers&) = delete;
+        Buffers& operator=(const Buffers&) = delete;
+        ~Buffers() {
+            if (in)  api.dealloc(in);
+            if (out) api.dealloc(out);
+        }
         bool ok() const { return in && out; }
     };
 
@@ -1548,7 +1718,12 @@ private:
         m_bg_size = fft_size;
         m_bg_rigor = rigor;
         m_bg_running = true;
-        m_bg_thread = std::thread([this, fft_size, rigor]() {
+        // Copied by value, not read from m_backend inside the thread: prepare() re-points m_backend
+        // on the cooking thread, and a background thread reading it would be a data race. The plan
+        // it produces belongs to this library, so m_bg_api is also what destroys it.
+        const FftApi api = m_backend.api;
+        m_bg_api = api;
+        m_bg_thread = std::thread([this, fft_size, rigor, api]() {
 #ifdef _WIN32
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
@@ -1561,9 +1736,9 @@ private:
             fftwf_plan p = nullptr;
             {
                 std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
-                Buffers b(fft_size);
-                if (b.ok()) p = fftwf_plan_dft_r2c_1d(static_cast<int>(fft_size), b.in, b.out, rigor);
-                if (p) exportWisdom();
+                Buffers b(api, fft_size);
+                if (b.ok()) p = api.planR2C(static_cast<int>(fft_size), b.in, b.out, rigor);
+                if (p) exportWisdom(api);
             }
             m_bg_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
             m_bg_plan.store(p);
@@ -1579,20 +1754,37 @@ public:
         if (!ready) return false;
         if (m_bg_size != m_fft_size) {                 // size changed meanwhile: discard
             std::lock_guard<std::mutex> lock(plannerMutex());
-            fftwf_destroy_plan(ready);
+            if (m_bg_api.destroyPlan) m_bg_api.destroyPlan(ready);
             joinBackground();
             return false;
         }
         {
             std::lock_guard<std::mutex> lock(plannerMutex());
-            if (m_plan) fftwf_destroy_plan(m_plan);
+            if (m_plan && m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
             m_plan = ready;
         }
         joinBackground();
         const char* rigor = (m_bg_rigor == FFTW_PATIENT) ? "FFTW_PATIENT" : "FFTW_MEASURE";
-        m_planStatus = std::string("FFTW3 (") + rigor + " upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
-        if (m_log) m_log->log(std::string("[FFT Plugin] [FFTW3] background ") + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in and saved to wisdom");
+        m_planStatus = std::string(tag()) + " (" + rigor + " upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
+        if (m_log) m_log->log(std::string("[FFT Plugin] [") + tag() + "] background " + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in");
         return true;
+    }
+
+    // The node's Async toggle, delivered per cook. Two behaviours, and the reason each is safe:
+    //  * true  -> allowed again. If the live plan is an ESTIMATE that was only left un-upgraded
+    //              because background work was disallowed (m_wants_upgrade), the measurement starts
+    //              now. Without this, turning Async back on would leave the node on ESTIMATE forever:
+    //              prepare()'s early-out sees an unchanged size/policy/backend and never re-plans.
+    //  * false -> disallowed. Nothing is stopped or joined: a measurement already running finishes
+    //              and is swapped in by pollBackgroundPlan() (one-shot, and the result is a better
+    //              plan for the same library - discarding it would be pure waste). What is prevented
+    //              is *starting* one, and the deferred log in prepare() only fires when setBackgroundAllowed(false)
+    //              was seen before the plan was made.
+    void setBackgroundAllowed(bool allowed) override {
+        if (allowed == m_bg_allowed) return;
+        m_bg_allowed = allowed;
+        if (allowed && m_wants_upgrade && m_plan && !m_bg_running && m_fft_size != 0)
+            startBackgroundMeasure(m_fft_size, m_bg_rigor);
     }
 
 private:
@@ -1603,23 +1795,34 @@ private:
         fftwf_plan leftover = m_bg_plan.exchange(nullptr);
         if (leftover) {
             std::lock_guard<std::mutex> lock(plannerMutex());
-            fftwf_destroy_plan(leftover);
+            // Destroyed with the library that planned it; m_bg_api is a copy taken when the thread
+            // started, so it survives a backend switch on the cooking thread.
+            if (m_bg_api.destroyPlan) m_bg_api.destroyPlan(leftover);
         }
         m_bg_running = false;
     }
 
+    FftBackend m_backend;                  // active library; loaded once per process and cached
     fftwf_plan m_plan{ nullptr };
     size_t m_fft_size{ 0 };
     PlannerPolicy m_policy{ PlannerPolicy::Auto };
-    std::string m_planStatus{ "FFTW3 (Uninitialized)" };
+    std::string m_planStatus;              // empty = not prepared yet; getPlanStatus() names the tag
     PlanLog* m_log{ nullptr };
 
     std::thread m_bg_thread;
     std::atomic<fftwf_plan> m_bg_plan{ nullptr };
     std::atomic<bool> m_bg_running{ false };
+    FftApi m_bg_api;                       // the library m_bg_plan was created by
     size_t m_bg_size{ 0 };
     unsigned m_bg_rigor{ FFTW_MEASURE };
     double m_bg_ms{ 0.0 };
+    // The node's Async state, as last delivered by setBackgroundAllowed(). Starts true: the engine may
+    // be driven by a caller (the headless tests and the bench) that never says otherwise, and those
+    // want the background upgrade. See setBackgroundAllowed() for the full contract.
+    bool m_bg_allowed{ true };
+    // The live plan is an ESTIMATE that a rigour policy wanted upgraded, but the measurement has not
+    // been taken (yet). Set in prepare(), and the trigger for the re-arm in setBackgroundAllowed().
+    bool m_wants_upgrade{ false };
 };
 
 } // namespace FFTDSP

@@ -687,7 +687,20 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 	                  myAsyncActive ? "off the cook thread" : "on the cook thread",
 	                  (myPipeline && myPipeline->parallelActive()) ? ", channel loop parallel" : ""); row("dsp_time", tempBuffer); return;
 	case 14: snprintf(tempBuffer, sizeof(tempBuffer), "%llu dropped, hold %d frame(s)", static_cast<unsigned long long>(myJobsDropped.load(std::memory_order_relaxed)), myHoldFrames); row("async_jobs", tempBuffer); return;
-	case 15: row("wisdom_file", FFTDSP::FFTWEngine::wisdomPath()); return;
+	case 15: {
+		// Which library is actually loaded, and where *its* wisdom lives. The two backends keep
+		// separate wisdom files on purpose (a wisdom file names the library that wrote it, and FFTW
+		// rejects one that does not match), so reporting a single hard-coded path would be wrong as
+		// soon as the toggle is on. The live description comes from the status snapshot, not from the
+		// pipeline directly: the snapshot is the one channel that is safe to read from the thread
+		// TouchDesigner calls this on, while the engine's own state belongs to the worker thread.
+		const FFTDSP::FftBackendInfo& be = myPipeline ? myPipeline->backendInfo() : FFTDSP::defaultBackend();
+		std::string text = std::string(be.display) + " | wisdom: " +
+		                   FFTDSP::FFTWEngine::wisdomPathFor(be);
+		if (!s.backend.empty()) text += " | " + s.backend;
+		row("fft_backend", text.c_str());
+		return;
+	}
 	case 16: {
 		// The axis is uniform whenever the blend collapses every scale onto the linear ramp: Scale =
 		// Linear (its perceptual grid IS the linear one, so any blend stays uniform) or Warp Blend = 0

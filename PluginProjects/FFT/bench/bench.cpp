@@ -2,11 +2,17 @@
 //
 //   build/bin/Release/fft_bench.exe [--channels N] [--fft N] [--win N] [--bins N] [--scale S]
 //                                   [--iters N] [--planner auto|fast|measured|patient] [--db 0|1|2]
+//                                   [--backend fftw3|mkl]
 //                                   [--cook N]   simulate N cooks of the operator's cook thread
 //                                                (async worker + sync) and report its cost distribution
 //
 // Prints microseconds per stage per channel and the total per cook, so the real cost of
 // each parameter choice (FFT size, bins, scale, dB mode) can be measured instead of guessed.
+// --backend is the same choice the node's "FFT Backend" toggle makes, resolved through the same
+// registry and the same runtime loading path, so a bench run is a fair A/B of the two libraries:
+// everything else in the pipeline is identical, and the plan is built by whichever library is
+// selected. The line it prints names the library, its path and its version, so a recorded number
+// cannot be attributed to the wrong build.
 
 #include "DSPModules.h"
 
@@ -30,6 +36,7 @@ struct Args {
     double fmax = 24000.0;     // Display Max Hz (limits the magnitude bins computed)
     int cook = 0;              // > 0: also run the cook-thread simulation for this many cooks
     PlannerPolicy planner = PlannerPolicy::Auto;
+    int backend = 0;           // registry index: 0 = FFTW3, 1 = oneMKL (see FftBackend.h)
 };
 
 // ------------------------------------------------------------------------------------------
@@ -200,6 +207,14 @@ static Args parse(int argc, char** argv)
             a.planner = (p == "fast") ? PlannerPolicy::Fast : (p == "measured") ? PlannerPolicy::Measured
                       : (p == "patient") ? PlannerPolicy::Patient : PlannerPolicy::Auto;
         }
+        else if (k == "--backend") {
+            // Names rather than indices, because a bench command line gets copied into a log or a
+            // README and "1" says nothing a year later. Unknown names keep the default and say so.
+            std::string b = v;
+            if (b == "mkl" || b == "onemkl" || b == "intel") a.backend = 1;
+            else if (b == "fftw3" || b == "fftw") a.backend = 0;
+            else std::printf("unknown --backend '%s': using the default (fftw3)\n", b.c_str());
+        }
     }
     return a;
 }
@@ -208,6 +223,12 @@ struct Stage { const char* name; double us = 0.0; };
 
 int main(int argc, char** argv)
 {
+    // Unbuffered stdout. When this process is piped (CI, a redirected log, rtk) the MSVC CRT block-
+    // buffers stdout and abort()/an access violation does not flush it, so a crash loses *every* line
+    // printed before it and the run looks like it produced no output at all rather than like it died.
+    // The bench prints a few dozen lines outside the timing loop, so line-buffering costs nothing
+    // measurable and buys a crash whose last line is the line it died on.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     Args a = parse(argc, argv);
     const double sr = 44100.0;
     const size_t N = static_cast<size_t>(a.fft), win = static_cast<size_t>(a.win), bins = static_cast<size_t>(a.bins);
@@ -222,10 +243,16 @@ int main(int argc, char** argv)
 
     PlanLog log;
     FFTWEngine engine;
+    const FftBackendInfo& want = backendById(a.backend);
     auto t0 = clk::now();
-    engine.prepare(N, a.planner, &log);
+    engine.prepare(N, a.planner, &log, &want);
     std::printf("plan: %s (%.1f ms)\n", engine.getPlanStatus().c_str(),
                 std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    // Which library is actually doing the work, spelled out with its version and path: this is the
+    // attribution line for every number that follows, and it is also where a requested-but-missing
+    // oneMKL shows up as a fallback rather than as a silently mis-labelled result.
+    std::printf("backend asked for: %s\n", want.display);
+    std::printf("backend live:      %s\n", engine.backendReport().c_str());
     if (engine.upgradeInProgress()) {                                // Auto/Patient: wait for the background plan so the stage numbers use it
         std::printf("waiting for the background plan ...");
         std::fflush(stdout);

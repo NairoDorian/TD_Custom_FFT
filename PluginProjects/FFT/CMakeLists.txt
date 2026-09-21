@@ -27,8 +27,22 @@ enable_testing()
 # The plugin
 # ---------------------------------------------------------------------------
 td_add_plugin(FFT FAMILY CHOP)
-td_plugin_use_fftw3(FFT)                     # vendored 3rdParty/fftw3 (libfftw3f-3), runtime DLL deployed automatically
-td_plugin_optimize(FFT AVX2 FAST_MATH)       # /O2 /Oi /Ot /fp:fast /arch:AVX2 (+ /OPT:REF,ICF)
+
+# Vendored FFTW 3.3.11 built from source with AVX2+FMA codelets; see 3rdParty/fftw3/README.md and
+# 3rdParty/fftw3/VERSION for the provenance of every artifact. VERSION pins the exact tag, so the
+# library, the header and the deployed runtime DLL all carry the version in their names and a second
+# FFTW can be dropped in beside this one without ambiguity.
+#
+# DYNAMIC: the plugin does NOT link this import library. fftwf_* is resolved at run time (LoadLibrary
+# + GetProcAddress) because the FFT Backend toggle can also select Intel oneMKL's FFTW3 interface, and
+# that library exports the very same symbol names - linking one of them would make the other
+# unreachable. The DLL is still copied next to the plugin, so the default backend works out of the box.
+td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)
+
+# /O2 /Oi /Ot /Gy /arch:AVX2 /fp:fast, plus LTO: the AVX2 intrinsics in DSPModules.h are only worth
+# what the inliner does with them, and /GL lets the inliner work across FFT.cpp / AnalysisPipeline.cpp
+# / Parameters.cpp instead of stopping at each translation unit.
+td_plugin_optimize(FFT AVX2 FAST_MATH LTO)
 
 # ---------------------------------------------------------------------------
 # Headless tests & benchmark (no TouchDesigner needed):
@@ -44,4 +58,8 @@ if(FFT_BUILD_BENCH)
     td_plugin_add_bench(FFT fft_bench SOURCES bench/bench.cpp)
     # Answers "would FFTW's built-in threading help?" with numbers (it does not for Mono Mix).
     td_plugin_add_bench(FFT fft_threads_probe SOURCES bench/fftw_threads_probe.cpp)
+    # Reports which fftwf DLL is loaded, its version, whether that build has the threads API, which
+    # SIMD codelets it actually selects, and the per-size r2c cost. Swapping the DLL next to this exe
+    # is how the 3.3.5 -> 3.3.11 AVX2 comparison in 3rdParty/fftw3/README.md was measured.
+    td_plugin_add_bench(FFT fft_version_probe SOURCES bench/fftw_version_probe.cpp)
 endif()

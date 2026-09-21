@@ -25,7 +25,8 @@ Registers the custom parameters on 5 pages:
 3. Window & Weighting:     window type, Kaiser beta, equal-loudness weighting, magnitude normalization.
 4. Loudness & Ballistics:  linear/dB/dB-normalized, dB reference, dB floor, attack/release
                            (per-frame coefficient or milliseconds), reset.
-5. Performance:            the async worker thread. That is the whole page - this node is one mono
+5. Performance:            the async worker thread, and which FFT library the node plans
+                           and transforms with (FFTW3 or Intel oneMKL). This node is one mono
                            channel per instance, so there is nothing else to schedule.
 
 Defaults reproduce the behaviour of the previous version exactly (Window Length Mode = Samples,
@@ -35,8 +36,32 @@ Magnitude Normalization = Coherent Gain, dB Reference = Frame Peak, Ballistics M
 
 #include "Parameters.h"
 
+#include "FftBackend.h"   // FFTDSP::backendCount()/backendById() - the menu-value contract below
+
 #include <algorithm>
 #include <cmath>
+
+// ---------------------------------------------------------------------------------------------
+// Menu value <-> backend registry: the compile-time half of the contract.
+// ---------------------------------------------------------------------------------------------
+// Parameters::Backend is a plain int-typed enum because TouchDesigner menus are integers, while the
+// registry in FftBackend.h is a switch over static descriptors. Nothing but these asserts stops the
+// two from drifting apart - and a drift here is silent and expensive: the toggle would select a
+// backend the engine never looks up, and the node would keep transforming with FFTW3 while claiming
+// oneMKL. Asserting the count and both endpoints pins the whole mapping, since the enum is dense
+// (COUNT == 2 and Fftw3 == 0, OneMkl == 1 forces the one legal correspondence).
+static_assert(static_cast<int>(Parameters::Backend::COUNT) == FFTDSP::backendCount(),
+              "Parameters::Backend and the FftBackend.h registry disagree on how many backends exist: "
+              "extend both, and give the new backend a menu value in appendToggle()");
+static_assert(static_cast<int>(Parameters::Backend::Fftw3) == 0 && static_cast<int>(Parameters::Backend::OneMkl) == 1,
+              "backend menu values are the registry indices: Backend::Fftw3 must index kFftw3Backend (0) "
+              "and Backend::OneMkl must index kMklBackend (1) - see backendById() in FftBackend.h");
+static_assert(FFTDSP::backendById(static_cast<int>(Parameters::Backend::Fftw3)).honoursPolicy,
+              "the FFTW3 backend honours FFTW's plan rigour flags; if this ever becomes false the "
+              "Planner Policy menu is being offered for a library that ignores it");
+static_assert(FFTDSP::backendById(static_cast<int>(Parameters::Backend::OneMkl)).expectedVersion == nullptr,
+              "the oneMKL backend deliberately pins no version: MKL ships under its own version scheme, "
+              "so a pinned string here would report a false mismatch on every load");
 
 namespace Parameters {
 
@@ -193,6 +218,13 @@ void setup(TD::OP_ParameterManager* manager)
 
 	// --- Page 5: Performance ---
 	appendToggle(manager, "Performance", AsyncName,       AsyncLabel,       true);
+	// Off = the vendored FFTW3 build (libfftw3f-3.3.11-avx2.dll), which is what ships with the plugin.
+	// On = Intel oneMKL's FFTW3 interface (mkl_rt.2.dll), which dispatches to Intel-optimised kernels
+	// on Intel CPUs. Neither library is linked in: both are resolved with LoadLibrary + GetProcAddress
+	// at run time, because they export the same fftwf_* names and would collide at link time. If the
+	// selected library is not present the plugin logs which file it looked for and falls back to FFTW3,
+	// so this toggle can never make the node stop producing a spectrum.
+	appendToggle(manager, "Performance", FftbackendName,  FftbackendLabel,  false);
 	// (v2.7.0) "Update Every N Cooks" / "Parameter Poll Every N Cooks" removed: both made the node
 	// strictly worse. Update Every N Cooks halved the spectrum's effective update rate to save a cost
 	// that the async worker already took off the cook thread; Parameter Poll Every N Cooks saved
@@ -208,7 +240,11 @@ void setup(TD::OP_ParameterManager* manager)
 	// same reason in the other direction: this node is one mono channel per node instance, so several
 	// channels means several nodes, and a per-channel fan-out knob can never fire. The fan-out itself
 	// stays (unconditional, >1 channel only) for Channels = All Channels, which is the one mode that
-	// still produces more than one transform per cook. Performance has exactly one control: Async.
+	// still produces more than one transform per cook.
+	// (v2.9.0) FFT Backend is the second control on this page, and the only one on it that is not
+	// about threading. Job scheduling stays here rather than on Spectrum because the backend and the
+	// async worker interact: the parallel fan-out and the background plan both run inside whichever
+	// library is selected, so the toggle and the worker belong side by side.
 }
 
 Values eval(const TD::OP_Inputs* inputs, int* reads)
@@ -288,6 +324,9 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 
 	// --- Performance ---
 	v.async       = getI(AsyncName) != 0;
+	// Read unconditionally (one fetch) so switching it takes effect on the next cook in both the async
+	// and the synchronous path. See Parameters.h -> Backend for why this is a toggle and not a menu.
+	v.backend     = (getI(FftbackendName) != 0) ? Backend::OneMkl : Backend::Fftw3;
 
 	if (reads) *reads = n;
 	return v;

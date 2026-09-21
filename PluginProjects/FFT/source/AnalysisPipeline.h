@@ -66,6 +66,7 @@ public:
     // Telemetry (owner thread only). statusVersion() changes whenever status() would.
     struct Status {
         std::string plan;
+        std::string backend;                 // engine's own description of the live FFT library, or empty
         bool planFailed{ false };          // prepare() could not produce a plan — surface via getErrorString
         size_t fftSize{ 0 }, capacity{ 0 }, linearBins{ 0 }, magnitudeBins{ 0 };
         double axisRate{ 0.0 };              // 2 x (top of the axis) for the grid that was built; NOT info->sampleRate
@@ -93,6 +94,12 @@ public:
     // True if the engine has no plan ready (owner thread only; read once per published job by FFT::runJob
     // to decide whether to escalate the failure to getErrorString).
     bool planFailed() const noexcept { return !myEngine || !myEngine->hasPlan(); }
+    // Which FFT library the engine last planned against. Never null after the first process().
+    // A pointer to one of the two static descriptors in FftBackend.h, so reading it from another
+    // thread is safe even while the owner thread switches backends: the pointee never moves.
+    const FFTDSP::FftBackendInfo& backendInfo() const noexcept {
+        return myBackend ? *myBackend : FFTDSP::defaultBackend();
+    }
 
 private:
     struct DspState {
@@ -131,6 +138,7 @@ private:
     size_t myPadStart{ 0 };
     int myPadChoice{ -1 };
     FFTDSP::PlannerPolicy myPlanner{ FFTDSP::PlannerPolicy::Auto };
+    const FFTDSP::FftBackendInfo* myBackend{ nullptr };  // null until the first rebuild; see rebuild()
     WindowKey myWindowKey;
     WarpKey myWarpKey;
     WeightKey myWeightKey;

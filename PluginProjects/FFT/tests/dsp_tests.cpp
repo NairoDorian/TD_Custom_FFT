@@ -15,10 +15,40 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <tlhelp32.h>   // which libraries are actually loaded in this process (the OpenMP check below)
+#endif
+
 using namespace FFTDSP;
 
 static int g_failures = 0;
 static int g_checks = 0;
+
+// Case-insensitive "is a module whose name starts with this loaded in this process" test. Used to
+// check the oneMKL threading-layer contract, which is a statement about which DLLs are resident and
+// so cannot be checked any other way: FFT results are identical either way, and the difference only
+// shows up as a second Intel OpenMP runtime inside TouchDesigner's process.
+static bool moduleLoaded(const char* prefix)
+{
+#ifdef _WIN32
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32 me{};
+    me.dwSize = sizeof(me);
+    bool found = false;
+    const size_t n = std::strlen(prefix);
+    if (Module32First(snap, &me)) {
+        do {
+            if (_strnicmp(me.szModule, prefix, n) == 0) { found = true; break; }
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
+#else
+    (void)prefix;
+    return false;
+#endif
+}
 
 #define CHECK(cond)                                                                             \
     do {                                                                                        \
@@ -307,6 +337,161 @@ static void test_background_plan()
     CHECK(pe2.getPlanStatus().find("from wisdom") != std::string::npos);
     ae.prepare(2048, PlannerPolicy::Auto, &log);
     CHECK(ae.getPlanStatus().find("from wisdom") != std::string::npos);
+}
+
+// ------------------------------------------------------------------------------------------
+// The FFT Backend toggle. Runs identically whether or not oneMKL is installed on this machine,
+// because both are legitimate outcomes and the test asserts the contract rather than the install:
+//   1. asking for oneMKL either loads it, or falls back to FFTW3 *with a working plan* - never a
+//      node with no plan, which would publish a flat spectrum and look like a broken plugin;
+//   2. every backend that is offered by the registry can be asked for and produces the same
+//      transform (a backend switch is a performance choice, not a numerical one);
+//   3. switching back and forth re-plans cleanly and leaves no plan behind for the wrong library
+//      (a plan freed by the other library's destroy_plan is heap corruption, see FftBackend.h).
+static void test_backend_selection()
+{
+    section("FFT backend selection (FFTW3 / oneMKL toggle)");
+    FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";
+    PlanLog log;
+    // The registry is the single source of truth here: this test does not include Parameters.h (it is
+    // a TouchDesigner-side header), so the menu-value contract is asserted there instead.
+    CHECK(backendCount() >= 2);
+    const int kFftw3 = 0;   // Parameters::Backend::Fftw3 — see the static_assert in Parameters.cpp
+
+    const size_t N = 4096;
+    AlignedVector frame(N, 0.0f);
+    frame[9] = 1.0f;                                  // impulse: |X[k]| == 1 for every k
+    AlignedVector reference;
+    {
+        FFTWEngine e;
+        e.prepare(N, PlannerPolicy::Fast, &log, &backendById(kFftw3));
+        CHECK(e.hasPlan());
+        AlignedComplexVector scratch;
+        e.executeRFFT(frame, reference, scratch);
+        CHECK_NEAR(reference[5], 1.0, 1e-3);
+    }
+
+    for (int i = 0; i < backendCount(); ++i) {
+        const FftBackendInfo& want = backendById(i);
+        FFTWEngine e;
+        e.prepare(N, PlannerPolicy::Fast, &log, &want);
+        // Which library actually ended up live, which is not necessarily the one asked for.
+        const std::string status = e.getPlanStatus();
+        const bool loaded = status.find("(no library)") == std::string::npos;
+        std::printf("  asked for %-8s -> %s\n", want.id, status.c_str());
+        CHECK(loaded);                                        // never left without a plan
+        CHECK(e.hasPlan());
+        CHECK(e.backendReport().find("<no backend>") == std::string::npos);
+        AlignedVector mag; AlignedComplexVector scratch;
+        e.executeRFFT(frame, mag, scratch);
+        // Same numbers either way: the backend changes how the transform is computed, never what it is.
+        double worst = 0.0;
+        for (size_t k = 0; k < reference.size(); ++k)
+            worst = std::max(worst, static_cast<double>(std::abs(mag[k] - reference[k])));
+        std::printf("     max |mag - FFTW3 mag| over %zu bins: %.2e\n", reference.size(), worst);
+        CHECK(worst < 1e-3);
+    }
+
+    // Toggling on one engine, repeatedly: the plan in hand belongs to the previous library every
+    // time, so this is the path that would corrupt the heap if the plan were destroyed by the wrong
+    // library. Checked by value, since the damage would be silent otherwise.
+    {
+        FFTWEngine e;
+        for (int round = 0; round < 3; ++round) {
+            for (int i = 0; i < backendCount(); ++i) {
+                e.prepare(N, PlannerPolicy::Fast, &log, &backendById(i));
+                CHECK(e.hasPlan());
+                AlignedVector mag; AlignedComplexVector scratch;
+                e.executeRFFT(frame, mag, scratch);
+                CHECK_NEAR(mag[5], 1.0, 1e-3);
+            }
+        }
+        std::printf("  %d backend switches in one engine: plan valid every time\n", 3 * backendCount());
+    }
+
+    // If oneMKL is installed, it is now loaded, and this is the only place that can check what it
+    // brought with it. The plugin calls MKL_Set_Threading_Layer(MKL_THREADING_SEQUENTIAL) at load
+    // time: oneMKL otherwise defaults to its Intel OpenMP layer, which loads libiomp5md.dll into the
+    // host process. TouchDesigner already ships and loads its own copy, and two Intel OpenMP runtimes
+    // in one process is the "Error #15: ... but found libiomp5md.dll already initialized" abort - so
+    // the whole point of the switch is that the OpenMP layer must NOT be resident here.
+    //
+    // Measured both ways on this machine (mkl_rt.3.dll, oneMKL 2026.1.0): a plan + execute of a
+    // 4096-point r2c with no threading-layer call leaves mkl_intel_thread.3.dll resident; with the
+    // call, neither mkl_intel_thread.3.dll nor libiomp5md.dll is loaded. So this check is not
+    // vacuous - it is exactly the observable difference the switch makes, and it fails if the switch
+    // is ever lost (for instance if a future mkl_rt stops exporting MKL_Set_Threading_Layer).
+    if (moduleLoaded("mkl_rt")) {
+        const bool omp = moduleLoaded("mkl_intel_thread") || moduleLoaded("libiomp5md");
+        std::printf("  oneMKL resident; intel_thread/libiomp5md loaded: %s\n", omp ? "YES" : "no");
+        CHECK(!omp);        // the sequential layer switch took effect
+    } else {
+        std::printf("  (oneMKL is not installed here - the OpenMP layer check is skipped)\n");
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Async off must mean one thread for the whole node. The window -> FFT -> warp -> dB chain is
+// already single-threaded there (the pipeline owner is the cook thread), and the channel fan-out
+// only fires with more than one channel, so the one piece of work that could still escape to another
+// thread is the FFTW planner's deferred MEASURE/PATIENT upgrade. This asserts both halves of that
+// contract, in one engine:
+//   * off -> nothing is started, the node keeps cooking on a correct ESTIMATE plan;
+//   * on  -> the deferred measurement starts, because prepare()'s early-out sees an unchanged size,
+//            policy and backend and will never re-plan on its own. Without the re-arm the node would
+//            sit on ESTIMATE for the rest of the session.
+static void test_async_single_thread()
+{
+    section("Async toggle: deferred background upgrade (single-threaded node)");
+    FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";   // the file the earlier tests already imported
+    PlanLog log;
+    // A size no other test plans, so an Auto plan cannot come from wisdom and there is a real upgrade
+    // to defer. If a machine's wisdom happens to cover it, the branch below says so and skips rather
+    // than asserting a path the run cannot reach.
+    const size_t N = 12288;
+
+    FFTWEngine e;
+    e.setBackgroundAllowed(false);                 // Async off, exactly as the node delivers it per cook
+    e.prepare(N, PlannerPolicy::Auto, &log);
+    const bool from_wisdom = e.getPlanStatus().find("from wisdom") != std::string::npos;
+    std::printf("  Async off, prepare(%zu, Auto): %s\n", N, e.getPlanStatus().c_str());
+    CHECK(e.hasPlan());                            // deferred, never planless
+    if (from_wisdom) {
+        std::printf("  (N is already measured in wisdom here - the deferral path is not reachable)\n");
+        CHECK(!e.upgradeInProgress());
+        return;
+    }
+    CHECK(!e.upgradeInProgress());                 // no planner thread was started
+    // The status has to say "deferred", not "measuring in background": it is what the Info DAT shows,
+    // and it would otherwise promise an upgrade that is not coming.
+    CHECK(e.getPlanStatus().find("deferred") != std::string::npos);
+    CHECK(e.getPlanStatus().find("measuring in background") == std::string::npos);
+
+    // Twenty cooks' worth of polls with Async off: still no thread, still a valid transform.
+    AlignedVector frame(N, 0.0f), mag; AlignedComplexVector scratch;
+    frame[11] = 1.0f;
+    for (int i = 0; i < 20; ++i) {
+        e.executeRFFT(frame, mag, scratch);        // executes on this thread, the whole point of the toggle
+        e.setBackgroundAllowed(false);             // delivered every cook, so a missed flip cannot hide
+        CHECK(!e.pollBackgroundPlan());
+    }
+    CHECK(!e.upgradeInProgress());
+    CHECK_NEAR(mag[0], 1.0, 1e-4);
+
+    // Async back on, same engine, no re-prepare: the deferred measurement must start now.
+    e.setBackgroundAllowed(true);
+    CHECK(e.upgradeInProgress());
+    bool upgraded = false;
+    for (int i = 0; i < 400 && !upgraded; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        e.executeRFFT(frame, mag, scratch);        // cooking while the planner measures is the design
+        upgraded = e.pollBackgroundPlan();
+    }
+    std::printf("  Async on  -> %s\n", e.getPlanStatus().c_str());
+    CHECK(upgraded);
+    CHECK(e.getPlanStatus().find("upgraded in background") != std::string::npos);
+    e.executeRFFT(frame, mag, scratch);
+    CHECK_NEAR(mag[0], 1.0, 1e-4);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -813,6 +998,11 @@ static void test_equal_loudness()
 // ------------------------------------------------------------------------------------------
 int main()
 {
+    // Unbuffered stdout, for the same reason as the bench: piped output is block-buffered by the MSVC
+    // CRT and a crash does not flush, so a crash here would swallow the name of the test that was
+    // running. With this, the last line printed is the crash site - and that line is the whole
+    // diagnosis, because the alternative is bisecting by re-running with tests commented out.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
 #if defined(__AVX2__)
                 "build",
@@ -831,6 +1021,8 @@ int main()
     test_v23_helpers();
     test_triple_buffer_and_signal();
     test_background_plan();
+    test_backend_selection();
+    test_async_single_thread();
     test_pipeline_sine();
     test_pipeline_process();
     test_identity_grid_and_rate();

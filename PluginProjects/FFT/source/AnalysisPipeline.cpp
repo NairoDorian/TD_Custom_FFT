@@ -51,6 +51,7 @@ AnalysisPipeline::status() const
 {
 	Status s;
 	s.plan = myEngine ? myEngine->getPlanStatus() : std::string("Uninitialized");
+	s.backend = myEngine ? myEngine->backendReport() : std::string();
 	s.planFailed = planFailed();
 	s.fftSize = myFFTSize;
 	s.capacity = myCapacity;
@@ -77,6 +78,9 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 	myCapacity = std::max<size_t>(1, static_cast<size_t>(job.winSamples));
 	myPadChoice = job.p.padSize;
 	myPlanner = static_cast<FFTDSP::PlannerPolicy>(job.p.planner);
+	// Parameters::Backend and FFTDSP::backendById() are the same numbering by construction (see the
+	// static_assert in FFT.cpp); the cast keeps the dependency one-way, pipeline -> DSP.
+	myBackend = &FFTDSP::backendById(static_cast<int>(job.p.backend));
 
 	// FFT size >= zero-pad length and >= next power of two of the window (window never overflows the frame)
 	myFFTSize = fftSizeFrom(job.p, static_cast<int>(myCapacity));
@@ -89,7 +93,7 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 	myWarpKey = WarpKey{};
 
 	if (!myEngine) myEngine = std::make_unique<FFTDSP::FFTWEngine>();
-	myEngine->prepare(myFFTSize, myPlanner, myLog);
+	myEngine->prepare(myFFTSize, myPlanner, myLog, myBackend);
 
 	for (auto& ch : myChannels) {
 		ch.padded_frame.assign(myFFTSize, 0.0f);
@@ -284,8 +288,18 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 	                         || std::abs(job.sampleRate - mySampleRate) > 1e-3
 	                         || static_cast<size_t>(job.winSamples) != myCapacity
 	                         || p.padSize != myPadChoice
-	                         || static_cast<FFTDSP::PlannerPolicy>(p.planner) != myPlanner;
+	                         || static_cast<FFTDSP::PlannerPolicy>(p.planner) != myPlanner
+	                         // A backend switch must rebuild: the plan object belongs to the library
+	                         // that made it, so the old plan has to be destroyed by its own
+	                         // fftwf_destroy_plan before the new one replaces it. prepare() does that.
+	                         || &FFTDSP::backendById(static_cast<int>(p.backend)) != myBackend;
 	if (rebuild_needed) rebuild(job);
+	// The Async toggle, handed to the engine every cook before it is polled. Async off must mean one
+	// thread for the whole node - the cook thread - and the FFTW planner's deferred MEASURE/PATIENT
+	// upgrade is the one piece of work that would otherwise still run off it. The engine decides what
+	// that means for a plan it already holds (see FFTWEngine::setBackgroundAllowed); this call is
+	// deliberately unconditional and cheap, so a flip is never missed by the rebuild early-out.
+	if (myEngine) myEngine->setBackgroundAllowed(p.async);
 	if (myEngine->pollBackgroundPlan()) ++myStatusVersion;
 	const bool upgrading = myEngine->upgradeInProgress();
 	if (upgrading != myLastUpgrading) { myLastUpgrading = upgrading; ++myStatusVersion; }

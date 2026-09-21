@@ -36,6 +36,11 @@ enum class DbRef : int { FramePeak = 0, Dbfs, Agc, COUNT };
 enum class BallisticsMode : int { Coefficient = 0, Milliseconds, COUNT };
 enum class ChanMode : int { MonoMix = 0, FirstChannel, AllChannels, COUNT };
 enum class WarpInterp : int { Linear = 0, Cubic, COUNT };
+// Which FFT library the transform runs in. A toggle rather than a menu because there are exactly two
+// today (the user's rule: a menu once there are three). The two libraries export the *same* fftwf_*
+// symbols, so they cannot both be linked into one binary; the plugin loads whichever is selected at
+// run time through FFTDSP::FftApi (see FftBackend.h). Values match backendById() in that header.
+enum class Backend : int { Fftw3 = 0, OneMkl = 1, COUNT = 2 };
 
 // Zero-padded FFT transform lengths, indexed by the "Pad" menu (menu order in Parameters.cpp)
 inline constexpr int kPadValues[7] = { 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
@@ -98,6 +103,7 @@ constexpr char ResetName[]        = "Reset";        constexpr char ResetLabel[] 
 
 // Page 5: Performance
 constexpr char AsyncName[]        = "Async";        constexpr char AsyncLabel[]        = "Async Analysis (worker thread)";
+constexpr char FftbackendName[]   = "Fftbackend";   constexpr char FftbackendLabel[]   = "FFT Backend (off: FFTW3 / on: Intel oneMKL)";
 
 // ---------------------------------------------------------------------------
 // Snapshot of every parameter for one cook
@@ -144,6 +150,7 @@ struct Values {
     double     releaseMs    = 200.0;
     // Performance
     bool       async        = true;       // analysis on a worker thread; the cook only ingests + copies
+    Backend    backend      = Backend::Fftw3;  // FFTW3 by default: it is the library this build vendors
 };
 
 // Fetch every parameter in one pass. Optional sections are only read when enabled, so a

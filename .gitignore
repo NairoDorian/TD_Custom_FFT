@@ -16,8 +16,19 @@ __Plugins__/**/*.dll.old*
 # Vendored FFTW: only the single-precision runtime + import lib are needed
 PluginProjects/FFT/3rdParty/fftw3/temp_extract/
 PluginProjects/FFT/3rdParty/fftw3/*.zip
-!PluginProjects/FFT/3rdParty/fftw3/lib/libfftw3f-3.lib
-!PluginProjects/FFT/3rdParty/fftw3/bin/libfftw3f-3.dll
+# A vendored library that is not in the repository is not vendored: the rules above exclude the
+# `bin/` and `lib/` *directories* at any depth, and git cannot re-include a file whose parent
+# directory was excluded - so the negations that used to sit here (naming libfftw3f-3.dll, the
+# previous version's file) never took effect. A fresh clone had no FFTW DLL and could not build.
+# Un-excluding the two directories first is what makes the per-file rules below actually work;
+# `git check-ignore -v <path>` is how to confirm it after any edit to this file.
+!PluginProjects/FFT/3rdParty/fftw3/bin/
+!PluginProjects/FFT/3rdParty/fftw3/lib/
+!PluginProjects/FFT/3rdParty/fftw3/bin/libfftw3f-*.dll
+!PluginProjects/FFT/3rdParty/fftw3/lib/libfftw3f-*.def
+!PluginProjects/FFT/3rdParty/fftw3/lib/libfftw3f-*.lib
+# The .exp is a byproduct of generating the .lib from the .def (ignored globally above), and the
+# runtime DLL is kept in bin/ only - CMake stages it from there, so lib/ holds no second copy.
 
 # Visual Studio / VS Code / IDE temporary files
 .vs/
@@ -39,6 +50,7 @@ scratchpad/
 # OS metadata
 # Build helper / test artifacts (per-project)
 PluginProjects/FFT/_b.bat
+PluginProjects/FFT/_c.bat
 PluginProjects/FFT/fft_tests_wisdom.txt
 
 # OS metadata

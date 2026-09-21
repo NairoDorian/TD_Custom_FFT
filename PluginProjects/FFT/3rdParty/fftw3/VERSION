@@ -1,0 +1,34 @@
+FFTW_VENDORED_UPSTREAM_VERSION=3.3.11
+FFTW_VENDORED_RELEASE_DATE=2026-04-21
+FFTW_VENDORED_BUILD_TAG=3.3.11-avx2
+FFTW_VENDORED_PRECISION=single (fftwf_ / libfftw3f)
+FFTW_VENDORED_SIMD=SSE2+AVX+AVX2(FMA)  [config.h: HAVE_SSE2=1 HAVE_AVX=1 HAVE_AVX2=1]
+FFTW_VENDORED_THREADS=off (ENABLE_THREADS=OFF, ENABLE_OPENMP=OFF) - the plugin never used them
+FFTW_VENDORED_FORTRAN=off
+FFTW_VENDORED_COMPILER=MSVC 19.51 (VS 18.10.1 Community), Release, x64
+FFTW_VENDORED_SOURCE=https://fftw.org/pub/fftw/fftw-3.3.11.tar.gz
+FFTW_VENDORED_SOURCE_MD5=40ec8d0447d03b8f01f8c90aa77bd16f
+FFTW_VENDORED_DLL=libfftw3f-3.3.11-avx2.dll
+FFTW_VENDORED_DLL_SHA256=b5111a34871787d4c9b42afef32c221a16fd63d8a6497ffd1f2f5af54a42dbfe
+FFTW_VENDORED_RUNTIME_VERSION_STRING=fftw-3.3.11-sse2-avx-avx2-avx2_128  (what fftwf_version reports)
+FFTW_VENDORED_CMAKE_VERSION_PATCH=set(FFTW_VERSION 3.3.11)
+  Upstream FFTW 3.3.11's contributed CMakeLists.txt still hardcodes "set (FFTW_VERSION 3.3.10)":
+  upstream bumped configure.ac for the 3.3.11 release but not the CMake file. That value is
+  substituted into config.h as PACKAGE_VERSION, which is the string fftwf_version returns and the
+  version header FFTW stamps into its wisdom files. Unpatched, a genuine 3.3.11 build self-reports
+  as 3.3.10 and the plugin's own pin (FftwVersion.h) would log a mismatch on every run. The patch is
+  one line in the scratch source tree at .fftw_build/fftw-3.3.11/CMakeLists.txt and is the only
+  source modification made to the vendored build. Evidence the source really is 3.3.11:
+  configure.ac:29 "fftw-3.3.11 was 10:x:7 (added fftw_copy_plan())", and configure's
+  PACKAGE_VERSION='3.3.11' with the tarball md5 above.
+FFTW_VENDORED_LIB=libfftw3f-3.3.11-avx2.lib
+FFTW_VENDORED_EXP=libfftw3f-3.3.11-avx2.exp
+FFTW_VENDORED_DEF=libfftw3f-3.3.11-avx2.def
+  The .def's "LIBRARY" line must name the same file the .dll is called, because the import library
+  embeds that name and the loader follows the embedded name, not the .lib's own file name.
+  td_plugin_use_fftw3() rewrites the line when the two disagree, so a future re-versioning cannot
+  silently produce an import library that demands a DLL that no longer exists.
+FFTW_VENDORED_HEADER=fftw3-3.3.11-avx2.h
+FFTW_VENDORED_HEADER_SHA256=c82bf45065551f8659748f9c77d8c9dee6783ea524d579e951757ac78a926d05
+FFTW_VENDORED_EXPORT_COUNT=125 (78 fftwf_ public functions + 47 sfftw_ legacy aliases)
+FFTW_VENDORED_CONSUMER_DEFINE=FFTW_DLL  (required for MSVC consumers; see include/fftw3.h in FFTW)
