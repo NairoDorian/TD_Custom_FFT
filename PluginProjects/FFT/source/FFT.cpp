@@ -55,7 +55,8 @@ const char* kOpType    = "Fftcustom";   // must not collide with the built-in FF
 const char* kOpLabel   = "FFT Custom";
 const char* kOpIcon    = "FFT";
 const int   kMajorVersion = 2;
-const int   kMinorVersion = 8;
+const int   kMinorVersion = 9;   // keep in step with CHANGELOG.md - the v2.9.0 work landed without this bump,
+                                 // so the popup and the Info DAT reported v2.8 for a v2.9 node
 
 using clk = std::chrono::steady_clock;
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
@@ -107,6 +108,21 @@ FillCHOPPluginInfo(CHOP_PluginInfo* info)
 	info->customOPInfo.authorEmail->setString("Nairod785@gmail.com");
 	info->customOPInfo.minInputs = 1;
 	info->customOPInfo.maxInputs = 1;
+	// cookOnStart kick-starts every-frame cooking for a node nothing else in the file uses or views,
+	// which matters because all of this plugin's telemetry arrives through the info callbacks and
+	// those only run inside a cook (see getGeneralInfo below). It applies to one of the two ways this
+	// DLL gets loaded, and it is worth being exact about which:
+	//
+	//   * As a registered Custom Operator (Documents/Derivative/Plugins/FFT) - honoured, and needed.
+	//   * Loaded into the built-in CPlusPlus CHOP - ignored. The SDK says so explicitly ("this fix
+	//     only works for Custom Operators, not cases where the .dll is loaded into CPlusPlus CHOP"),
+	//     and that is how PluginBuilder hosts it (plugin_loader is a cplusplusCHOP).
+	//
+	// So this line is not what makes the info popup work in the PluginBuilder setup; cookEveryFrame in
+	// getGeneralInfo is. It is set anyway because the operator must behave correctly however it is
+	// deployed, and because a node that never cooks on project load has no telemetry to show until
+	// something happens to pull it.
+	info->customOPInfo.cookOnStart = true;
 	info->customOPInfo.majorVersion = kMajorVersion;
 	info->customOPInfo.minorVersion = kMinorVersion;
 	info->customOPInfo.opHelpURL->setString("https://github.com/NairoDorian/TD_Custom_FFT");
@@ -151,8 +167,31 @@ FFT::~FFT()
 void
 FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* reserved1)
 {
-	ginfo->cookEveryFrame = false;
-	ginfo->cookEveryFrameIfAsked = true;
+	// cookEveryFrame, not cookEveryFrameIfAsked. This is load-bearing, not a preference.
+	//
+	// TouchDesigner calls every information callback *inside a cook*, in the order documented at the
+	// top of CHOP_CPlusPlusBase.h: execute() -> getNumInfoCHOPChans()/getInfoCHOPChan() ->
+	// getInfoDATSize()/getInfoDATEntries() -> getInfoPopupString() -> getWarningString() ->
+	// getErrorString(). Nothing else calls them, and none of them is invoked on demand by the
+	// middle-click itself - the popup renders whatever the last cook left behind.
+	//
+	// v2.3.0 set cookEveryFrame = false / cookEveryFrameIfAsked = true, which the SDK defines as
+	// "if nobody is using the output from the CHOP, it won't cook". That is the right economy for a
+	// pure number-cruncher, and the wrong one for this node, which carries all of its telemetry
+	// (peak frequency, cook and DSP time, plan events, live backend, warnings, errors) through those
+	// callbacks. An idle node therefore has no Info CHOP, no Info DAT, and an *empty* middle-click
+	// info popup - the callbacks are correct, they are simply never reached.
+	//
+	// Worse, a hard failure cannot report itself: getErrorString() is in that same chain, so a plan
+	// that will not build or an input with no usable sample rate leaves the node silently blank
+	// instead of flagged. Always cooking is what keeps the node able to explain itself.
+	//
+	// The cost is the async pipeline's cook-thread work, measured at 11 us mean / 17 us p99 per cook
+	// at 16384 bins (v2.4.0, `fft_bench --cook`) - about 0.07 % of a 60 fps frame. See cookOnStart in
+	// fillCustomOPInfo(): the SDK requires it alongside cookEveryFrame to kick-start cooking, since
+	// a node nobody pulls is never asked to cook in the first place.
+	ginfo->cookEveryFrame = true;
+	ginfo->cookEveryFrameIfAsked = false;
 	ginfo->timeslice = false;
 	ginfo->inputMatchIndex = 0;
 }
@@ -747,7 +786,21 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 {
 	const AnalysisPipeline::Status s = statusSnapshot();
 	char buf[256];
-	std::string text = "TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
+	// Node identity first. Two things make this worth the three lines: the middle-click popup is the
+	// only place the node can name itself and its own binary, and "which FFT.dll answered" is a real
+	// question here - the plugin can be installed under Documents/Derivative/Plugins and also staged in
+	// the project's __Plugins__, and the two copies are indistinguishable in a textport log that does
+	// not say which process loaded which.
+	const char* nodePath = (myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>";
+	const char* dllPath  = (myNodeInfo && myNodeInfo->pluginPath) ? myNodeInfo->pluginPath : "<unknown>";
+	// cookCount is the node's own proof that it is cooking. Everything below it arrives through the
+	// info callbacks, which TouchDesigner only calls inside a cook - so if this number is not climbing,
+	// nothing else on this popup is live either. (That failure mode is why getGeneralInfo returns
+	// cookEveryFrame = true; see the comment there.)
+	const uint32_t cooks = myNodeInfo ? myNodeInfo->cookCount : 0u;
+	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP, " + std::to_string(myAnalysisChannels) + " channel(s))\n";
+	text += "Plugin: TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
+	text += std::string("Binary: ") + dllPath + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + " | " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
 	text += "Engine & Plan: " + s.plan + "\n";
 	text += "FFT Size: N = " + std::to_string(s.fftSize) + " | Window: " + std::to_string(s.capacity) + " samples | magnitude bins computed: " + std::to_string(s.magnitudeBins) + "\n";
@@ -774,7 +827,19 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		         dt_ms);
 		text += buf;
 	}
-	text += "Cook: " + std::to_string(myLastCookUs) + " us (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us\n";
+	// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel,
+	// channel count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the
+	// node's output can be compared without opening a CHOP viewer.
+	snprintf(buf, sizeof(buf), "Output: %d samples/channel x %d channel(s) @ %.0f Hz | window %zu samples of input\n",
+	         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams),
+	         static_cast<size_t>(s.capacity));
+	text += buf;
+	text += "Cook: " + std::to_string(myLastCookUs) + " us CPU (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us"
+	     + " | cooks: " + std::to_string(cooks) + "\n"
+	     // GPU cook time is deliberately not invented here: this node has no GPU stage at all, so
+	     // there is nothing for it to report. TouchDesigner's own Operator Info header carries the
+	     // node's CPU and GPU cook times for the frame; this line is the plugin's own measurement.
+	     + "GPU: none (all stages are CPU/AVX2; TD's Operator Info header reports the per-node GPU time)\n";
 	text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
 	auto logs = myLog.snapshot();
 	size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;

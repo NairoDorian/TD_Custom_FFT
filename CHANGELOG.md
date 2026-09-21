@@ -62,6 +62,35 @@ All notable changes to `Plugin_FFT` are documented here.
 - Tests: **547 checks** (was 493) - backend selection producing the same transform to float precision on both
   libraries and surviving six switches in one engine, the OpenMP check, and the Async single-thread contract.
 
+### Fixed
+- **The middle-click info popup came up empty (regression from v2.3.0).** Reported as "it used to show a lot more
+  information". It was not a popup bug at all: `getGeneralInfo` had been returning `cookEveryFrame = false` /
+  `cookEveryFrameIfAsked = true` since the mono-first async rework, which the SDK defines as *"if nobody is using
+  the output from the CHOP, it won't cook"*. TouchDesigner calls every information callback **inside a cook** - the
+  order is documented at the top of `CHOP_CPlusPlusBase.h` (`execute()`, then `getInfoCHOPChan`, `getInfoDATEntries`,
+  `getInfoPopupString`, `getWarningString`, `getErrorString`) and nothing calls them on demand from the middle-click
+  itself. So an idle node had no Info CHOP, no Info DAT, no warning/error state and an empty popup, because the
+  callbacks were correct but were never reached. The node now returns `cookEveryFrame = true`
+  (`cookEveryFrameIfAsked = false`), which is the honest trade for a node that carries all of its telemetry through
+  those callbacks: the cost is the async pipeline's cook-thread work, **11 us mean / 17 us p99** per cook at 16384
+  bins (v2.4.0, `fft_bench --cook`), about 0.07 % of a 60 fps frame.
+  A second consequence was worse than the empty popup: `getErrorString` is in that same chain, so a node that had
+  stopped cooking could not report a hard failure - a plan that would not build, an input with no usable sample
+  rate - and would just go quiet instead of showing an error badge. Both are fixed by the same flag.
+  `OP_CustomOPInfo::cookOnStart` is also set now, with the caveat recorded in the source: the SDK honours it only
+  for a **Custom Operator**, not for a `.dll` loaded into the built-in CPlusPlus CHOP - which is how PluginBuilder
+  hosts this plugin (`plugin_loader` is a `cplusplusCHOP`). There, `cookEveryFrame` is the flag that does the work.
+- **The popup now names the node and the binary that answered it.** It reports the node path, the registered op
+  type, the plugin version, and `OP_NodeInfo::pluginPath` - the full path of the loaded `FFT.dll`. That last one is
+  not decoration: the plugin can be loaded twice in one TouchDesigner process, once as the registered Custom
+  Operator under `Documents/Derivative/Plugins/FFT` and once by PluginBuilder from `<project>/__Plugins__/FFT`, and
+  each instance resolves its FFTW3/oneMKL libraries from **its own** directory. A log that names one path is
+  therefore not evidence about the other instance, and the popup is where that ambiguity gets settled. The cook
+  count (`OP_NodeInfo::cookCount`) is printed alongside, because it is the node's own proof that the cook-driven
+  telemetry on that popup is live.
+- **Reported version was `v2.8` while the changelog documented v2.9.0** - `kMinorVersion` was never bumped for the
+  v2.9.0 work, so the popup under-reported its own version. Now 2.9.
+
 ### Notes
 - `fftwf_cleanup` and `fftwf_forget_wisdom` are deliberately **not** in the resolved API table. They free
   process-global state - every plan and every cached trigonometric table - so there is no such thing as cleaning
