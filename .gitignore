@@ -13,6 +13,16 @@ __Plugins__/**/*.dll
 __Plugins__/**/*.dll.old*
 *.dll.old*
 
+# The oneMKL runtime, when it is deployed next to FFT.dll so the FFT Backend toggle works in
+# TouchDesigner: the plugin resolves the library from its own directory (pluginDirectory() in
+# FftBackend.h), so `__Plugins__/FFT/` is the only place it can live at run time. It is 521 MB and
+# entirely optional - the plugin runs on the vendored FFTW3 with none of it present - so it is never
+# vendored here, only staged by hand for the machine that wants it. The notices *are* kept with it,
+# because the Intel Simplified Software License requires the license text and the third-party
+# notices to travel with a redistribution of the DLLs:
+#   https://github.com/NairoDorian/TD_Custom_FFT -> 3rdParty/fftw3/README.md, "Using Intel oneMKL"
+__Plugins__/FFT/oneMKL-licenses/
+
 # Vendored FFTW: only the single-precision runtime + import lib are needed
 PluginProjects/FFT/3rdParty/fftw3/temp_extract/
 PluginProjects/FFT/3rdParty/fftw3/*.zip

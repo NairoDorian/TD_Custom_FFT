@@ -75,7 +75,10 @@ build\bin\Release\fft_bench.exe --channels 1 --db 0 --weight 0 --ball 0 --cook 3
 ```
 `PLUGIN_BUILDER_DIR` defaults to the sibling `../../../PluginBuilder_V2`; pass `-DPLUGIN_BUILDER_DIR=` otherwise.
 A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
-The oneMKL DLLs are never deployed by the build: they are the user's to install, and the plugin only looks for them.
+The oneMKL DLLs are never deployed by the build: they are 521 MB, entirely optional, and the user's to install
+(the plugin only *looks* for them, in its own directory). On this machine they are installed in `__Plugins__/FFT/`
+alongside the notices, which `.gitignore` keeps out of the repository — so a fresh clone builds and runs on FFTW3
+alone, and the `FFT Backend` toggle is the only thing that needs them.
 
 Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.21, Ninja, a CPU with AVX2 + FMA.
 
