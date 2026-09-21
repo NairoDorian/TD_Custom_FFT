@@ -333,7 +333,7 @@ A blank popup is one of exactly two things, and they need opposite fixes:
 | | Chain **not** entered | Chain entered, text **not** rendered |
 |---|---|---|
 | `info_callback_calls` Info DAT row | counters **frozen** (they stop advancing while the node cooks) | counters **climb** — popup count tracks `cookCount` 1:1 |
-| Textport | the `getInfoPopupString() called (#N, node cook #M)` line **stops** printing | the line **keeps** printing, with a healthy character count (~1660) |
+| Textport | the `getInfoPopupString() called (#N, node cook #M)` line **stops** printing | the line **keeps** printing, with a healthy character count (~1660 before the v2.9 string trim, ~1100-1300 after) |
 | Meaning | the node stopped cooking → fix the cook, not the popup | the string is fine and TouchDesigner did not draw it → **not a plugin problem** |
 | Fix | see *"Making sure the node is cooking"* below | report to Derivative with that evidence |
 
@@ -344,8 +344,11 @@ and was not drawn". That invariant is deliberate and should be preserved.
 ### Rule: never put a diagnostic in the popup string
 
 This is not a style preference; it is what broke the popup, twice in each direction, and it is the one change that
-was measured. The string that renders is **~1660 characters**: a fixed identity block, a telemetry body, and the
-last five plan-log lines. Adding two diagnostic lines to it - `Info callbacks entered: ...` and `Cook stall: ...` -
+was measured. The string that renders is a fixed identity block plus a telemetry body - a set of numbers whose
+length is dominated by the two paths - and then up to **three** plan-log lines. **The whole thing is now hard-bounded
+at 1600 characters** (`kMaxPopupChars` in `FFT.cpp`), enforced where the only unbounded input enters: the body is
+budgeted first and the tail is filled only while the total fits. Adding two diagnostic lines - `Info callbacks
+entered: ...` and `Cook stall: ...` -
 took it to roughly 1760 and the popup rendered **empty**; removing them brought it back. No size limit is documented
 anywhere in the SDK (`OP_String::setString` is a bare `virtual void setString(const char* val)`, no cap stated), so
 what TouchDesigner does above some undisclosed length is **not** established - but the correlation was reproduced in

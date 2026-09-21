@@ -58,6 +58,21 @@ const int   kMajorVersion = 2;
 const int   kMinorVersion = 9;   // keep in step with CHANGELOG.md - the v2.9.0 work landed without this bump,
                                  // so the popup and the Info DAT reported v2.8 for a v2.9 node
 
+// Upper bound on the middle-click popup string, and how many plan-log lines may be appended into it.
+//
+// The popup is the one string this plugin hands to TouchDesigner whose rendering has been observed to depend
+// on its length: ~1660 characters rendered, ~1760 came up empty (measured, both directions - see README,
+// "The middle-click info popup"). No cap is documented anywhere in the SDK, so no theory of the real limit is
+// available to design against. What *is* available is the shortest length known to have failed, and the bound
+// is set clear of it: everything the popup can say, including the tail, is held under 1600 characters.
+//
+// The bound only has to bind the tail. The body above it is a fixed set of numbers - the only variable-length
+// pieces are the node path and the plugin path - so it cannot grow on its own; a plan-log entry can, because
+// it carries whatever the engine logged. Bounding where the unbounded input enters is what makes the total
+// bounded without the body having to truncate a number, which would be worse than a long string.
+constexpr size_t kMaxPopupChars     = 1600;
+constexpr size_t kTailPlanLogLines  = 3;
+
 using clk = std::chrono::steady_clock;
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
 
@@ -869,10 +884,10 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	// cookCount is the node's own proof that it is cooking; if it is not climbing, nothing else here is
 	// live. (That failure mode is why getGeneralInfo returns cookEveryFrame = true - see there.)
 	const uint32_t cooks = myNodeInfo ? myNodeInfo->cookCount : 0u;
-	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP, " + std::to_string(myAnalysisChannels) + " channel(s))\n";
-	text += "Plugin: TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
+	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP)\n";
+	text += "Plugin: TouchDesigner Custom FFT v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
 	text += std::string("Binary: ") + dllPath + "\n";
-	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + " | " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
+	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + ", " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
 	// NO DIAGNOSTIC LINES ABOVE THIS POINT THAT ARE NOT IN THE ORIGINAL. The body below is byte-for-byte
 	// the text that was verified rendering as a full middle-click popup. Two lines were briefly added here
 	// - an "Info callbacks entered" counter line and a "Cook stall" line - and the popup came up empty
@@ -885,13 +900,13 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		const AnalysisPipeline::Status s = statusSnapshot();
 		char buf[256];
 		text += "Engine & Plan: " + s.plan + "\n";
-		text += "FFT Size: N = " + std::to_string(s.fftSize) + " | Window: " + std::to_string(s.capacity) + " samples | magnitude bins computed: " + std::to_string(s.magnitudeBins) + "\n";
+		text += "FFT: N = " + std::to_string(s.fftSize) + " | window " + std::to_string(s.capacity) + " samples | " + std::to_string(s.magnitudeBins) + " magnitude bins\n";
 		{
 			const double axis_rate = outputAxisRate(myParams, mySampleRate);
 			const int n_out = outputBinCountFrom(myParams);
 			snprintf(buf, sizeof(buf), "Spectrum axis: %d bins @ %.2f Hz = %.1f..%.1f Hz (input %.1f Hz%s)\n",
 			         n_out, hzPerSample(myParams, mySampleRate), s.axisBottom, axis_rate * 0.5, mySampleRate,
-			         s.linearGrid ? ", linear grid: identity warp, no resampling" : ", resampled onto the warp grid");
+			         s.linearGrid ? ", linear grid, no resampling" : ", warped grid");
 			text += buf;
 		}
 		{
@@ -901,31 +916,52 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 			const double dt_ms = myCookDtMs.load(std::memory_order_relaxed);
 			const double rate = myCookRate.load(std::memory_order_relaxed);
 			const int n_out = outputBinCountFrom(myParams);
-			snprintf(buf, sizeof(buf), "Sample rate (to TouchDesigner): %.0f Hz = %d bins x %.2f frames/s (me.time.rate)\n",
+			snprintf(buf, sizeof(buf), "Rate: %.0f Hz = %d bins x %.2f fps (me.time.rate)\n",
 			         outputSampleRate(myParams), n_out, rate > 0.0 ? rate : 60.0);
 			text += buf;
-			snprintf(buf, sizeof(buf), "Measured throughput: %.0f samples/s (cook delta %.2f ms)\n",
+			snprintf(buf, sizeof(buf), "Throughput: %.0f samples/s (cook delta %.2f ms)\n",
 			         outputBandwidth(myParams),
 			         dt_ms);
 			text += buf;
 		}
 		// The shape of what leaves the node, stated the way TouchDesigner sees it (samples per channel,
 		// channel count, sample rate) - the same three numbers getOutputInfo() sets, so the popup and the
-		// node's output can be compared without opening a CHOP viewer.
-		snprintf(buf, sizeof(buf), "Output: %d samples/channel x %d channel(s) @ %.0f Hz | window %zu samples of input\n",
-		         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams),
-		         static_cast<size_t>(s.capacity));
+		// node's output can be compared without opening a CHOP viewer. The window length that used to trail
+		// this line is gone: the FFT line above already reports it.
+		snprintf(buf, sizeof(buf), "Output: %d samples x %d channel(s) @ %.0f Hz\n",
+		         outputBinCountFrom(myParams), myAnalysisChannels, outputSampleRate(myParams));
 		text += buf;
-		text += "Cook: " + std::to_string(myLastCookUs) + " us CPU (params " + std::to_string(myParamUs) + " us) | DSP: " + std::to_string(myDspUs.load(std::memory_order_relaxed)) + " us"
-		     + " | cooks: " + std::to_string(cooks) + "\n"
-		     // GPU cook time is deliberately not invented here: this node has no GPU stage at all, so
-		     // there is nothing for it to report. TouchDesigner's own Operator Info header carries the
-		     // node's CPU and GPU cook times for the frame; this line is the plugin's own measurement.
-		     + "GPU: none (all stages are CPU/AVX2; TD's Operator Info header reports the per-node GPU time)\n";
+		// One decimal, not std::to_string's six. std::to_string(double) is %f, so a cook time of 13 us
+		// printed as "13.000000" - six digits of noise on a microsecond figure, and eleven wasted
+		// characters per number on a string that has to stay short. The cook count that used to end this
+		// line is gone; proving the node is cooking is the identity block's job, and the count is in the
+		// info_callback_calls Info DAT row where reading it costs the popup nothing.
+		snprintf(buf, sizeof(buf), "Cook: %.1f us CPU (params %.1f us) | DSP: %.1f us\n",
+		         myLastCookUs, myParamUs, myDspUs.load(std::memory_order_relaxed));
+		text += buf;
+		// GPU cook time is deliberately not invented here: this node has no GPU stage at all, so there is
+		// nothing for it to report. TouchDesigner's own Operator Info header carries the node's CPU and GPU
+		// cook times for the frame; this line is the plugin's own measurement.
+		text += "GPU: none (CPU/AVX2 only; TD reports per-node GPU time)\n";
 		text += std::string("SIMD: ") + (myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU") + "\n\n--- Recent Plan Event Logs ---\n";
+		// The tail is the only part of this string with no fixed size. Everything above is a fixed set of
+		// numbers (the only variable-length pieces are the two paths), but a plan-log entry is arbitrary
+		// text - a plan line carries the FFTW wisdom note, a backend name, timing - and there can be several
+		// of them. So the total length is bounded here, where the unbounded input is: the body is budgeted
+		// first and the tail is filled only while it fits.
+		//
+		// The bound is kMaxPopupChars, and the number is chosen to stay under the smallest length this popup
+		// is *known* to have failed at rather than picked from a theory of what the real limit is. Measured:
+		// ~1660 characters rendered, ~1760 came up empty (see README, "The middle-click info popup"). No
+		// limit is documented on OP_String::setString, so rather than guess at it, the string is held well
+		// clear of the shortest length observed to break - and the actual length is reported in the
+		// info_callback_calls Info DAT row, so if this bound is ever the thing that is wrong, it says so.
 		auto logs = myLog.snapshot();
-		size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
-		for (size_t i = start_idx; i < logs.size(); ++i) text += logs[i] + "\n";
+		const size_t start_idx = logs.size() > kTailPlanLogLines ? logs.size() - kTailPlanLogLines : 0;
+		for (size_t i = start_idx; i < logs.size(); ++i) {
+			if (text.size() + logs[i].size() + 1 > kMaxPopupChars) break;
+			text += logs[i] + "\n";
+		}
 	} catch (const std::exception& e) {
 		text += std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n";
 	} catch (...) {

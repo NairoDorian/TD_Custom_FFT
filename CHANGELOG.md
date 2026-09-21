@@ -153,6 +153,25 @@ All notable changes to `Plugin_FFT` are documented here.
   row report it: a value near 16.7 ms is one 60 fps frame, and a value in seconds says the node stopped cooking
   for that long and its information output was blank while it lasted.
 
+- **The popup string was shortened, its numbers now read properly, and its length is bounded.** Three separate
+  things, all in the same string:
+  - **Timing figures were printed with six decimals.** `std::to_string(double)` is `%f`, so a 13 µs cook time
+    read `Cook: 13.000000 us CPU (params 10.700000 us) | DSP: 124.300000 us` - six digits of noise on a
+    microsecond figure. Now `%.1f`: `Cook: 13.0 us CPU (params 10.7 us) | DSP: 124.3 us`.
+  - **The cook count no longer ends the Cook line.** Proving the node is cooking is the identity block's job, and
+    the count is in the `info_callback_calls` Info DAT row, where reading it costs the popup nothing. Wordy labels
+    were trimmed throughout the same pass (`FFT Size:` → `FFT:`, `magnitude bins computed` → `magnitude bins`,
+    `Sample rate (to TouchDesigner)` → `Rate:`, `Measured throughput` → `Throughput:`, `frames/s` → `fps`, and the
+    `Output:` line's window length, which the FFT line above it already reports). Every number is still there.
+  - **The string is now bounded at 1600 characters, with at most 3 plan-log lines.** The body is a fixed set of
+    numbers - only the node path and the plugin path vary - but a plan-log entry is arbitrary text, so the tail was
+    the one unbounded input. The bound is enforced where that input enters: the body is budgeted first and the tail
+    fills only while the total fits. `kMaxPopupChars` is set **under the shortest length known to have failed**
+    (~1760, measured) rather than from a theory of the real limit, because none is documented. Measured effect:
+    ~1660 characters before this change, roughly **1100-1300** now, with the ceiling no longer reachable by a long
+    log line. The actual length is reported in the `info_callback_calls` Info DAT row, so if the bound is ever the
+    thing that is wrong, it says so rather than being silent.
+
 ### Confirmed in TouchDesigner, and what that confirmation cost
 The middle-click popup was watched rendering **in full** from this plugin, in TouchDesigner, on the build this
 entry describes. The evidence is the textport line, and it settles two questions at once:
