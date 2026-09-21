@@ -104,6 +104,53 @@ All notable changes to `Plugin_FFT` are documented here.
   is a line forever, confirming something already known. It now prints **once per load** - the one moment it is
   wanted, when an empty popup is the symptom being chased - and the state it used to announce on a timer is
   readable on demand from the popup's `Info callbacks entered:` line and from `info_callback_calls`.
+- **A corrected claim, and what it means for the bullets above.** The bullet above records that "the empty popup
+  really was the cooking flag". That conclusion was drawn from the counters and it was too strong: the counters
+  prove TouchDesigner *enters* the info chain every cook, which is not the same as proving the popup rendered,
+  and the popup went empty again afterwards with the flag unchanged. The flag fix is still correct and still
+  needed (`cookEveryFrame = false` genuinely was a bug), but it is not established as *the* popup cause. The
+  bullets below are the same class of mistake being avoided: they record what was measured, and mark separately
+  what has not been confirmed in TouchDesigner.
+- **Two error states were latched and could never clear (real defect, independent of the popup).** `myErrorText`
+  was set by the `execute()` catch blocks and cleared **only** when the user happened to pulse `Reset`, and the
+  error string was driven off the lifetime counter `myPipelineErrors`, which is never cleared at all. So a single
+  transient exception - which is exactly what a plugin hot-swap during development produces - left a node that was
+  cooking correctly flagged as broken permanently. This matters for the popup specifically because TouchDesigner
+  reports a node's error state in place of the operator's own information, which is one of the few things that can
+  empty a middle-click popup while every callback behind it runs normally. Both now clear on the condition they
+  describe: `myErrorText` is cleared by the first cook that completes, and the error string is gated on a new
+  `myPipelineFailing` flag that is set on a throw and **cleared when an analysis publishes a result**. The lifetime
+  count is kept and reported as the history it is. A fault that recurs re-latches on the next cook, so nothing is
+  hidden. Tested: 547 checks, 0 failures.
+- **`getInfoPopupString` publishes its text once, at the end, on every path.** It had been changed to publish a
+  four-line identity block first and then publish the full text again, so `setString` ran twice per call. The
+  single-call form - build the whole string, set it once - is the form that was observed rendering the complete
+  popup in this harness, so it is restored. The safety property the two-call order was reaching for is kept without
+  a second call: the identity block is in `text` before the `try`, and the catches **append** a note rather than
+  replacing it, so this final `setString` always hands TouchDesigner a populated popup. **Not yet confirmed in
+  TouchDesigner** - see the note below.
+- **The Info DAT declared a row count it might not fill.** `getInfoDATSize` computed `rows` from `myLog.size()` and
+  `getInfoDATEntries` walked `myLog` again. `PlanLog::log()` truncates the history by half at
+  `kMaxPlanLogEntries` (256), so a plan event logged by the worker between the two calls made the log *shorter*
+  after the size was declared, leaving TouchDesigner walking rows the plugin never wrote. The log is now frozen
+  into `myInfoDatLog` at size time and the walk reads only that copy - the same view for both calls, which is what
+  the API requires.
+- **Cook-stall telemetry, because a stopped cook is invisible from outside.** Every signal this node produces is
+  emitted from inside a cook, so when cooking stops they all go quiet together and the node simply looks blank
+  with nothing anywhere saying why. `executeImpl` now records the largest gap between two consecutive cooks
+  (`myMaxCookGapMs`, two clock reads per cook, no allocation) and the popup and the `info_callback_calls` Info DAT
+  row report it: a value near 16.7 ms is one 60 fps frame, and a value in seconds says the node stopped cooking
+  for that long and its information output was blank while it lasted.
+
+### Not confirmed in TouchDesigner
+The popup fix above is a plugin-side change and was **not** reproduced in TouchDesigner from the development
+machine - a report of a blank middle-click popup arriving after a build that contained it. What *is* established:
+the plugin builds clean, passes all 547 checks, and the deployed `__Plugins__/FFT/FFT.dll` is byte-identical to the
+build output. What is **not** established: that the popup renders after this change. The two counters, the
+`Cook stall:` line and the `info_callback_calls` row exist precisely so the next report can say which of the three
+failure modes it is - the chain is not entered (counters frozen while the node cooks), the chain is entered but
+nothing renders (counters climb, popup empty), or the node stopped cooking (a `Cook stall` far above one frame) -
+instead of another round of guessing.
 
 ### Notes
 - `fftwf_cleanup` and `fftwf_forget_wisdom` are deliberately **not** in the resolved API table. They free

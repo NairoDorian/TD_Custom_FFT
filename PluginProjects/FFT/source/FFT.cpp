@@ -424,14 +424,20 @@ FFT::runJob(const AnalysisJob& job)
 		myPipeline->process(job, res);
 	} catch (...) {
 		// The slot is not published: the previous result stays visible. Record that an analysis
-		// failed so it surfaces instead of vanishing silently into the textport.
+		// failed so it surfaces instead of vanishing silently into the textport. Two records, because
+		// they answer different questions: the counter is the lifetime tally for the Info DAT, and the
+		// flag is whether the node is failing *now*, which is what the error string reports.
 		myPipelineErrors.fetch_add(1, std::memory_order_relaxed);
+		myPipelineFailing.store(true, std::memory_order_relaxed);
 		myLog.log("[FFT Plugin] [pipeline] analysis threw an exception; previous spectrum retained");
 		return;
 	}
 	myPlanFailed.store(myPipeline->planFailed(), std::memory_order_relaxed);
 	res.seq = job.seq;
 	myResults.publish();
+	// A published result is the proof the pipeline is working again, so the failure flag goes down here.
+	// If the fault is persistent it is set again by the very next analysis, so this cannot mask anything.
+	myPipelineFailing.store(false, std::memory_order_relaxed);
 	myDspUs.store(myPipeline->lastUs(), std::memory_order_relaxed);
 	// Exactly the axis rate read off the tables that produced these bins — it is 2*(top of the axis)
 	// by construction, never fitted and never assumed (relaxed: the cook only needs it to be a recent,
@@ -539,6 +545,22 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	const auto t_start = clk::now();
 	FFTDSP::DenormalGuard ftz;
 
+	// --- 0. how long was the gap since the previous cook? --------------------------------------
+	// This is the only place in the plugin that can observe a cook that did NOT happen. Every other
+	// signal - the popup, the Info CHOP, the Info DAT, the warning and error strings - is produced by
+	// callbacks TouchDesigner runs *inside a cook*, so if cooking stops they all go quiet together and
+	// the node simply looks blank, with nothing anywhere saying why. Recording the largest gap means
+	// that once cooking resumes (which is what a reload does), the popup can say it happened and for
+	// how long, instead of the user being left with an empty box and no history. Two clock reads per
+	// cook, on the cook thread, and no allocation.
+	if (myLastCookStart.time_since_epoch().count() != 0) {
+		const double gap_ms = std::chrono::duration<double, std::milli>(t_start - myLastCookStart).count();
+		if (gap_ms > myMaxCookGapMs.load(std::memory_order_relaxed)) {
+			myMaxCookGapMs.store(gap_ms, std::memory_order_relaxed);
+		}
+	}
+	myLastCookStart = t_start;
+
 	// --- 1. parameters (normally already polled by getOutputInfo for this cook) ---
 	myExecStage = 1;
 	if (!myParamsFreshForExecute) pollParameters(inputs);
@@ -605,6 +627,18 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
 	try {
 		executeImpl(output, inputs);
+		// The cook completed, so whatever the previous cook failed on is no longer this node's state, and
+		// the error string is cleared here. It used to survive until the user happened to pulse Reset,
+		// which is a latch with no relation to the fault: a node cooking perfectly well stayed flagged as
+		// broken for as long as nobody pressed anything. That matters beyond the flag itself, because
+		// TouchDesigner reports a node in an error state in place of the operator's own information, so a
+		// latched error is one of the few things that empties a middle-click popup while every callback
+		// behind it is running normally. A fault that recurs re-latches this on the next cook, so clearing
+		// it hides nothing - it only stops the node from claiming a fault it no longer has.
+		if (!myErrorText.empty()) {
+			myLog.log("[FFT Plugin] recovered: this cook completed, clearing the latched error \"" + myErrorText + "\"");
+			myErrorText.clear();
+		}
 	} catch (const std::exception& e) {
 		myErrorText = std::string("exception at stage ") + std::to_string(myExecStage) + ": " + e.what();
 		myLog.log("[FFT Plugin] ERROR: " + myErrorText + " — zeroing output");
@@ -677,7 +711,15 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 	// getInfoPopupString in the documented cook order, so if this number climbs and the popup's does
 	// not, the chain is breaking between the two rather than never starting.
 	myInfoDatSizeCalls.fetch_add(1, std::memory_order_relaxed);
-	infoSize->rows = 20 + static_cast<int32_t>(myLog.size());
+	// The row count and the rows themselves must come from the SAME view of the log. PlanLog::log()
+	// truncates the history by half once it reaches kMaxPlanLogEntries, so a plan event logged by the
+	// worker between the two calls would make the log *shorter* after the size was declared - and every
+	// row past the new end would then be left unwritten, handing TouchDesigner rows with nothing in
+	// them. TouchDesigner only asks for the size once and then walks that many rows, so the fix is to
+	// freeze the view here and have getInfoDATEntries() read exactly this copy. The info callbacks all
+	// run on the cook thread, so the copy cannot change underneath the walk that follows it.
+	myInfoDatLog = myLog.snapshot();
+	infoSize->rows = 20 + static_cast<int32_t>(myInfoDatLog.size());
 	infoSize->cols = 2;
 	infoSize->byColumn = false;
 	return true;
@@ -781,21 +823,24 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 		return;
 	}
 	case 19: {
-		// The same three counters the popup prints, readable without middle-clicking. They advance in
-		// lockstep with the node's cook count whenever the info chain is live, which is what makes them a
-		// usable signal: a row stuck at 0 while the node is visibly cooking means TouchDesigner is not
-		// entering the info callbacks at all, and no plugin-side string change can fix that.
+		// The same counters the popup prints, readable without middle-clicking, plus the largest gap
+		// between two cooks. Together they separate the three ways this node can look blank: the info
+		// chain is not being entered at all (counters stuck at 0 while the node is visibly cooking), the
+		// counters climb but nothing renders, or the node stopped cooking for a stretch (a stall far
+		// above one frame). All three are invisible from outside, which is why they share a row.
+		const double gap_ms = myMaxCookGapMs.load(std::memory_order_relaxed);
 		row("info_callback_calls", "popup " + std::to_string(myInfoPopupCalls.load(std::memory_order_relaxed))
 		    + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
-		    + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed)));
+		    + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed))
+		    + " | largest cook gap " + std::to_string(gap_ms) + " ms");
 		return;
 	}
 	default: break;
 	}
 	size_t log_idx = static_cast<size_t>(index - 20);
-	if (log_idx < myLog.size()) {
+	if (log_idx < myInfoDatLog.size()) {
 		snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
-		row(tempBuffer, myLog.entry(log_idx));
+		row(tempBuffer, myInfoDatLog[log_idx]);
 	}
 }
 
@@ -823,10 +868,9 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		          + ") - middle-click info is being served by this plugin. Logged once per load.");
 	}
 
-	// The identity block is built and committed before anything that can fail, so a throw further down
-	// leaves TD with a populated popup instead of an empty one. Telemetry that can blank the whole
-	// popup is worse than telemetry that is missing: the popup exists to explain the node, and an empty
-	// one says nothing at all. Everything after this point is inside the try for that reason.
+	// The text is built whole and handed to TouchDesigner exactly once, at the very end of this function,
+	// on every path - see the note above the setString call for why the single call is load-bearing.
+	// Everything between here and there only appends to `text`.
 	const char* nodePath = (myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>";
 	const char* dllPath  = (myNodeInfo && myNodeInfo->pluginPath) ? myNodeInfo->pluginPath : "<unknown>";
 	// cookCount is the node's own proof that it is cooking; if it is not climbing, nothing else here is
@@ -839,8 +883,18 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	text += "Info callbacks entered: popup " + std::to_string(popupCall)
 	     + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
 	     + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed)) + "\n";
-	info->setString(text.c_str());
-
+	// The tallest gap between two cooks since this instance loaded. One frame at 60 fps is ~16.7 ms, so
+	// anything much above that is a stall, and a large number here is the explanation for an info popup
+	// that was blank earlier: every callback on this text runs inside a cook, so while cooking is stopped
+	// the node has nothing to show. Reported rather than hidden because it is invisible otherwise.
+	{
+		const double gap_ms = myMaxCookGapMs.load(std::memory_order_relaxed);
+		text += "Cook stall: largest gap between cooks "
+		     + (gap_ms > 100.0 ? std::to_string(gap_ms / 1000.0) + " s"
+		                       : std::to_string(gap_ms) + " ms")
+		     + (gap_ms > 100.0 ? " (the node was not cooking; its info output is blank while that lasts)\n"
+		                       : " (normal - one frame at 60 fps is 16.7 ms)\n");
+	}
 	try {
 		const AnalysisPipeline::Status s = statusSnapshot();
 		char buf[256];
@@ -886,14 +940,27 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		auto logs = myLog.snapshot();
 		size_t start_idx = logs.size() > 5 ? logs.size() - 5 : 0;
 		for (size_t i = start_idx; i < logs.size(); ++i) text += logs[i] + "\n";
-		info->setString(text.c_str());
 	} catch (const std::exception& e) {
 		text += std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n";
-		info->setString(text.c_str());
 	} catch (...) {
 		text += "(telemetry truncated after the identity block: unknown exception)\n";
-		info->setString(text.c_str());
 	}
+
+	// ONE setString per call, at the end, reached on every path including both catches above.
+	//
+	// This is the fix for the middle-click popup going blank, and the ordering is the whole of it. The
+	// previous version published the four-line identity block with a setString *before* the try, then
+	// built the full text and published that with a second setString after it. The popup then rendered
+	// with nothing in its body, while the same build's counters showed TouchDesigner entering this
+	// callback on every single cook - so the text was being produced and thrown away, not never produced.
+	// The version before that change, which built the string in full and set it exactly once at the end,
+	// is the one that rendered the complete popup in this harness. That is the shape restored here.
+	//
+	// The safety property the old two-call order was reaching for is kept, and does not need a second
+	// call to keep it: `text` already holds the identity block and the cook-stall line before the try is
+	// entered, so if anything below throws, the catches append a note to text rather than replacing it,
+	// and this call still hands TouchDesigner a populated popup. It can never come up empty.
+	info->setString(text.c_str());
 }
 
 void
@@ -910,7 +977,10 @@ FFT::getErrorString(OP_String* error, void* reserved1)
 {
 	if (!myErrorText.empty()) error->setString(myErrorText.c_str());
 	else if (myPlanFailed.load(std::memory_order_relaxed)) error->setString("FFTW plan creation failed for the current FFT size (see textport log); output is silent until a plan succeeds or the FFT size changes.");
-	else if (myPipelineErrors.load(std::memory_order_relaxed) > 0) error->setString((std::to_string(myPipelineErrors.load(std::memory_order_relaxed)) + " analysis pipeline error(s); see textport log.").c_str());
+	// Gated on the live flag, not on the lifetime counter, and the count is reported as the history it is.
+	// Driving this off "has an analysis ever thrown?" meant one transient exception - the kind a plugin
+	// hot-swap during development produces - left the node erroring forever with the fault long gone.
+	else if (myPipelineFailing.load(std::memory_order_relaxed)) error->setString((std::to_string(myPipelineErrors.load(std::memory_order_relaxed)) + " analysis pipeline error(s), the most recent on the last analysis; previous spectrum retained, see textport log.").c_str());
 	else if (mySampleRate <= 0.0) error->setString("Invalid or missing audio sample rate from input CHOP.");
 }
 

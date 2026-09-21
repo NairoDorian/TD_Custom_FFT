@@ -55,6 +55,7 @@
 #include "Parameters.h"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -175,7 +176,14 @@ private:
 
 	// --- engine/pipeline failure escalation (lock-free; details go to the deferred textport log) ---
 	std::atomic<bool>		myPlanFailed{ false };      // prepare() failed to produce a plan for the current size
-	std::atomic<uint64_t>	myPipelineErrors{ 0 };      // runJob() caught an exception (slot not published)
+	std::atomic<uint64_t>	myPipelineErrors{ 0 };      // lifetime count of runJob() exceptions, telemetry only
+	// Whether the MOST RECENT analysis threw. The lifetime counter above is not a statement about the
+	// present, so it must not drive the error string on its own: latched on the counter alone, a single
+	// transient exception during a reload left the node flagged as broken forever while it was cooking
+	// correctly, and TouchDesigner reports a node in an error state instead of its operator information -
+	// which is one of the few things that can empty a middle-click popup with nothing else visibly wrong.
+	// Set on a throw, cleared when an analysis completes and publishes.
+	std::atomic<bool>		myPipelineFailing{ false };
 
 	// --- telemetry ---
 	std::atomic<double>	myDspUs{ 0.0 };
@@ -199,6 +207,17 @@ private:
 	std::atomic<uint32_t> myInfoPopupCalls{ 0 };
 	std::atomic<uint32_t> myInfoDatSizeCalls{ 0 };
 	std::atomic<uint32_t> myInfoChopChansCalls{ 0 };
+	// Longest gap between two consecutive cooks, and the start of the previous cook. Cook thread only,
+	// except the high-water mark, which the Info callbacks read. This is the one measurement that can
+	// report a cook that did not happen: the node's whole information surface lives inside a cook, so a
+	// stall blanks all of it at once and leaves nothing to explain itself. See executeImpl.
+	std::atomic<double> myMaxCookGapMs{ 0.0 };
+	std::chrono::steady_clock::time_point myLastCookStart{};
+	// The plan-log rows for the Info DAT, frozen by getInfoDATSize() and consumed by
+	// getInfoDATEntries(). It exists so the declared row count and the rows actually written describe the
+	// same log: PlanLog::log() truncates the history by half at its cap, so reading myLog twice could see
+	// two different lengths and leave TouchDesigner walking rows the plugin never filled. Cook thread only.
+	std::vector<std::string> myInfoDatLog;
 };
 
 #endif // FFT_H
