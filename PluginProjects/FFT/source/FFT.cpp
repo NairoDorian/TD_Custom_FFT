@@ -828,8 +828,15 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 		// chain is not being entered at all (counters stuck at 0 while the node is visibly cooking), the
 		// counters climb but nothing renders, or the node stopped cooking for a stretch (a stall far
 		// above one frame). All three are invisible from outside, which is why they share a row.
+		//
+		// The popup's last character count rides here too, and here rather than in the popup string
+		// precisely so it cannot be suspected of affecting what it measures: this row is read as a value,
+		// not rendered as the popup, so whatever the popup does with its text cannot change this number.
+		// Read it as: counters at 0 while the node cooks = the chain never reaches these callbacks; a
+		// healthy character count on a blank popup = a real string was handed over and not rendered.
 		const double gap_ms = myMaxCookGapMs.load(std::memory_order_relaxed);
 		row("info_callback_calls", "popup " + std::to_string(myInfoPopupCalls.load(std::memory_order_relaxed))
+		    + " (" + std::to_string(myInfoPopupLen.load(std::memory_order_relaxed)) + " chars)"
 		    + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
 		    + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed))
 		    + " | largest cook gap " + std::to_string(gap_ms) + " ms");
@@ -849,24 +856,10 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 {
 	// --- is this callback even being called? -------------------------------------------------
 	// TouchDesigner calls the whole info chain inside a cook, so an empty popup can mean either "TD
-	// never called us" (the node is not cooking) or "TD called us and did not render the text". Those
-	// need opposite fixes and are indistinguishable from the popup itself, so the first entry is
-	// announced in the textport: if this line never appears, the problem is upstream of this string and
-	// no amount of rewriting it will help.
-	//
-	// Announced ONCE, not repeatedly. TouchDesigner enters this callback on every cook, so a periodic
-	// version of this line prints forever at 60 fps to confirm something already known - which is exactly
-	// what it did before it was cut down to this one-shot. The line is only ever wanted right after a
-	// load, when an empty popup is the symptom being chased; after that the same three counters are
-	// readable on demand from the popup's own "Info callbacks entered" line and, without a textport, from
-	// the `info_callback_calls` Info DAT row.
+	// never called us" (the chain broke before this callback) or "TD called us and did not render the
+	// text". Those need opposite fixes and are indistinguishable from the popup itself, so entries are
+	// announced in the textport.
 	const uint32_t popupCall = myInfoPopupCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (popupCall == 1) {
-		myLog.log(std::string("[FFT Plugin] info chain live: TouchDesigner entered getInfoPopupString() (node cook #")
-		          + std::to_string(myNodeInfo ? myNodeInfo->cookCount : 0u)
-		          + ", " + ((myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>")
-		          + ") - middle-click info is being served by this plugin. Logged once per load.");
-	}
 
 	// The text is built whole and handed to TouchDesigner exactly once, at the very end of this function,
 	// on every path - see the note above the setString call for why the single call is load-bearing.
@@ -880,21 +873,14 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	text += "Plugin: TouchDesigner Custom FFT Plugin v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
 	text += std::string("Binary: ") + dllPath + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + " | " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
-	text += "Info callbacks entered: popup " + std::to_string(popupCall)
-	     + ", Info CHOP " + std::to_string(myInfoChopChansCalls.load(std::memory_order_relaxed))
-	     + ", Info DAT " + std::to_string(myInfoDatSizeCalls.load(std::memory_order_relaxed)) + "\n";
-	// The tallest gap between two cooks since this instance loaded. One frame at 60 fps is ~16.7 ms, so
-	// anything much above that is a stall, and a large number here is the explanation for an info popup
-	// that was blank earlier: every callback on this text runs inside a cook, so while cooking is stopped
-	// the node has nothing to show. Reported rather than hidden because it is invisible otherwise.
-	{
-		const double gap_ms = myMaxCookGapMs.load(std::memory_order_relaxed);
-		text += "Cook stall: largest gap between cooks "
-		     + (gap_ms > 100.0 ? std::to_string(gap_ms / 1000.0) + " s"
-		                       : std::to_string(gap_ms) + " ms")
-		     + (gap_ms > 100.0 ? " (the node was not cooking; its info output is blank while that lasts)\n"
-		                       : " (normal - one frame at 60 fps is 16.7 ms)\n");
-	}
+	// NO DIAGNOSTIC LINES ABOVE THIS POINT THAT ARE NOT IN THE ORIGINAL. The body below is byte-for-byte
+	// the text that was verified rendering as a full middle-click popup. Two lines were briefly added here
+	// - an "Info callbacks entered" counter line and a "Cook stall" line - and the popup came up empty
+	// afterwards. Whether the text or something else is at fault is not established, but those two values
+	// are diagnostics, and a diagnostic must never be able to change what it is measuring: they now live
+	// in the Info DAT (see the info_callback_calls row), which is read as rows and columns and cannot be
+	// affected by anything about this string. This is the bisection - same content as the known-good
+	// build, so if the popup renders again the cause was in the text, and if it does not, it was not.
 	try {
 		const AnalysisPipeline::Status s = statusSnapshot();
 		char buf[256];
@@ -946,21 +932,40 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		text += "(telemetry truncated after the identity block: unknown exception)\n";
 	}
 
-	// ONE setString per call, at the end, reached on every path including both catches above.
+	// ONE setString per call, at the end, reached on every path including both catches above. The
+	// two-call version it replaced built a short identity block, published it, then published the full
+	// text; the single-call form is what this harness was observed rendering, so it is what is kept.
 	//
-	// This is the fix for the middle-click popup going blank, and the ordering is the whole of it. The
-	// previous version published the four-line identity block with a setString *before* the try, then
-	// built the full text and published that with a second setString after it. The popup then rendered
-	// with nothing in its body, while the same build's counters showed TouchDesigner entering this
-	// callback on every single cook - so the text was being produced and thrown away, not never produced.
-	// The version before that change, which built the string in full and set it exactly once at the end,
-	// is the one that rendered the complete popup in this harness. That is the shape restored here.
-	//
-	// The safety property the old two-call order was reaching for is kept, and does not need a second
-	// call to keep it: `text` already holds the identity block and the cook-stall line before the try is
-	// entered, so if anything below throws, the catches append a note to text rather than replacing it,
-	// and this call still hands TouchDesigner a populated popup. It can never come up empty.
+	// The safety property the two-call order was reaching for is kept without needing a second call:
+	// `text` already holds the identity block before the try is entered, so if anything below throws, the
+	// catches append a note rather than replacing it, and this call still hands TouchDesigner a populated
+	// popup. It cannot come up empty because the callback ran and threw - only because TouchDesigner never
+	// called it, which myInfoPopupCalls answers separately.
 	info->setString(text.c_str());
+	// The length actually handed over, for the announcement below and the Info DAT row. It is recorded
+	// because a destination with a fixed capacity that is given more than it holds looks exactly like a
+	// popup that was never filled, and every measurement of that failure so far has been blind to the one
+	// number that would confirm it: a blank popup alongside a length that has grown past its previous
+	// values says the text outgrew something, while a blank popup alongside an ordinary length says the
+	// text is not the problem.
+	myInfoPopupLen.store(static_cast<uint32_t>(text.size()), std::memory_order_relaxed);
+
+	// --- announce this entry, on the cadence this harness had when the popup was last seen in full ---
+	// Calls 1, 2 and every 300th. The first two land immediately after a load, which is when an empty
+	// popup is the symptom being chased; the 300th is a heartbeat (one line every ~5 s at 60 fps) that
+	// answers the question that must be settled before anything else is changed: is TouchDesigner
+	// entering this callback at all? It is a flood compared to a one-shot line, but it is the exact
+	// cadence the report that triggered this fix cites by name ("#2100", "#2400"), it costs one buffered
+	// string per 300 cooks, and it is the only thing that separates "TD never called us" - which is
+	// upstream of every line of text below - from "TD called us and did not render what it was given",
+	// which is a TouchDesigner-side matter. The length is carried on the same line so one paste answers
+	// both halves: no line at all means the callback is not running, and a line with a healthy character
+	// count means a real string was handed over and nothing rendered it.
+	if (popupCall == 1 || popupCall == 2 || (popupCall % 300) == 0) {
+		myLog.log(std::string("[FFT Plugin] getInfoPopupString() called (#") + std::to_string(popupCall)
+		          + ", node cook #" + std::to_string(cooks) + ") - TD is reading this node's custom popup text ("
+		          + std::to_string(text.size()) + " chars handed over)");
+	}
 }
 
 void

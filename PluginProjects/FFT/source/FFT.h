@@ -202,11 +202,18 @@ private:
 	// How many times TouchDesigner has actually entered each info callback. Nothing else in the plugin
 	// can answer "is the popup empty because TD never called us, or because it called us and did not
 	// render the text?", and the whole info chain runs inside a cook, so a node that is not cooking
-	// leaves these at 0 with no other visible symptom. Reported three ways: the first-call log line (once per
-	// load), the popup's own `Info callbacks entered:` line, and the `info_callback_calls` Info DAT row.
+	// leaves these at 0 with no other visible symptom. Reported three ways: the periodic log line, the
+	// `info_callback_calls` Info DAT row, and (for the popup) the length below.
 	std::atomic<uint32_t> myInfoPopupCalls{ 0 };
 	std::atomic<uint32_t> myInfoDatSizeCalls{ 0 };
 	std::atomic<uint32_t> myInfoChopChansCalls{ 0 };
+	// Length of the string last handed to TouchDesigner by getInfoPopupString. It is recorded because a
+	// destination with a fixed capacity that is given more than it holds looks exactly like a popup that
+	// was never filled, and every measurement of that failure so far has been blind to the one number
+	// that would confirm it: a blank popup alongside a length that has grown past its previous values
+	// says the text outgrew something, while a blank popup alongside an ordinary length says the text
+	// was never the problem and the callback may not be entered at all.
+	std::atomic<uint32_t> myInfoPopupLen{ 0 };
 	// Longest gap between two consecutive cooks, and the start of the previous cook. Cook thread only,
 	// except the high-water mark, which the Info callbacks read. This is the one measurement that can
 	// report a cook that did not happen: the node's whole information surface lives inside a cook, so a

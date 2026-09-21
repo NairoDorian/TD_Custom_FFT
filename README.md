@@ -300,6 +300,115 @@ shared state is read-only. It applies to `Channels = All Channels` only — `Mon
 cook, so the branch is a single integer compare and the serial path is taken. `fft_bench` measures it at 2 / 4 / 8
 channels: **38 % / 65 % / 76 % faster** than serial, outputs identical bin for bin.
 
+## The middle-click info popup: why it goes blank, and how to fix it
+
+This was the most expensive bug in the project's history, it was misdiagnosed three times, and it is written down
+here so the next person spends ten minutes on it instead of a day. **Read the mechanism first: almost every wrong
+guess comes from assuming the popup asks the plugin for its text.**
+
+### The mechanism: the popup is a *snapshot of the last cook*, not a query
+
+TouchDesigner's middle-click does **not** call the plugin. It renders whatever the *last cook* left behind. Every
+information callback runs inside a cook, in this order, documented at the top of `CHOP_CPlusPlusBase.h`:
+
+```
+getGeneralInfo -> getOutputInfo -> getChannelName xN -> execute()
+  -> getNumInfoCHOPChans -> getInfoCHOPChan xN
+  -> getInfoDATSize -> getInfoDATEntries xN
+  -> getInfoPopupString -> getWarningString -> getErrorString
+```
+
+Two consequences follow, and they are the whole of this section:
+
+1. **A node that is not cooking has no information surface at all.** No popup, no Info CHOP, no Info DAT, no
+   warning, and - the one that actually hurts - **no `getErrorString`**, so a hard failure (a plan that will not
+   build, an input with no usable sample rate) reports itself as silence instead of an error badge.
+2. **There is no plugin-side change that can force a render.** If the chain is not entered, nothing written in
+   `getInfoPopupString` is ever read. Any fix attempted there is a fix aimed at the wrong component.
+
+### The two failure modes, and the one thing that tells them apart
+
+A blank popup is one of exactly two things, and they need opposite fixes:
+
+| | Chain **not** entered | Chain entered, text **not** rendered |
+|---|---|---|
+| `info_callback_calls` Info DAT row | counters **frozen** (they stop advancing while the node cooks) | counters **climb** — popup count tracks `cookCount` 1:1 |
+| Textport | the `getInfoPopupString() called (#N, node cook #M)` line **stops** printing | the line **keeps** printing, with a healthy character count (~1660) |
+| Meaning | the node stopped cooking → fix the cook, not the popup | the string is fine and TouchDesigner did not draw it → **not a plugin problem** |
+| Fix | see *"Making sure the node is cooking"* below | report to Derivative with that evidence |
+
+**The popup string is never textually empty** - its first line is always `Node: <path>`, built before anything that
+can throw. So a blank popup is never "the string came out empty"; it is always "the callback did not run, or ran
+and was not drawn". That invariant is deliberate and should be preserved.
+
+### Rule: never put a diagnostic in the popup string
+
+This is not a style preference; it is what broke the popup, twice in each direction, and it is the one change that
+was measured. The string that renders is **~1660 characters**: a fixed identity block, a telemetry body, and the
+last five plan-log lines. Adding two diagnostic lines to it - `Info callbacks entered: ...` and `Cook stall: ...` -
+took it to roughly 1760 and the popup rendered **empty**; removing them brought it back. No size limit is documented
+anywhere in the SDK (`OP_String::setString` is a bare `virtual void setString(const char* val)`, no cap stated), so
+what TouchDesigner does above some undisclosed length is **not** established - but the correlation was reproduced in
+both directions, and it is enough to state the rule:
+
+> **No diagnostic may ever be added to the popup string.** Diagnostic values go in the `info_callback_calls` Info DAT
+> row (row 19), which TouchDesigner reads as *a value*, not as the popup. A diagnostic that is rendered by the thing
+> it is measuring can change what it measures - and here it appears to have done exactly that.
+
+The same rule is why the popup carries a **character count** into that Info DAT row instead of printing it: a stable
+length on a blank popup says the text was never the problem.
+
+### Making sure the node is cooking (branch 1)
+
+In order of how often each is actually the cause:
+
+1. **Is the DLL loaded in the node the one you just built?** TouchDesigner does **not** reload a DLL when the file
+   on disk changes. It is easy to spend a day alternating between two different builds and calling the result
+   "intermittent". Pulse **`Reloadplugin`** on the PluginBuilder COMP (`PluginBuilderExt.py:166`), or turn the
+   loader's `unloadplugin` off/on. To confirm which DLL answered, middle-click and read the `Binary:` line - it
+   prints `OP_NodeInfo::pluginPath`.
+2. **There are two installs, and only one of them auto-updates.** `<project>/__Plugins__/FFT/FFT.dll` is copied by
+   PluginBuilder on every build. `~/Documents/Derivative/Plugins/FFT/FFT.dll` (the registered Custom Operator) is
+   updated **only** by the **Install Plugin** pulse and drifts stale - it was three builds behind during the session
+   that produced this note. Each instance also resolves FFTW3/oneMKL from *its own* directory, so a measurement on
+   one says nothing about the other.
+3. **Is the timeline advancing?** `cookEveryFrame = true` makes the node cook on every frame, not on every
+   wall-clock tick. A paused timeline stops cooking, the spectrum holds its last frame and *looks* fine, and the
+   popup goes blank. This is the single best explanation for "it worked a minute ago".
+4. **Is an error or warning showing on the node?** TouchDesigner reports an error state **in place of** the
+   operator information. Until v2.9.0 both `myErrorText` and the pipeline error string could latch forever
+   (`getErrorString` was driven off a lifetime counter that is never cleared, and `myErrorText` cleared only on a
+   `Reset` pulse), so one transient exception during a hot-swap left a perfectly healthy node flagged as broken
+   permanently. Both now clear on the condition they describe - see `CHANGELOG.md`, v2.9.0.
+5. **The viewer flag on the loader.** For a `.dll` hosted in the built-in CPlusPlus CHOP, the SDK's
+   `OP_CustomOPInfo::cookOnStart` does not apply (it is Custom-Operator only), so an active **viewer** flag is the
+   only kick-start available. PluginBuilder sets it (`_ensure_loader_live()`); note that `PluginBuilderExt.py` is
+   loaded when the COMP is created, so a change there is inert until the extension is re-inited or the `.toe` is
+   reopened.
+
+### What is *not* established
+
+Recorded honestly, because the confident version of this section was wrong three times:
+
+- **Why the extra two lines blanked the popup.** The correlation is solid and reproduced in both directions; the
+  mechanism is not. No SDK cap is documented, and no test on the development machine can measure TouchDesigner's
+  renderer.
+- **Whether the popup is stable indefinitely.** The longest confirmed run was ~4800 popup entries (80 s at 60 fps)
+  at a stable 1660-1662 characters - and that same build later reported blank with no code change in between, which
+  is why the cook-driven mechanism above is the one to reach for first.
+- **That any given blank popup is this node's fault.** Establish which branch it is from the table above before
+  changing a line of code.
+
+### What was tried, and what each attempt actually taught
+
+| Change | Result |
+|---|---|
+| `cookEveryFrame = true` (`b388b5a`) | **A real bug, still needed** - `cookEveryFrameIfAsked` is the *weaker* flag ("only if someone asks"), so an idle node genuinely had no information surface. But it was **not** established as *the* popup cause: the popup emptied again afterwards with the flag unchanged. |
+| One `setString` at the end, not two (`6309258`) | Kept. Two calls (short block, then full text) is not the shape observed rendering, and one call is strictly simpler. The safety the two-call order wanted is kept by appending in the `catch` blocks instead of replacing. |
+| Removing the latched error states (`6309258`) | **Kept, independent real defect.** A node can no longer claim a fault it no longer has. |
+| Two diagnostic lines **in the popup string** | **Removed, and the rule above exists because of it.** This is the change that separated working from blank. |
+| Log line once per load, instead of every 300 cooks (`7b419b5`) | **Reverted.** The one-shot line is quieter, but it removes the only signal that distinguishes branch 1 from branch 2 - and it landed in the same commit as the two lines above, so neither could be cleared separately. |
+
 ## License / third party
 
 **FFTW3 is GPL.** The build vendors FFTW 3.3.11 (single precision, AVX2) as `libfftw3f-3.3.11-avx2.dll` and ships

@@ -96,14 +96,24 @@ All notable changes to `Plugin_FFT` are documented here.
   the plugin could tell them apart. Three counters (`myInfoPopupCalls`, `myInfoDatSizeCalls`,
   `myInfoChopChansCalls`) were added, plus a line to the textport on the first entry. That settled it: the counters
   advance **in lockstep with `OP_NodeInfo::cookCount`, one popup entry per cook** - popup #2100 at cook #2101,
-  #2400 at #2401, #2700 at #2701 - so TouchDesigner was calling the chain every frame, and the empty popup really
-  was the cooking flag. The counters stay, because they are the only signal that separates "the node stopped
-  cooking" from "the popup string broke"; they are now reported in the popup itself and in the new
-  `info_callback_calls` Info DAT row (rows 19 -> 20 before the plan log), so the diagnostic needs no textport.
-- **The instrumentation line no longer repeats.** It first printed on calls 1, 2 and every 300th, which at 60 fps
-  is a line forever, confirming something already known. It now prints **once per load** - the one moment it is
-  wanted, when an empty popup is the symptom being chased - and the state it used to announce on a timer is
-  readable on demand from the popup's `Info callbacks entered:` line and from `info_callback_calls`.
+  #2400 at #2401, #2700 at #2701 - so TouchDesigner was calling the chain every frame. The counters stay, because
+  they are the only signal that separates "the node stopped cooking" from "the popup string broke"; they are now
+  reported in the `info_callback_calls` Info DAT row (row 19, ahead of the plan log), together with the popup's last
+  character count and the largest cook gap, so the diagnostic needs no textport and - the point of moving it - no
+  presence in the popup string at all.
+- **The popup string no longer carries diagnostics of its own, and the instrumentation line is back to every 300.**
+  Two changes made in `7b419b5` are undone here, together, because they landed together and both reverted cleanly.
+  It had cut the entry line from calls 1, 2 and every 300th down to **once per load**, and it had added two lines to
+  the popup text itself - `Info callbacks entered: popup N, Info CHOP N, Info DAT N` and `Cook stall: largest gap
+  between cooks ... ms`. The popup went empty after that commit and came back when both were reverted, so the
+  string content is where the break was; **which of the two changes caused it is not separated**, and does not need
+  to be, because the durable rule is now this: a diagnostic must never be able to change what it measures. Both
+  values live in the `info_callback_calls` Info DAT row, which TouchDesigner reads as a value rather than rendering
+  as the popup, so whatever the popup does with its text cannot move that number. The periodic line is restored to
+  the cadence this harness had when the popup was last observed full - one line per 300 cooks, about one every 5 s
+  at 60 fps, carrying the call index, the node's cook count, and the character count handed to TouchDesigner. It is
+  more log noise than a one-shot line, and it is the only thing that separates "TD never entered the callback" from
+  "TD entered it and nothing rendered", which are the two remaining explanations and need opposite fixes.
 - **A corrected claim, and what it means for the bullets above.** The bullet above records that "the empty popup
   really was the cooking flag". That conclusion was drawn from the counters and it was too strong: the counters
   prove TouchDesigner *enters* the info chain every cook, which is not the same as proving the popup rendered,
@@ -127,8 +137,9 @@ All notable changes to `Plugin_FFT` are documented here.
   single-call form - build the whole string, set it once - is the form that was observed rendering the complete
   popup in this harness, so it is restored. The safety property the two-call order was reaching for is kept without
   a second call: the identity block is in `text` before the `try`, and the catches **append** a note rather than
-  replacing it, so this final `setString` always hands TouchDesigner a populated popup. **Not yet confirmed in
-  TouchDesigner** - see the note below.
+  replacing it, so this final `setString` always hands TouchDesigner a populated popup. **Confirmed in
+  TouchDesigner** - the complete popup was watched rendering on this form, at a stable 1660 characters, with the
+  callback entered on every cook; see the section below.
 - **The Info DAT declared a row count it might not fill.** `getInfoDATSize` computed `rows` from `myLog.size()` and
   `getInfoDATEntries` walked `myLog` again. `PlanLog::log()` truncates the history by half at
   `kMaxPlanLogEntries` (256), so a plan event logged by the worker between the two calls made the log *shorter*
@@ -142,15 +153,36 @@ All notable changes to `Plugin_FFT` are documented here.
   row report it: a value near 16.7 ms is one 60 fps frame, and a value in seconds says the node stopped cooking
   for that long and its information output was blank while it lasted.
 
-### Not confirmed in TouchDesigner
-The popup fix above is a plugin-side change and was **not** reproduced in TouchDesigner from the development
-machine - a report of a blank middle-click popup arriving after a build that contained it. What *is* established:
-the plugin builds clean, passes all 547 checks, and the deployed `__Plugins__/FFT/FFT.dll` is byte-identical to the
-build output. What is **not** established: that the popup renders after this change. The two counters, the
-`Cook stall:` line and the `info_callback_calls` row exist precisely so the next report can say which of the three
-failure modes it is - the chain is not entered (counters frozen while the node cooks), the chain is entered but
-nothing renders (counters climb, popup empty), or the node stopped cooking (a `Cook stall` far above one frame) -
-instead of another round of guessing.
+### Confirmed in TouchDesigner, and what that confirmation cost
+The middle-click popup was watched rendering **in full** from this plugin, in TouchDesigner, on the build this
+entry describes. The evidence is the textport line, and it settles two questions at once:
+
+```
+[FFT Plugin] getInfoPopupString() called (#4200, node cook #4201) - TD is reading this node's custom popup text (1662 chars handed over)
+[FFT Plugin] getInfoPopupString() called (#4500, node cook #4501) - TD is reading this node's custom popup text (1660 chars handed over)
+[FFT Plugin] getInfoPopupString() called (#4800, node cook #4801) - TD is reading this node's custom popup text (1660 chars handed over)
+```
+
+- The popup call count tracks `OP_NodeInfo::cookCount` exactly one behind, so TouchDesigner enters the callback on
+  **every cook**. The chain was never the problem.
+- The length is **1660-1662 characters and stable**, so the text was never outgrowing anything.
+- What it took to get here is the subject of the two bullets above, and the reason the popup string now carries no
+  diagnostics at all: two lines added to it (`Info callbacks entered: ...`, `Cook stall: ...`) took it to roughly
+  1760 characters and the popup came up **empty**, and removing them brought it back. Reproduced in both
+  directions; the mechanism is **not** established (the SDK documents no cap on `OP_String::setString`), which is
+  exactly why the guard is a rule rather than an explanation - see *"The middle-click info popup"* in `README.md`.
+
+**Still open, and recorded as open.** The same build that rendered the popup at `#4800` later reported blank with
+**no code change in between**. That single fact rules out the DLL, and the string, as the variable: the popup is a
+snapshot of the last cook, so a node that has stopped cooking has no information surface at all - and the spectrum
+it last produced holds on screen and looks healthy, which is why "the plugin still works but the popup is empty" is
+the expected symptom of that failure, not a contradiction. The counters and the character count exist so the next
+report can say which branch it is without a rebuild: counters frozen with the log line gone means the chain is not
+being entered (fix the cook), and counters climbing with a healthy length on a blank popup means a real string was
+handed over and not drawn (not a plugin problem). See *"Making sure the node is cooking"* in `README.md` for the
+five causes in the order they actually occur, including the two that make this look intermittent - a node running a
+DLL that is not the one just built, and the separate `Documents/Derivative/Plugins/FFT` install that only the
+**Install Plugin** pulse updates.
 
 ### Notes
 - `fftwf_cleanup` and `fftwf_forget_wisdom` are deliberately **not** in the resolved API table. They free
