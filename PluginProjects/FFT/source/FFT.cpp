@@ -33,6 +33,34 @@
  *        (hold the previous spectrum when nothing new has been published)
  *     5. telemetry; deferred Textport log flush only when something was logged
  * ===========================================================================
+ *
+ * HOW TO READ THIS FILE
+ * ---------------------
+ * It is the TouchDesigner half of the plugin, and it is longer than the DSP half for one reason:
+ * TouchDesigner calls a lot of small callbacks and each one has rules. The order to read in:
+ *
+ *   the anonymous namespace        - version numbers, the popup's three size constants, and the
+ *                                    thread-priority helper. Every constant here is explained in
+ *                                    place; the version numbers must be kept in step with
+ *                                    CHANGELOG.md by hand.
+ *   FillCHOPPluginInfo()           - the DLL's one-time registration: operator type, label, icon,
+ *                                    author, and the CPU check that every instance then reads.
+ *   FFT::getGeneralInfo()          - cook scheduling. Read the comment on cookEveryFrame before
+ *                                    changing it; it is load-bearing for the whole telemetry story.
+ *   FFT::getOutputInfo()           - where the parameters are read. The only getPar* calls in a cook.
+ *   FFT::execute()                 - THE COOK. Five numbered steps; this is the function to read if
+ *                                    you want to know what happens 60 times a second.
+ *   FFT::runJob()                  - what runs on the worker thread (or inline when Async is off)
+ *   ingest() and friends           - how the input block becomes the window the FFT sees
+ *   the info callbacks at the end  - getInfoCHOPChan/getInfoDATEntries/getInfoPopupString. These
+ *                                    are the ONLY way this node surfaces diagnostics, and they run
+ *                                    inside a cook, never on demand. See README, "The middle-click
+ *                                    info popup".
+ *
+ * THE ONE THING TO UNDERSTAND BEFORE EDITING: everything the user sees about the node's state
+ * (peak frequency, timings, plan events, the live backend, warnings, errors) travels through the
+ * information callbacks, and those are only invoked as part of a cook. There is no "refresh" path.
+ * ===========================================================================
  */
 
 #include "FFT.h"
@@ -49,11 +77,20 @@
 
 namespace {
 
+// Set once per process in FillCHOPPluginInfo() from FFTDSP::cpuSupportsAVX2(), then copied into every
+// FFT instance. It exists as a namespace-scope variable rather than a per-instance field because the
+// answer cannot change during a run: it is a property of the machine, and probing CPUID for every
+// node in a project would be pointless work. Instances read the copy (myCpuOk) so a hot path never
+// touches a global. See DSPModules.h for what the probe actually checks and why AVX2 alone is not
+// enough (FMA is required too).
 bool g_cpuHasAVX2 = true;
 
 const char* kOpType    = "Fftcustom";   // must not collide with the built-in FFT CHOP
 const char* kOpLabel   = "FFT Custom";
 const char* kOpIcon    = "FFT";
+// The three version numbers reported in the popup's `Plugin:` line and by the Info DAT. They are
+// maintained by hand - nothing derives them from git - so a release that forgets to bump them makes
+// the popup lie about which build is loaded, which is exactly what happened for v2.9.0.
 const int   kMajorVersion = 2;
 const int   kMinorVersion = 9;   // keep in step with CHANGELOG.md - the v2.9.0 work landed without this bump,
                                  // so the popup and the Info DAT reported v2.8 for a v2.9 node
@@ -91,6 +128,8 @@ constexpr size_t kTailPlanLogLines  = 3;
 constexpr size_t kMaxTailLineChars  = 72;
 
 using clk = std::chrono::steady_clock;
+// Microseconds since a steady-clock timestamp, for the cook and DSP timings. steady_clock rather
+// than system_clock because this measures elapsed time and must not jump if the clock is adjusted.
 inline double usSince(clk::time_point t0) { return std::chrono::duration<double, std::micro>(clk::now() - t0).count(); }
 
 // The TD-free sample-rate / bin / axis model (windowSamplesFrom, fftSizeFrom,
@@ -99,6 +138,12 @@ inline double usSince(clk::time_point t0) { return std::chrono::duration<double,
 #include "RateModel.h"
 
 #ifdef _WIN32
+// Windows-only, and called on the worker thread as its first action. Two jobs:
+//   1. raise the thread's priority so a busy machine cannot delay a result into the next frame
+//   2. set a debugger-visible name so the thread is identifiable in a profiler or in Visual Studio's
+//      Threads window. SetThreadDescription is resolved at runtime rather than linked because it
+//      only exists from Windows 10 1607 onwards; older systems simply get no name.
+// The priority reasoning is in the comment below and is worth reading before changing the level.
 void nameAndBoostCurrentThread(const wchar_t* name)
 {
 	// THREAD_PRIORITY_HIGHEST (normal + 2): the worker now sits above TouchDesigner's normal-priority
@@ -179,6 +224,10 @@ DestroyCHOPInstance(CHOP_CPlusPlusBase* instance)
 // =============================================================================================
 // FFT operator
 // =============================================================================================
+// Instance construction. Order matters: the CPU check is copied first because a machine without
+// AVX2/FMA must end up with an error text set before anything tries to run a transform, and the
+// log must be put into deferred mode before the pipeline is built (the pipeline can log from its
+// worker thread, and a worker thread must never call into Python - see PlanLog in DSPModules.h).
 FFT::FFT(const OP_NodeInfo* info)
 	: myNodeInfo(info)
 {
@@ -191,6 +240,9 @@ FFT::FFT(const OP_NodeInfo* info)
 	myPipeline = std::make_unique<AnalysisPipeline>(&myLog);
 }
 
+// Destroying the operator stops the worker and joins it before the pipeline is destroyed (the
+// member's own destructor runs after this body). That order matters: the worker thread calls
+// into the pipeline, so the pipeline must outlive it.
 FFT::~FFT()
 {
 	stopWorker();
@@ -225,6 +277,8 @@ FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* rese
 	ginfo->cookEveryFrame = true;
 	ginfo->cookEveryFrameIfAsked = false;
 	ginfo->timeslice = false;
+	// "cook in lockstep with input 0's rate" - the standard choice for a node that processes a
+	// signal, and unchanged since the first version. It has no effect on scheduling.
 	ginfo->inputMatchIndex = 0;
 }
 
@@ -232,15 +286,31 @@ FFT::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* rese
 // Parameters: one eval() per cook, from getOutputInfo() (TouchDesigner calls it right before
 // execute()). execute() only re-polls if getOutputInfo() was skipped for this cook.
 // ---------------------------------------------------------------------------------------------
+// Reads every parameter once and stores the result in myParams. This is the ONLY place getPar*
+// is called in the cook path, and it is deliberately done in one batch: TouchDesigner's parameter
+// lookups are not free, and doing them per use would scatter them through execute().
+//
+// Called from getOutputInfo() (which TouchDesigner invokes immediately before execute()) and, as a
+// fallback, from execute() itself if that call was skipped. myHaveParams/myParamsFreshForExecute
+// record that it happened, so the second call is a no-op rather than a double read.
+// ---------------------------------------------------------------------------------------------
 void
 FFT::pollParameters(const OP_Inputs* inputs)
 {
 	const auto t0 = clk::now();
 	myParams = Parameters::eval(inputs, &myParamReads);
 	myHaveParams = true;
-	myParamUs = usSince(t0);
+	myParamUs = usSince(t0);   // reported as param_us; part of the cook-time breakdown on the Info DAT
 }
 
+// How many spectra this cook will produce. Mono Mix and "First Channel" always analyse one channel
+// (a mono mix, or the first channel of the input); All Channels analyses every input channel, up to
+// the hard cap Parameters::kMaxChannels.
+//
+// The cap is not cosmetic: each analysed channel costs a full FFT per frame and gets its own
+// per-channel buffers, so an input with hundreds of channels would multiply the per-cook cost by
+// hundreds. One channel unless explicitly asked, and a bounded number when asked, is the whole rule.
+// A missing input (nullptr) or a channel-less one still reports 1, so the node always has a shape.
 int
 FFT::analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode) const
 {
@@ -256,6 +326,10 @@ FFT::analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode)
 //
 // This is what hzPerSample() and the `output_spectrum_axis` Info row are derived from. It is NOT
 // what info->sampleRate reports — see outputSampleRate() below.
+//
+// The two readings of "sample rate" this file keeps apart, in one line each:
+//   outputAxisRate()   - what the bins MEAN (the band the axis covers)   -> hz_per_sample, axis rows
+//   outputSampleRate() - how FAST the data comes out (bins x fps)        -> info->sampleRate
 double
 FFT::outputAxisRate(const Parameters::Values& p, double sampleRate) const
 {
@@ -321,6 +395,11 @@ FFT::outputBandwidth(const Parameters::Values& p) const
 	return throughput(p, myCookDtMs.load(std::memory_order_relaxed));
 }
 
+// ---------------------------------------------------------------------------------------------
+// getOutputInfo - TouchDesigner asks what shape the output will be, immediately before execute().
+// This is where the parameters are read (the only getPar* calls in a cook), and where the CHOP's
+// declared size, channel count and sample rate are set. The frame delta is also captured here.
+// ---------------------------------------------------------------------------------------------
 bool
 FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserved1)
 {
@@ -339,10 +418,15 @@ FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserve
 	info->startIndex = 0;
 	info->numSamples = bins;
 	info->numChannels = analysisChannelCount(cinput, p.chanMode);
+	// Note this is the throughput reading, not the axis rate - see outputSampleRate() above and the
+	// `output_spectrum_axis`/`hz_per_sample` Info rows for the frequency meaning of the bins.
 	info->sampleRate = static_cast<float>(outputSampleRate(p));
 	return true;
 }
 
+// The name of each output channel. Convention: the input channel's own name with "_fft" appended,
+// so a spectrum is recognisable next to its source in a network; "mix_fft" for the mono mix and
+// "rfft" for the fallback with no usable input. Cosmetic only - nothing reads these names back.
 void
 FFT::getChannelName(int32_t index, OP_String* name, const OP_Inputs* inputs, void* reserved1)
 {
@@ -362,6 +446,19 @@ FFT::getChannelName(int32_t index, OP_String* name, const OP_Inputs* inputs, voi
 	name->setString("rfft");
 }
 
+// Writes zeros over every channel TouchDesigner handed us, and does nothing else.
+//
+// WHERE IT IS CALLED FROM, and there are exactly three sites: the `!myCpuOk` early-out in
+// executeImpl(), and the two catch blocks in execute() (std::exception and ...).
+//
+// WHY IT IS SO DEFENSIVE: every one of those is a failure path, i.e. exactly when the state of
+// `output` is least trustworthy. So it checks the pointer, checks the channel array, clamps the
+// channel count against both the reported count and the hard cap, and checks each channel pointer
+// before writing to it. A crash here would replace a silent node with a crashed TouchDesigner,
+// which is a strictly worse outcome than silence.
+//
+// noexcept for the same reason: an exception thrown while already handling a failure has nowhere
+// to go, and would terminate the process.
 void
 FFT::zeroOutputSafe(CHOP_Output* output) noexcept
 {
@@ -376,14 +473,46 @@ FFT::zeroOutputSafe(CHOP_Output* output) noexcept
 // ---------------------------------------------------------------------------------------------
 // Ingest (cook thread): mono mix / first / all -> optional EQ on the new samples -> FIFO
 // ---------------------------------------------------------------------------------------------
+// WHAT THIS DOES: turns this cook's input block into one sample stream per analysis channel, then
+// pushes it into that channel's FIFO (the ring buffer that always holds the newest `capacity`
+// samples - the window the next FFT will be taken over).
+//
+// THE FOUR STEPS, in the order they must happen:
+//   1. pick the source block - the mono mix of every input channel, or one specific channel
+//   2. note whether the block is digital silence (a run counter, used to skip work later)
+//   3. run the optional EQ over the new samples, in time order
+//   4. push the block into the FIFO
+//
+// WHY THE EQ COMES BEFORE THE FIFO AND NOT AFTER: EQ is a stateful filter (it carries its own
+// history from the previous block). To stay continuous it must see samples in the order they were
+// captured, once each. Running it after the FIFO would filter the same samples repeatedly, once per
+// cook, as the window slides - which would both multiply the cost and change the result.
+//
+// WHY ONLY THE NEW SAMPLES: `keep = min(numSamples, capacity)`. A cook normally delivers far fewer
+// samples than the window is long (60 frames/s against a 3175-sample window), so only the tail of
+// the block is new information; the rest is already in the FIFO. Copying more would be wasted work.
+//
+// CALLED BY: execute(), step 2, once per cook. Cook thread only - it writes the FIFOs, and
+// fillJob() reads them on the same thread.
 void
 FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChannels, const Parameters::Values& p, size_t capacity)
 {
 	if (static_cast<int>(myIngest.size()) != numChannels) myIngest.resize(static_cast<size_t>(numChannels));
+	// Housekeeping over every state, not just the ones this cook will use: the loop is a
+	// capacity compare in the steady state, and doing it for all of them means a state left over
+	// from a previous, larger channel count is already consistent if the count grows back.
 	for (auto& st : myIngest) {
+		// A capacity change means a different window length, i.e. a different FFT. The FIFO is
+		// reset rather than carried over because its contents describe a window that no longer
+		// exists; silent_run restarts with it for the same reason.
 		if (st.fifo.capacity() != capacity) { st.fifo.resize(capacity); st.silent_run = 0; }
+		// The EQ's coefficients are sample-rate dependent, so it is told the current rate every
+		// cook (it is a cheap no-op when the rate has not changed).
 		st.eq.setSampleRate(mySampleRate);
 	}
+	// Nothing to ingest: no input connected, or a CHOP with no channels, or a cook with no samples
+	// in it. Returning here leaves the FIFOs untouched, which is deliberate - the spectrum keeps
+	// showing the last real audio rather than falling to zero on a momentary gap.
 	if (!cinput || cinput->numChannels <= 0 || cinput->numSamples <= 0) return;
 
 	const size_t n = static_cast<size_t>(cinput->numSamples);
@@ -392,11 +521,16 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 
 	for (int ch = 0; ch < numChannels; ++ch) {
 		IngestState& st = myIngest[static_cast<size_t>(ch)];
-		if (st.block.size() < keep) st.block.resize(keep);
+		if (st.block.size() < keep) st.block.resize(keep);     // grows once, then reused every cook
 		float* blk = st.block.data();
 
 		// --- source block ---
+		// The `+ (n - keep)` everywhere below is the point of `keep`: it skips the older samples at
+		// the front of the block and takes only its newest `keep` ones, which are the only ones not
+		// already in the FIFO.
 		if (mode == Parameters::ChanMode::MonoMix && inChans > 1) {
+			// Sum every input channel into the scratch block, then divide by the channel count so
+			// the mix does not get louder with more channels (an average, not a sum).
 			const float* c0 = cinput->getChannelData(0);
 			if (!c0) continue;
 			std::memcpy(blk, c0 + (n - keep), keep * sizeof(float));
@@ -406,6 +540,10 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 			}
 			FFTDSP::scaleInPlace(blk, keep, 1.0f / static_cast<float>(inChans));
 		} else {
+			// One channel only: the first input channel for "First Channel" and Mono Mix with a
+			// single input, or channel `ch` for All Channels - clamped with std::min so a request
+			// for more analysis channels than the input has repeats the last real channel instead
+			// of reading past the end.
 			const int src_ch = (mode == Parameters::ChanMode::AllChannels) ? std::min(ch, inChans - 1) : 0;
 			const float* cd = cinput->getChannelData(src_ch);
 			if (!cd) continue;
@@ -413,10 +551,18 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 		}
 
 		// --- silence tracking (digital zero) ---
+		// A run counter, not a per-cook flag: what the pipeline needs to know is "has this channel
+		// been silent for a whole window's worth of samples", because that is the point at which the
+		// spectrum is genuinely flat rather than merely quiet. The counter is capped at 2*capacity so
+		// it cannot grow without bound over a long silence and overflow its int.
 		if (FFTDSP::blockIsSilent(blk, keep)) st.silent_run = std::min(st.silent_run + keep, capacity * 2);
 		else st.silent_run = 0;
 
 		// --- EQ on the new samples only (stateful, time order) ---
+		// updateAndCheckActive() reports whether the filter is doing anything at all this block: with
+		// EQ disabled, or enabled but flat, it returns false and the filter is skipped entirely. That
+		// is the difference between "EQ costs nothing when it is off" and "EQ costs a full pass over
+		// every sample in the window on every cook".
 		if (p.eqEnable && st.eq.updateAndCheckActive(p.gainDb, p.cutoffHz, p.lowGainDb, p.lowCutoffHz, p.q, p.amount)) {
 			st.eq.processBlockInPlace(blk, keep, p.amount);
 		}
@@ -427,27 +573,62 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 // ---------------------------------------------------------------------------------------------
 // Job / result handoff
 // ---------------------------------------------------------------------------------------------
+// WHAT A JOB IS: one self-contained description of "analyse this". It carries the parameters as
+// they were at this cook, the frame delta, the reset request, and a full copy of every channel's
+// newest window. Nothing in it points back at the node, which is what lets the analysis run on
+// another thread without touching live state.
+//
+// WHY THE WINDOWS ARE COPIED (fifo.get) RATHER THAN SHARED: the FIFO keeps receiving samples while
+// the analysis of the previous frame is still running, so a pointer into it would be reading memory
+// that is being rewritten underneath. The copy is a few thousand floats - cheaper than any
+// synchronisation that would make sharing safe.
+//
+// CALLED BY: execute(), step 3, once per cook, on the cook thread. The caller publishes the filled
+// slot afterwards (myJobs.publish()).
 void
 FFT::fillJob(AnalysisJob& job, int numChannels, int winSamples, double dtMs)
 {
+	// seq counts jobs, not cooks, and it is how a result is matched back to the job that produced it
+	// (see copyResultsToOutput, where the difference is what the hold_frames figure counts).
 	job.seq = ++myJobSeq;
 	job.numChannels = numChannels;
 	job.sampleRate = mySampleRate;
 	job.winSamples = winSamples;
 	job.dtMs = dtMs;
-	job.p = myParams;
-	job.reset = myResetPending;
+	job.p = myParams;                 // the pipeline never reads live UI state; see pollParameters()
+	job.reset = myResetPending;       // consumes the Reset pulse; cleared at the end of this function
 	const size_t n = static_cast<size_t>(numChannels);
 	if (job.windows.size() != n) job.windows.resize(n);     // no allocation after the first cooks
 	if (job.silent.size() != n) job.silent.resize(n);
 	for (int ch = 0; ch < numChannels; ++ch) {
-		myIngest[ch].fifo.get(job.windows[ch]);
+		myIngest[ch].fifo.get(job.windows[ch]);             // newest `capacity` samples, oldest first
+		// One whole window of digital silence: not "quiet", but exactly zero, and long enough that
+		// the spectrum is genuinely flat. The pipeline uses this to skip work it can prove is wasted.
 		job.silent[ch] = myIngest[ch].silent_run >= myCapacity ? 1 : 0;
 	}
 	myResetPending = false;
 }
 
 // Pipeline owner thread: worker (Async on) or cook thread (Async off)
+// ---------------------------------------------------------------------------------------------
+// WHAT THIS DOES: runs one job through the pipeline and publishes the result, then refreshes
+// whatever of the node's cross-thread telemetry that result changed. It is the ONLY place the
+// pipeline is called, and it is called by whichever thread owns the pipeline at the time.
+//
+// WHY IT IS WRITTEN AS "TRY, PUBLISH, THEN REPUBLISH TELEMETRY" RATHER THAN A PLAIN CALL:
+//   * The pipeline is not allowed to throw into the worker thread - there is no cook above it to
+//     catch it - so a throw is caught here, counted, and the previous result is left in place.
+//     The slot is only published on success, which means the node keeps showing the last good
+//     spectrum instead of blanking out.
+//   * myPipelineFailing is set on a throw and cleared on the next success, so it always answers
+//     "is the node failing right now" rather than "has it ever failed" - the lifetime count is
+//     kept separately in myPipelineErrors for the Info DAT.
+//   * The status strings are rebuilt only when the pipeline's status version moves, which is only
+//     when the plan or the tables changed - not once per cook.
+//
+// THREADING: everything written here is either an atomic the info callbacks read (myDspUs,
+// myOutputSampleRate, myPlanFailed, ...) or the status copy under myStatusMutex. The results buffer
+// is the single-producer/single-consumer handoff described in DSPModules.h.
 void
 FFT::runJob(const AnalysisJob& job)
 {
@@ -490,10 +671,21 @@ FFT::runJob(const AnalysisJob& job)
 // ---------------------------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------------------------
+// WHAT THE WORKER IS FOR: with Async on, the analysis (the FFT and everything after it) runs on
+// this thread instead of on the cook thread, so the node's cook costs only the ingest and the
+// output copy. With Async off, neither of these is ever called and runJob() is invoked inline from
+// execute() instead.
+//
+// LIFECYCLE: started and stopped from execute() (step 3) whenever the Async parameter differs from
+// the current state, and stopped one final time from the destructor. stopWorker() joins the thread,
+// so after it returns nothing can be running the pipeline - which is what makes it safe for the
+// destructor to then destroy the pipeline the worker was calling into.
 void
 FFT::startWorker()
 {
-	if (myWorkerRunning) return;
+	if (myWorkerRunning) return;                       // idempotent: execute() calls this on every cook
+	// Both flags are cleared BEFORE the thread starts, so the loop cannot immediately observe a
+	// stop request left over from a previous run and exit at once.
 	myWorkerStop.store(false, std::memory_order_release);
 	myWorkerDormant.store(false, std::memory_order_release);
 	myWorkerRunning = true;
@@ -503,47 +695,78 @@ FFT::startWorker()
 void
 FFT::stopWorker()
 {
-	if (!myWorkerRunning) return;
+	if (!myWorkerRunning) return;                      // idempotent: also called from the destructor
 	myWorkerStop.store(true, std::memory_order_release);
+	// The signal is what wakes a DORMANT worker: in that state it is blocked in myWake.wait() and
+	// would never see the stop flag on its own. A hot worker polls and sees the flag by itself.
 	myWake.signal();
-	if (myWorker.joinable()) myWorker.join();
+	if (myWorker.joinable()) myWorker.join();          // blocks until the loop has actually returned
 	myWorkerRunning = false;
 }
 
-// Hot: poll the job slot every kWorkerPollMs (the cook never pays for a kernel wake-up).
-// Dormant (no job for kWorkerDormantAfterMs, e.g. TouchDesigner paused or the node not cooking):
-// sleep until the cook signals once. The dormancy transition is a Dekker handshake with the
-// cook (store dormant; full fence; re-check the job slot) so a job published at that instant
-// is never left unprocessed.
+// The worker thread's whole body. It has exactly two modes and no other state:
+//
+//   HOT     - a job arrived recently, so the loop polls the slot every kWorkerPollMs. The cook
+//             publishes a job without waking anything, which is why the poll exists: a kernel
+//             wake-up costs ~5 us and the cook must never pay it in the normal case.
+//   DORMANT - no job for kWorkerDormantAfterMs (TouchDesigner paused, or the node not cooking for
+//             some other reason), so the loop blocks in myWake.wait() until the cook signals once.
+//             This is the "node is idle" mode and it costs nothing at all.
+//
+// The dormancy transition is a Dekker handshake with the cook (store dormant; full fence; re-check
+// the job slot) so a job published at that instant is never left unprocessed - one side or the
+// other always sees the other's store, so the wake-up and the poll cannot both be missed.
+//
+// Call runJob() (below) to see what actually happens to a job once it is picked up.
 void
 FFT::workerLoop()
 {
 #ifdef _WIN32
 	nameAndBoostCurrentThread(L"FFT Custom CHOP analysis");
 #endif
-	FFTDSP::DenormalGuard ftz;
+	FFTDSP::DenormalGuard ftz;       // flush denormals for this thread; see the note in execute()
 	auto lastJob = clk::now();
 	for (;;) {
 		if (myWorkerStop.load(std::memory_order_acquire)) return;
 		if (myJobs.acquire()) {                          // latest job wins; older unconsumed jobs were overwritten
 			runJob(myJobs.front());
-			lastJob = clk::now();
+			lastJob = clk::now();                        // this resets the dormancy countdown
 			myWorkerDormant.store(false, std::memory_order_relaxed);
 			continue;
 		}
 		if (!myWorkerDormant.load(std::memory_order_relaxed)) {
 			if (std::chrono::duration<double, std::milli>(clk::now() - lastJob).count() > kWorkerDormantAfterMs) {
+				// Going dormant: announce it with the strongest ordering, fence, then re-check the
+				// slot on the next iteration rather than sleeping here. The fence is what pairs with
+				// the cook's fence - see the handshake note above.
 				myWorkerDormant.store(true, std::memory_order_seq_cst);
 				std::atomic_thread_fence(std::memory_order_seq_cst);
 				continue;                                // re-check the slot before sleeping (pairs with the cook's fence)
 			}
-			myWake.waitFor(kWorkerPollMs);
+			myWake.waitFor(kWorkerPollMs);               // hot: short timed sleep, then poll again
 		} else {
-			myWake.wait();
+			myWake.wait();                               // dormant: block until the cook signals
 		}
 	}
 }
 
+// Publishes the newest finished spectrum into the CHOP's output buffers, and updates the three
+// telemetry values that describe it (peak frequency, peak magnitude, how many frames behind the
+// analysis is).
+//
+// THE ONE LINE THAT MATTERS: myResults.acquire() is a single atomic exchange. If the pipeline has
+// published a result since the last cook it becomes the front slot; if it has not, this is a no-op
+// and the previous result stays where it is. That is the whole of the "hold the previous spectrum"
+// behaviour - the node is never blank while waiting for the next analysis, it simply repeats the
+// last one, and hold_frames says how many cooks that has been true for.
+//
+// EVERY OTHER LINE IS SIZING DEFENCE. The result's spectra and the output's buffers are sized by
+// two independent code paths (getOutputInfo for the node, the pipeline for the spectrum), and a
+// mismatch is possible at the moment a parameter changes. So: the copy is min(result, output), the
+// remainder of the output is zeroed rather than left with whatever was in it, and a channel with no
+// spectrum at all is zeroed outright.
+//
+// CALLED BY: execute(), step 4, once per cook, on the cook thread.
 void
 FFT::copyResultsToOutput(CHOP_Output* output, int numChannels)
 {
@@ -562,22 +785,61 @@ FFT::copyResultsToOutput(CHOP_Output* output, int numChannels)
 			std::memset(dst, 0, out_samples * sizeof(float));
 		}
 	}
+	// The peak is measured by the pipeline on channel 0 only (see AnalysisResult in
+	// AnalysisPipeline.h); it is read here rather than searched for so the Info callbacks never
+	// walk a spectrum.
 	myPeakMagnitude = res.peakMag;
 	myPeakFrequencyHz = res.peakHz;
+	// How far behind the analysis is: the number of jobs published since the one that produced this
+	// result. 0 = this cook is showing a spectrum from this cook's own job; 1 = the normal
+	// one-frame latency of the async pipeline. The guard keeps a result from a previous sequence
+	// (which cannot normally be seen, but would underflow an unsigned difference) from reporting a
+	// nonsense number.
 	myHoldFrames = (res.seq <= myJobSeq) ? static_cast<int>(myJobSeq - res.seq) : 0;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Cook
 // ---------------------------------------------------------------------------------------------
+// THE COOK, step by step. Everything a cook does happens here; execute() below is only the
+// try/catch wrapper that turns an exception into an error string and a silent output.
+//
+// THE FIVE STEPS, in order (the numbers in the code match these):
+//   0. measure the gap since the previous cook, for the "largest cook gap" diagnostic
+//   1. read the parameters, the input sample rate and the frame delta, and work out the window
+//      length this cook will use
+//   2. ingest: build each channel's sample stream and push it into its FIFO
+//   3. hand the analysis job to whoever will run it - the worker thread when Async is on, or this
+//      same thread when it is off
+//   4. copy the newest finished spectrum into the output buffers
+//   5. finish: flush anything the plan log wanted printed, and record how long the cook took
+//
+// THE ONE THING TO UNDERSTAND BEFORE EDITING: a cook does NOT necessarily run the analysis, and it
+// does NOT necessarily see the result of the job it just published. With Async on, the spectrum
+// written in step 4 usually belongs to the *previous* cook's job - that one-frame latency is the
+// deal that keeps the FFT off the cook thread, and hold_frames reports it. So "the output is one
+// frame stale" is the design, not a bug.
+//
+// myExecStage is set before each step and cleared at the end. Its only purpose is the error string:
+// if something throws, the stage number written by execute() below says where.
 void
 FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 {
 	myExecuteCount++;
+	// Defensive, in this order: an output with no buffers, or no OP_Inputs at all, cannot be
+	// served. Leaving the buffers alone is better than zeroing them here, because the previous
+	// cook's spectrum is still valid content.
 	if (!output || !output->channels || !inputs) return;
+	// No AVX2/FMA means every kernel in this plugin would fault or miscompute, so the node outputs
+	// silence and reports why through getErrorString (the text was set in the constructor).
 	if (!myCpuOk) { zeroOutputSafe(output); return; }
 
 	const auto t_start = clk::now();
+	// Flush-to-zero / denormals-are-zero for this thread. Denormal floats (values below ~1e-38) are
+	// produced naturally by the tail of a decaying signal and by FFT round-off, and on x86 they are
+	// handled in microcode - a single denormal in a loop can cost more than the entire transform.
+	// The guard is a scope object so the previous mode is restored on every exit path, including
+	// the throws that execute() catches. The worker thread sets it for itself as well (workerLoop).
 	FFTDSP::DenormalGuard ftz;
 
 	// --- 0. how long was the gap since the previous cook? --------------------------------------
@@ -603,10 +865,21 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	const Parameters::Values& p = myParams;
 
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
+	// The sample rate of the audio arriving on input 0. It is clamped rather than trusted: it comes
+	// from another operator and a CHOP that has not been set up yet can report 0 or something
+	// absurd, and every table in the pipeline is sized from it. 44100 is the fallback for "no input
+	// connected" so that the node still produces a correctly shaped spectrum instead of nothing.
 	double sr = 44100.0;
 	if (cinput && cinput->sampleRate > 0) sr = cinput->sampleRate;
 	mySampleRate = std::clamp(sr, Parameters::kMinSampleRate, Parameters::kMaxSampleRate);
 
+	// The frame delta, i.e. how much time this cook represents. It is what makes the ballistics
+	// (attack/release, AGC decay) frame-rate independent: those are specified in milliseconds and
+	// converted with this figure, so the same settings sound the same at 30 fps and at 120 fps.
+	// deltaMS is preferred and the rate is the fallback, because deltaMS is what actually elapsed
+	// while `rate` is only the target - they differ whenever a frame runs long. deltaMS is sanity
+	// checked against 5000 ms (a plausible pause or a first cook, where the frame delta can be
+	// enormous and would otherwise collapse every ballistics coefficient to zero).
 	double dt_ms = 1000.0 / 60.0;
 	if (const OP_TimeInfo* ti = inputs->getTimeInfo()) {
 		if (ti->deltaMS > 0.0 && ti->deltaMS < 5000.0) dt_ms = ti->deltaMS;
@@ -615,10 +888,17 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	}
 	myCookDtMs.store(dt_ms, std::memory_order_relaxed);    // outputBandwidth() reads it (Info callbacks)
 
+	// The FIFO/window length for this cook, derived from the parameters and the sample rate by the
+	// shared model in RateModel.h (the same function the bench and the tests use, so the CHOP and
+	// the offline measurements cannot disagree about what a given setting means).
 	const int win_samples = windowSamplesFrom(p, mySampleRate);
 	myCapacity = static_cast<size_t>(win_samples);
 
 	// --- 2. ingest ---
+	// How many spectra to produce. Two independent caps apply and the smaller wins: what the input
+	// and the Channel Mode allow (analysisChannelCount), and what the output was declared to hold.
+	// The second is not redundant - TouchDesigner allocates the output from getOutputInfo, and
+	// writing a channel that was never declared would corrupt memory rather than produce a channel.
 	myExecStage = 2;
 	const int num_channels = std::min(analysisChannelCount(cinput, p.chanMode), std::max(1, output->numChannels));
 	myAnalysisChannels = num_channels;
@@ -626,6 +906,9 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 
 	// --- 3. analysis job ---
 	myExecStage = 3;
+	// Start or stop the worker as the Async parameter changes. Both calls are idempotent, so this
+	// compare-and-switch runs on every cook without a state flag of its own; stopping joins the
+	// thread, which is why turning Async off mid-cook is a safe, synchronous operation.
 	const bool want_async = p.async;
 	if (want_async != myWorkerRunning) {
 		if (want_async) startWorker(); else stopWorker();
@@ -636,7 +919,9 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	// N-1 cooks out of N: with the analysis already off the cook thread, skipping bought nothing and
 	// only halved the rate at which the spectrum updated.)
 	fillJob(myJobs.back(), num_channels, win_samples, dt_ms);
-	if (myJobs.publish()) myJobsDropped.fetch_add(1, std::memory_order_relaxed);   // worker had not taken the previous job
+	// A publish that overwrites a job the worker never took is a dropped frame of analysis, counted
+	// for the async_jobs Info DAT row. It is normal under load and not an error.
+	if (myJobs.publish()) myJobsDropped.fetch_add(1, std::memory_order_relaxed);
 	if (myAsyncActive) {
 		// The hot worker polls the slot itself. Only a dormant worker needs a kernel wake-up
 		// (~5 us): fence + load pair with the worker's store + fence, so exactly one side always
@@ -644,19 +929,34 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 		std::atomic_thread_fence(std::memory_order_seq_cst);
 		if (myWorkerDormant.load(std::memory_order_seq_cst)) myWake.signal();
 	} else if (myJobs.acquire()) {
+		// Async off: the analysis runs right here, on the cook thread, and its result is published
+		// before step 4 reads it - so a synchronous cook shows a spectrum computed from its own
+		// samples, with no latency, at the cost of the transform being on the cook thread.
 		runJob(myJobs.front());                           // inline on the cook thread
 	}
 
 	// --- 4. output (hold the previous spectrum when nothing new has been published) ---
+	// Note it asks for the NEWEST published result, which in async mode is usually the previous
+	// cook's job. See the header comment above for why that latency is the design.
 	myExecStage = 4;
 	copyResultsToOutput(output, num_channels);
 
 	// --- 5. deferred Textport log (lock-free check; only locks when something was logged) ---
+	// The plan log can be written from the worker thread, and a non-cook thread must never call into
+	// Python, so log lines are buffered there and printed here. hasPending() is a relaxed atomic
+	// read, so the steady state (nothing logged) costs one load and no lock.
 	if (myLog.hasPending()) myLog.flushToTextport();
 	myLastCookUs = usSince(t_start);
-	myExecStage = 0;
+	myExecStage = 0;                                      // no step in progress; an error here means "outside the cook"
 }
 
+// The cook entry point TouchDesigner calls. Its entire job is to make sure that no exception can
+// cross the DLL boundary: an exception escaping into TouchDesigner's own code would be undefined
+// behaviour (and in practice a crash), so everything is caught here and turned into an error string
+// plus a zeroed output. The actual cook is executeImpl() above.
+//
+// THE SUCCESS PATH ALSO DOES ONE THING, and it is worth knowing about because it is easy to delete
+// by accident: it clears a previously latched error. See the comment inside.
 void
 FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
@@ -727,6 +1027,30 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 	return 21;
 }
 
+// One Info CHOP channel, by index. TouchDesigner calls this once per channel, in order, right after
+// getNumInfoCHOPChans() said how many there are.
+//
+// THE COUNT IS A CONTRACT: this switch must cover every index below `getNumInfoCHOPChans()`'s return
+// value (21), and the names must stay in the same position, because a CHOP that exports or references
+// a channel by index would silently follow a reordering. Adding a channel means: add a case here AND
+// raise the 21 in getNumInfoCHOPChans(). Adding a case without raising it does nothing; raising it
+// without adding a case hands TouchDesigner an unnamed zero-filled channel.
+//
+// READ THE INDEX MAP HERE, NOT IN TOUCHDESIGNER: the names are the API for anything downstream.
+//
+//   0 execute_count        how many times execute() has run  |  11 linear_bins        FFT bins before the warp
+//   1 fft_size             N of the transform                |  12 param_fetch_us     time spent reading parameters
+//   2 window_samples       samples in the analysis window    |  13 param_reads        number of parameter lookups
+//   3 input_sample_rate    rate of the incoming audio        |  14 jobs_dropped       async jobs overwritten untaken
+//   4 output_sample_rate   bins x me.time.rate (throughput) |  15 analysis_channels  spectra produced per cook
+//   5 peak_freq_hz         channel 0 spectral peak           |  16 hold_frames        cooks behind the analysis is
+//   6 peak_magnitude       magnitude at that peak            |  17 linear_grid        output grid == linear FFT grid
+//   7 simd_avx2_active     1 when the AVX2 path is usable    |  18 hz_per_sample      Hz between adjacent output bins
+//   8 async_active         1 when the worker thread is on    |  19 output_bandwidth_sps bins x frames per second
+//   9 cook_time_us         the whole cook, microseconds      |  20 channel_fanout     1 when channels were parallelised
+//  10 dsp_time_us          the analysis alone
+//
+// The read-only ones come from the status snapshot; see statusSnapshot() for why that matters.
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
@@ -791,6 +1115,27 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 	return true;
 }
 
+// One row of the Info DAT, by row index. Called once per row and per column pair, so it runs about
+// twice per row for a two-column table - roughly 276 times per cook at the standard row count.
+//
+// THE INDEX MAP (the first 20 rows are fixed; rows 20+ are the plan log, one row per entry):
+//
+//   0 execute_count          10 simd_acceleration      20+ plan_log_0, plan_log_1, ...
+//   1 mode                   11 fft_engine
+//   2 fft_size               12 cook_time              <- the cook/param breakdown
+//   3 linear_bins            13 dsp_time
+//   4 window_samples         14 async_jobs             <- dropped count and hold frames
+//   5 input_sample_rate      15 fft_backend            <- which library is loaded, and its wisdom
+//   6 output_spectrum_axis   16 hz_per_sample
+//   7 output_sample_rate     17 output_bandwidth_sps
+//   8 window_resolution      18 channel_fanout
+//   9 spectral_peak_freq     19 info_callback_calls    <- the diagnostic row; read this one first
+//
+// The rows are free-form strings rather than values: an Info DAT is read by a human, so each one
+// carries its own units and, where a number could be misread, the arithmetic behind it.
+//
+// THE ROW COUNT MUST MATCH getInfoDATSize(). That function freezes the log view and declares
+// `20 + rows`; this one walks the frozen copy. If you add a fixed row, change both.
 void
 FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entries, void* reserved1)
 {
@@ -798,7 +1143,12 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 	// copied two std::strings on each of those calls. See the block comment above statusSnapshot().
 	const AnalysisPipeline::Status& s = statusSnapshot();
 	const double dspUs = myDspUs.load(std::memory_order_relaxed);
+	// One stack buffer reused by every branch below: the table is `byColumn = false` (see
+	// getInfoDATSize), so values[0] is the row name and values[1] is the value, and setString copies
+	// out of the buffer immediately. 256 characters is comfortably more than any row here produces.
 	char tempBuffer[256];
+	// The shortcut for the rows whose value is already a string. It exists to keep the switch below
+	// readable: without it every string row would repeat the same two setString calls.
 	auto row = [&](const char* k, const std::string& v) {
 		entries->values[0]->setString(k);
 		entries->values[1]->setString(v.c_str());
@@ -919,6 +1269,9 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 	}
 	default: break;
 	}
+	// Past the fixed rows: one row per plan-log entry, in the order the frozen copy holds them.
+	// Anything past the end of the frozen copy is left alone deliberately - getInfoDATSize() declared
+	// the row count from that same copy, so this cannot normally be reached.
 	size_t log_idx = static_cast<size_t>(index - 20);
 	if (log_idx < myInfoDatLog.size()) {
 		snprintf(tempBuffer, sizeof(tempBuffer), "plan_log_%zu", log_idx);
@@ -1054,15 +1407,33 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	// DAT precisely so it cannot be mistaken for the thing it measures.
 }
 
+// The node's warning, shown on the operator itself. A warning means the node is working but not
+// well, which is exactly the case the async worker falls into when it cannot keep up: the spectrum
+// is still valid, it is just older than it should be.
+//
+// Setting no string (the normal case) is a no-op, not an empty warning.
 void
 FFT::getWarningString(OP_String* warning, void* reserved1)
 {
-	// hold_frames == 1 is the normal one-frame latency of the async pipeline
+	// hold_frames == 1 is the normal one-frame latency of the async pipeline - only a larger number
+	// is worth mentioning, and 3 is the threshold that separates "a frame ran long" from "the
+	// analysis is consistently behind". The remedy named in the message is the two settings that
+	// actually reduce the work: a shorter zero-pad (smaller N) or fewer output bins.
 	if (myAsyncActive && myHoldFrames > 3) {
 		warning->setString("Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins.");
 	}
 }
 
+// The node's error, shown on the operator itself. TouchDesigner puts the node into an error state
+// while this returns anything, and an errored node reports *that* instead of its own operator
+// information - which is why a stale error is worth clearing aggressively (see execute()).
+//
+// FOUR SOURCES, checked in priority order: the most specific and most recent first.
+//   1. myErrorText       - an exception this or a recent cook threw (carries the stage number)
+//   2. myPlanFailed      - FFTW could not build a plan for the current size
+//   3. myPipelineFailing - an analysis threw; live flag, not the lifetime count
+//   4. mySampleRate <= 0 - the input gave no usable sample rate
+// A node with none of these sets no string and is not in error.
 void
 FFT::getErrorString(OP_String* error, void* reserved1)
 {
@@ -1075,18 +1446,32 @@ FFT::getErrorString(OP_String* error, void* reserved1)
 	else if (mySampleRate <= 0.0) error->setString("Invalid or missing audio sample rate from input CHOP.");
 }
 
+// Called once, when TouchDesigner builds the node's parameter page. The whole parameter set lives
+// in Parameters.h/.cpp so that the CHOP's page and the values the pipeline reads are defined in one
+// place - add a parameter there, not here.
 void
 FFT::setupParameters(OP_ParameterManager* manager, void* reserved1)
 {
 	Parameters::setup(manager);
 }
 
+// A pulse parameter was pressed. Only Reset does anything today.
+//
+// RESET MEANS "forget everything that has history" - the EQ's filter state and the ballistics/AGC
+// state in the pipeline - so the node starts from a clean slate without rebuilding the plan or the
+// tables. It is NOT a re-plan and NOT a reload; an empty middle-click popup is a different problem
+// with a different answer (see README).
+//
+// The reset request is passed to the pipeline through the next job (myResetPending -> job.reset)
+// rather than applied here, because the pipeline state belongs to whichever thread owns it.
 void
 FFT::pulsePressed(const char* name, void* reserved1)
 {
 	if (!strcmp(name, Parameters::ResetName))
 	{
 		for (auto& st : myIngest) st.eq.reset();
+		// Also clears the latched error: after an explicit Reset the user has acknowledged whatever
+		// was wrong, so the node should stop reporting it even if nothing else has changed.
 		myResetPending = true;
 		myErrorText.clear();
 	}

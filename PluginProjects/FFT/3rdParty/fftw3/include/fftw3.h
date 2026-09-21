@@ -13,7 +13,9 @@
  * below; nothing else in the project needs to change.
  *
  * This project's pin (expected version string, DLL name, runtime check) lives
- * in source/FftwVersion.h, not here - this file stays a thin forwarder.
+ * in the kFftw3Backend descriptor in source/FftBackend.h - its expectedVersion
+ * field is the "3.3.11" that the runtime check compares against - not here.
+ * This file stays a thin forwarder.
  * --------------------------------------------------------------------------- */
 
 #include "fftw3-3.3.11-avx2.h"

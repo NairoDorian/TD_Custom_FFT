@@ -16,9 +16,10 @@ FFTW_VENDORED_CMAKE_VERSION_PATCH=set(FFTW_VERSION 3.3.11)
   upstream bumped configure.ac for the 3.3.11 release but not the CMake file. That value is
   substituted into config.h as PACKAGE_VERSION, which is the string fftwf_version returns and the
   version header FFTW stamps into its wisdom files. Unpatched, a genuine 3.3.11 build self-reports
-  as 3.3.10 and the plugin's own pin (FftwVersion.h) would log a mismatch on every run. The patch is
-  one line in the scratch source tree at .fftw_build/fftw-3.3.11/CMakeLists.txt and is the only
-  source modification made to the vendored build. Evidence the source really is 3.3.11:
+  as 3.3.10 and the plugin's own pin (the expectedVersion field of the kFftw3Backend descriptor in
+  source/FftBackend.h) would log a mismatch on every run. The patch is one line in the scratch source
+  tree at .fftw_build/fftw-3.3.11/CMakeLists.txt and is the only source modification made to the
+  vendored build. Evidence the source really is 3.3.11:
   configure.ac:29 "fftw-3.3.11 was 10:x:7 (added fftw_copy_plan())", and configure's
   PACKAGE_VERSION='3.3.11' with the tarball md5 above.
 FFTW_VENDORED_LIB=libfftw3f-3.3.11-avx2.lib

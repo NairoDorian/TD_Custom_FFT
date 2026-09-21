@@ -2,6 +2,133 @@
 
 All notable changes to `Plugin_FFT` are documented here.
 
+## How to read this file
+
+Newest release first. Every version opens with a one-line summary of what it was about, then the
+sections below. They mean specific things here, and the distinction has been worth keeping:
+
+| Section | What it means |
+|---|---|
+| **Added** | Something the node can now do that it could not before |
+| **Changed** | Existing behaviour that now behaves differently |
+| **Removed (breaking)** | A parameter or feature that is gone. Existing `.toe` files lose it, so these entries say what to do instead |
+| **Fixed** | A defect that was actually wrong, described with the mechanism and not just the symptom |
+| **Verified** | The evidence: the test check count, the benchmark number, or the check that was run against a real binary. A change with no entry here was not measured |
+| **Measured / Confirmed in TouchDesigner** | Numbers and observations from a real run, with the machine named |
+| **Notes / Still open** | Design reasoning, and - deliberately - what is *not* established. If a claim in this file could not be verified, it says so here rather than being stated as fact |
+
+Two conventions that matter if you are adding an entry:
+
+- **Name the machine** next to any timing. An absolute number without one is not comparable to
+  anything, and this project has measurements from two machines in it.
+- **Keep the "Still open" sections honest.** They exist because the middle-click popup was
+  misdiagnosed three times, and the confident version of that history was wrong. An entry that
+  claims more than was measured is worse than no entry.
+
+For what the node does *now* (rather than when it changed), see [README.md](README.md); for the
+performance analysis, see [FFT_REALTIME_OPTIMIZATION_ANALYSIS.md](FFT_REALTIME_OPTIMIZATION_ANALYSIS.md).
+
+---
+
+## [Unreleased] — maintainability pass: comments, structure and documentation only
+
+No behaviour change of any kind. No parameter added, removed or renamed, no default changed, no
+algorithm touched, no version bump. **`fft_tests`: 607 checks, 0 failures** before and after, which
+is the whole of the evidence that nothing moved.
+
+### Changed
+- **A plain-language layer was added above the existing comments across the source tree.** The comments
+  this project already had are dense and accurate - they explain *why* a thing is the way it is, with
+  measured facts - but they assume the reader already knows what the code does. Every file now opens
+  with what it is for and how to read it, and every non-obvious function and member has a short
+  WHAT / WHY / HOW TO CHANGE block above the existing prose. **No existing comment was deleted**: the
+  technical facts are all still there, with a plainer layer above them.
+- **The files concerned:** `source/DSPModules.h`, `source/AnalysisPipeline.h`,
+  `source/AnalysisPipeline.cpp`, `source/FFT.cpp`, `source/FFT.h`, `source/FftBackend.h`,
+  `source/RateModel.h`, `source/Parameters.h`, `source/Parameters.cpp`, `tests/dsp_tests.cpp`,
+  `bench/bench.cpp`, `bench/fftw_threads_probe.cpp`, `bench/fftw_version_probe.cpp`.
+- **Every markdown file was extended as well**, and `README.md` gained two navigation sections: a table
+  of which of the five documents answers which question, and a "Where to change what" map for a first
+  modification. The project-layout block in `README.md` had also gone stale - it was missing
+  `AnalysisPipeline.h/.cpp` and `RateModel.h` entirely, i.e. the file that holds the stage order and
+  the file that holds the sample-rate arithmetic.
+
+### Fixed (documentation only)
+- **Stale facts in the surrounding prose, corrected against the source.** The `README.md` project layout
+  was missing three source files (`AnalysisPipeline.h`, `AnalysisPipeline.cpp`, `RateModel.h`), one bench
+  file (`fftw_version_probe.cpp`) and the two build helpers, and it described `CMakeLists.txt` as "15
+  lines" (it is not, and the number was guaranteed to age badly). Claims of the form "CALLED BY ..." and "used by ..."
+  in the new comments were each checked with a search before being written, and several were corrected as
+  a result - notably the reason `interp` is in `WarpKey`, which is that
+  `AnalysisPipeline::updateWarp()` calls `setInterpolation()` *inside* its key-guarded block, so
+  removing it from the key would make the interpolation menu silently do nothing.
+- **A latent maintenance hazard was found and named, which is worth recording because it will recur:**
+  the comments cite each other as `file:line` ("CALLED BY: `FFT::pollParameters()` (`source/FFT.cpp:239`)"),
+  and **adding comments shifts every line below them, so this pass invalidated a whole set of those
+  citations at once**. The citations are being rewritten to name the symbol instead of the line
+  (`FFT::pollParameters()`), because a symbol survives an edit and a line number does not. The convention
+  is now stated in `README.md` under *"Where to change what"*. Nothing was wrong with the code in any of
+  these cases - the reference, not the referent, had moved.
+- **Three files pointed at something that is not there.** `3rdParty/fftw3/VERSION` and
+  `3rdParty/fftw3/include/fftw3.h` both named `source/FftwVersion.h` as the home of the FFTW version
+  pin. No such file exists anywhere in the tree. The real pin is the `expectedVersion` field of the
+  `kFftw3Backend` descriptor in `source/FftBackend.h` (`"3.3.11"`), which is what the runtime mismatch
+  check actually compares `fftwf_version()` against, and both files now name that instead.
+  `CMakeLists.txt` had the same class of error one step further out: it said the `3.3.5 -> 3.3.11`
+  comparison "in `3rdParty/fftw3/README.md`" was measured with `fft_version_probe`. That comparison
+  has never been in that file - it records the FFTW3-vs-oneMKL comparison - so the comment now says
+  no such A/B is kept there and to re-run the probe, rather than pointing at numbers a reader cannot
+  find. All three edits are comment text only: `CMakeLists.txt` is byte-identical with its `#` lines
+  stripped, all 18 `KEY=` value lines in `VERSION` are unchanged, and the `#include` in `fftw3.h` is
+  untouched.
+- **Two comments asserted a default and a location that were both wrong.** In `tests/dsp_tests.cpp`,
+  `test_rate_model()`'s note described the default `Parameters::Values` as "WinMode=Ms(50/72),
+  pad=32768". The real defaults are `WinMode::Samples` (3175 samples, which is 72 ms, so the two default
+  fields describe the same window) and `kPadDefault` = 16384, i.e. index 4 of `kPadValues` - and "50/72"
+  is the attack/release ms pair, not a window mode at all. In `AnalysisPipeline::rebuild()`, the comment
+  justifying the backend cast cited "the static_assert in FFT.cpp"; `FFT.cpp` contains no `static_assert`
+  anywhere, and the asserts that pin the two numberings are the ones after the menu tables in
+  `Parameters.cpp`. Both are latent traps rather than live bugs - the test passes either way and the cast
+  is correct either way, so nothing would ever have flagged them. Both are comment text only.
+- **The two realtime documents described a codebase that no longer exists.** They are the oldest prose in
+  the project - written as forward-looking plans and then kept as history - so much of what they name as
+  current had since been renamed, removed or overtaken. Corrected against the source, with the correction
+  placed beside the original claim rather than replacing it:
+  - **Four commit hashes were attached to the wrong descriptions and two commits were missing** from the
+    15-commit sweep that made it into the text. All six were checked individually with `git log -1`.
+  - **`MKLEngine` was described as a live implementation.** It does not exist, and has not since v2.2.0,
+    where it was removed as a byte-for-byte copy of `FFTWEngine`.
+  - **About a dozen symbol names were dead** (`hasActiveFilter()`, `applyWindow`, `applyWeightingCurve`,
+    `ChannelState::initBuffers()`, `getPlanLogHistory()`, `processChannel`, `rebuildDSP()`,
+    `std::max_element`, ...). Each was replaced with the symbol that search proved is current
+    (`BiquadEQ::updateAndCheckActive()`, `FFTDSP::multiplyInto()`, `PlanLog::snapshot()`,
+    `python_logger::writeToTextport()`, `AnalysisPipeline::runChannel()`, `FFTDSP::findPeakWithIndex()`).
+  - **Several "already in place" claims were false**, most notably an "adaptive planner (MEASURE for
+    small, ESTIMATE for large)" that has never existed - what exists is the user-selected `PlannerPolicy`
+    plus a background upgrade. Flagged, not quietly dropped.
+  - **Numbers that had been overtaken**: the scalar-dB decision (the converter is now fully vectorized,
+    16 bins/iteration), the warp (8 bins/iteration, not 4), `FastLog10`'s table (2048 entries, not 256),
+    the sample-rate clamp (1 - 384000 Hz, not 1 - 192000), the default parameter reads (20 / 33, not
+    19 / 31), and the v2.3.0 / v2.4.0 dates (16 days apart, not the same day).
+  - **What could not be checked was labelled, not deleted**: the `FFTW_EXHAUSTIVE` "32 s" stall, the
+    "16 branches" counts, every `Expected:` estimate, the GPU figures, and the hot-spot percentages are
+    each now marked as an estimate or as unverified. Every §1 item in the roadmap also gained its real
+    outcome - done, shipped-then-removed, or open - instead of reading as though it were still pending.
+
+### Notes
+- **One pre-existing inconsistency was found and deliberately left alone.** `PluginProjects/FFT/plugin.json`
+  still declares `"version": "2.9.0"`, while the node itself reports **v2.9.1** from
+  `kMajorVersion`/`kMinorVersion`/`kPatchVersion` in `FFT.cpp`, and the newest release in this file is
+  v2.9.1. The two numbers are maintained by hand in different places and nothing derives one from the
+  other. It was not corrected here because this pass changes no behaviour of any kind and a manifest
+  version is data rather than a comment - but a reader who finds the two disagreeing should know which is
+  authoritative for "which build is actually loaded": the constants are, because that is what the
+  middle-click popup's `Plugin:` line and the Info DAT report. See the comment above `kMajorVersion`.
+- **Nothing in this pass is a performance change, and no number in this file or in the README was
+  re-measured.** The benchmark figures quoted in the entries below and in the README are the ones taken
+  when those changes were made; treat them as a record, not as a current reading, and re-run
+  `fft_bench` if a decision depends on one.
+
 ---
 
 ## [v2.9.1] - 2026-09-21 — the popup's length is now a constant, and the log line is gone

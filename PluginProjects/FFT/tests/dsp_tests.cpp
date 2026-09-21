@@ -1,8 +1,81 @@
-// Headless DSP unit tests for the FFT plugin (no TouchDesigner required).
-//   ninja -C build && ctest --test-dir build --output-on-failure
+// ==========================================================================================
+// FFT DSP unit tests - headless, no TouchDesigner required.
+// ==========================================================================================
 //
-// Golden-vector style checks: every SIMD path is compared against a scalar
-// reference, and the full pipeline is checked against a known sine.
+// WHAT THIS FILE IS
+//   The only test suite for the TouchDesigner-free DSP core (source/DSPModules.h,
+//   source/RateModel.h, source/AnalysisPipeline.h). It is a hand-rolled harness, not a framework:
+//   CHECK / CHECK_NEAR bump two counters, the section banner is printed, and main() returns non-zero
+//   if anything failed. Nothing has to be installed or learned to run or extend it.
+//
+// WHAT IT COVERS
+//   Golden-vector style checks: every SIMD path is compared against a scalar reference, and the
+//   full pipeline is checked against a known sine. Concretely: the FIFO ring buffer, FastLog10,
+//   magnitude and peak finding, window normalization, the perceptual warp (linear and cubic), the
+//   dB converter, ballistics, the biquad EQ's streaming path, the v2.3 helpers, PlanLog,
+//   clipLine, the triple buffer and worker signal, the FFTW planner (Auto/Patient, background
+//   measurement, the Async toggle) and the FFT backend registry (FFTW3 / oneMKL).
+//
+// WHAT IT DELIBERATELY DOES NOT COVER
+//   Anything TouchDesigner-side: FFT.cpp, Parameters.cpp, the CHOP plumbing, the middle-click
+//   popup, the Info DAT and the Python textport logger. Where a plugin-side contract can be
+//   restated against the DSP core it is asserted here instead - see test_backend_selection, which
+//   notes that the menu-value mapping itself is checked in Parameters.cpp, not in this file.
+//
+// HOW IT IS BUILT AND RUN
+//   Built as the `fft_tests` target from tests/dsp_tests.cpp + source/AnalysisPipeline.cpp
+//   (see PluginProjects/FFT/CMakeLists.txt). Relative to PluginProjects/FFT, the documented command
+//   is:
+//       ninja -C build && ctest --test-dir build --output-on-failure
+//   which runs the executable directly:
+//       build/bin/Release/fft_tests.exe
+//   ctest starts it with the working directory set to build/bin/Release, where the FFTW DLL lives.
+//   That directory is also where the tests write their private wisdom file
+//   (fft_tests_wisdom.txt) - running the exe by hand from somewhere else still works, but leaves
+//   the wisdom file wherever you were standing.
+//
+// THE CHECK COUNT IS A SIGNAL
+//   The last line printed is "N checks, M failures", and N is watched: it is compared between
+//   runs and quoted when a change is described, so a difference in it means the coverage changed.
+//   As of this writing the suite reports 607 checks, 0 failures on this machine. Never add, remove,
+//   reorder or reword a CHECK/CHECK_NEAR, a section banner or a registration in main() to make a
+//   comment fit: the comments in this file are comments and nothing else. If a deliberate change
+//   moves the count, update this paragraph with it.
+//
+//   One caveat when comparing counts between machines: a few tests have branches that are taken or
+//   skipped depending on what is installed (oneMKL present or not, a size already in the wisdom
+//   file) and loop over the backend registry, so the total is genuinely machine-dependent in those
+//   places. The 607 above is this machine's number; a different one is not automatically a bug.
+//
+// RUNNING ORDER (the order main() calls them - which is NOT the order they appear in this file)
+//    1. test_fifo                       FIFOBuffer ring: right-aligned, zero-padded while filling
+//    2. test_fastlog10                  FastLog10 LUT accuracy, scalar and AVX2
+//    3. test_magnitude_and_peak         magnitude kernel vs scalar; findPeakWithIndex/peakMagnitude
+//    4. test_window_normalization       CoherentGain == mean 1, FullScale == sum 2, all 6 windows
+//    5. test_warp                       PerceptualWarping: identity bypass and the gather path
+//    6. test_decibel                    DecibelConverter: dB mode, 0..1 mode, floor clamp
+//    7. test_ballistics                 BallisticsFilter attack/release and coefFromMs
+//    8. test_eq_streaming               BiquadEQ block ingest == one-shot, plus the legacy mismatch
+//    9. test_v23_helpers                silence, mix, cubic warp, partial magnitude, deferred log
+//   10. test_plan_log_tail              PlanLog::snapshotTail()/version() against snapshot()
+//   11. test_clip_line                  clipLine() - the popup's per-line bound
+//   12. test_triple_buffer_and_signal   TripleBuffer handoff + WorkerSignal wake/timeout
+//   13. test_background_plan            FFTWEngine Auto/Patient: instant prepare, deferred upgrade
+//   14. test_backend_selection          the FFTW3 / oneMKL toggle and its OpenMP-layer contract
+//   15. test_async_single_thread        Async off -> no planner thread; on -> the upgrade re-arms
+//   16. test_pipeline_sine              full FFT chain on a 1 kHz sine, both normalizations
+//   17. test_pipeline_process           AnalysisPipeline::process(): single, multi-channel, silent
+//   18. test_identity_grid_and_rate     linear grid == identity warp, and the frequency axis model
+//   19. test_rate_model                 RateModel: bin counts, reported rate, axis rate, sizes
+//   20. test_equal_loudness             EqualLoudness A/C/468 golden vectors and shape invariants
+//
+//   Read that against the file itself: entries 1-8 appear in that order, then the file holds 13,
+//   14 and 15 (the planner / backend / Async tests), then 9, 10, 11 and 12 (the helper and
+//   container tests), then 16-20. So the file order really is not the running order - always trust
+//   main() at the bottom of the file, which is also the only place a test becomes part of the run.
+//
+//   Note also that test_pipeline_process() prints three section banners (one per scenario it
+//   covers), so the printed banner count is higher than the test-function count.
 
 #include "DSPModules.h"
 #include "RateModel.h"
@@ -21,6 +94,9 @@
 
 using namespace FFTDSP;
 
+// The two counters behind the final "N checks, M failures" line. g_checks is the number people
+// watch (see the header), so a check that is meant to be conditional still has to be reached the
+// same number of times on every machine for the count to be comparable between runs.
 static int g_failures = 0;
 static int g_checks = 0;
 
@@ -50,6 +126,12 @@ static bool moduleLoaded(const char* prefix)
 #endif
 }
 
+// Pass/fail primitives. Both count the check first and only then test it, so a failing check is
+// still counted - the reported total is "checks run", not "checks that passed".
+//
+// HOW TO CHANGE: these are deliberately macros rather than functions so that __LINE__ names the
+// call site in the FAIL message; converting them to templates or functions would print this line
+// for every failure and lose the only piece of information the message carries.
 #define CHECK(cond)                                                                             \
     do {                                                                                        \
         ++g_checks;                                                                             \
@@ -69,25 +151,38 @@ static bool moduleLoaded(const char* prefix)
         }                                                                                       \
     } while (0)
 
+// Section banner. Printed, not stored: it exists so that a hung run or a crash (which leaves the
+// last printed line as the whole diagnosis, see main()) says which test it was in.
 static void section(const char* name) { std::printf("[%s]\n", name); }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_fifo =====================
+// WHAT:  FIFOBuffer::get() always hands back exactly `capacity` samples, oldest-first, with the
+//        NEWEST sample last: an exact copy of the last N once the buffer has filled, and the same
+//        copy right-aligned behind zeros while it is still filling. Ordering property, not a
+//        numeric one - the check is bit equality, not a tolerance.
+// WHY:   not recorded in this file. The property is the one the ring buffer's own contract depends
+//        on (see the FIFOBuffer block in DSPModules.h): callers rely on "now" being at the last
+//        index whether the node just started or has been running for an hour.
+// HOW TO CHANGE: the 10 in this function is the buffer capacity and every 10 in the body means that
+//        same capacity, not a window length. The shipped default is 3175 (72 ms at 44.1 kHz); 10 is
+//        used here only so that 50 blocks wrap the ring many times over.
 static void test_fifo()
 {
     section("FIFOBuffer");
     FIFOBuffer fifo(10);
-    std::vector<float> ref;
-    std::mt19937 rng(7);
+    std::vector<float> ref;                      // the same stream kept as a plain vector to compare against
+    std::mt19937 rng(7);                         // fixed seed: the run has to be reproducible
     AlignedVector out;
-    for (int step = 0; step < 50; ++step) {
-        size_t n = 1 + rng() % 13;
+    for (int step = 0; step < 50; ++step) {      // 50 blocks against a 10-deep ring: wraps repeatedly
+        size_t n = 1 + rng() % 13;               // blocks of 1..13: some shorter than the capacity, some longer
         std::vector<float> block(n);
-        for (auto& v : block) v = static_cast<float>(rng() % 1000);
+        for (auto& v : block) v = static_cast<float>(rng() % 1000);   // 0..999, exact in a float
         fifo.add(block.data(), n);
         ref.insert(ref.end(), block.begin(), block.end());
-        if (ref.size() > 10) ref.erase(ref.begin(), ref.end() - 10);
+        if (ref.size() > 10) ref.erase(ref.begin(), ref.end() - 10);   // keep the reference to the same depth
         fifo.get(out);
-        CHECK(out.size() == 10);
+        CHECK(out.size() == 10);                 // always the full capacity, never a short buffer
         // out is right-aligned while filling, exact copy afterwards
         size_t offset = 10 - ref.size();
         bool ok = true;
@@ -98,10 +193,25 @@ static void test_fifo()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_fastlog10 =====================
+// WHAT:  FastLog10::scaled(x) - the 2048-entry mantissa LUT that stands in for 20*log10 - stays
+//        within 0.006 dB of the exact double-precision value across a 300 dB sweep, and under AVX2
+//        the 8-wide vector form agrees with the scalar form to 1e-4. The scalar sweep is the real
+//        contract; the vector check only guards the two implementations against drifting apart.
+// WHY:   the LUT is an approximation by construction, so the question the test answers is "how
+//        wrong can it be", and the answer is bounded next to the table in DSPModules.h. The
+//        tolerance below is deliberately set above that documented worst case rather than pinned
+//        to it, so the test fails on a real regression and not on the last digit.
+// HOW TO CHANGE: if the LUT size or its sampling changes (kTableBits / kTableSize, or mid-interval
+//        vs lower-edge rounding), both the 0.006 here and the comment next to the check have to be
+//        re-derived together - they describe the same number.
 static void test_fastlog10()
 {
     section("FastLog10");
     double max_err = 0.0;
+    // 1e-9 .. 1e6 is -180 dB .. +120 dB; the 3.7% geometric step means consecutive samples land
+    // between the LUT's entries as well as on them, which is what makes the mid-interval sampling
+    // observable here rather than a property of the table alone.
     for (float x = 1e-9f; x < 1e6f; x *= 1.037f) {
         double ref = 20.0 * std::log10(static_cast<double>(x));
         max_err = std::max(max_err, std::abs(ref - FastLog10::scaled(x)));
@@ -109,57 +219,85 @@ static void test_fastlog10()
     std::printf("  scalar max error: %.5f dB\n", max_err);
     CHECK(max_err < 0.006);   // 2048-entry LUT, mid-interval samples: 0.0042 dB worst case
 #if defined(__AVX2__)
+    // Exactly one AVX2 register of inputs, spanning several exponent decades and including a power
+    // of two (1.0, a mantissa boundary) and a large odd mantissa (12345.0).
     alignas(32) float in[8] = { 1e-6f, 0.001f, 0.5f, 1.0f, 3.7f, 100.0f, 12345.0f, 2.5e5f };
     alignas(32) float out[8];
     _mm256_store_ps(out, FastLog10::scaledVec(_mm256_load_ps(in)));
+    // Both paths read the same table with the same arithmetic, so this only has to absorb float
+    // rounding at these magnitudes - hence a tolerance four orders tighter than the scalar one.
     for (int i = 0; i < 8; ++i) CHECK_NEAR(out[i], FastLog10::scaled(in[i]), 1e-4);
 #endif
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_magnitude_and_peak =====================
+// WHAT:  computeMagnitudeAVX2_FMA() computes sqrt(re^2 + im^2) to within 1e-5 relative of a
+//        double-precision scalar reference, and findPeakWithIndex()/peakMagnitude() agree with
+//        std::max_element on where the peak is and what it is worth - including when the peak is at
+//        index 0, which is the case a running-maximum loop gets wrong if it is initialised badly.
+// WHY:   not recorded in this file.
+// HOW TO CHANGE: the 1000-point input is intentional - it is not a multiple of 8, so the AVX2 body
+//        runs on 992 samples and the last 8 fall through to the scalar tail; the peak test then uses
+//        19 (16 vectorised + 3 scalar) to reach the tail at both ends of the array.
 static void test_magnitude_and_peak()
 {
     section("computeMagnitudeAVX2_FMA / peak");
-    const size_t n = 1000;
+    const size_t n = 1000;              // 125 vectors of 8, plus a scalar tail (see above)
     AlignedComplexVector c(n);
     AlignedVector mag(n), ref(n);
-    std::mt19937 rng(3);
-    std::uniform_real_distribution<float> d(-100.0f, 100.0f);
+    std::mt19937 rng(3);                // fixed seed: reproducible data on every run
+    std::uniform_real_distribution<float> d(-100.0f, 100.0f);   // both signs, so re/im are exercised
     for (size_t i = 0; i < n; ++i) {
         c[i] = { d(rng), d(rng) };
-        ref[i] = std::sqrt(c[i].real() * c[i].real() + c[i].imag() * c[i].imag());
+        ref[i] = std::sqrt(c[i].real() * c[i].real() + c[i].imag() * c[i].imag());   // exact, in double
     }
     computeMagnitudeAVX2_FMA(reinterpret_cast<const float*>(c.data()), mag.data(), n);
     double max_rel = 0.0;
     for (size_t i = 0; i < n; ++i) {
+        // 1e-9 guards the division: a ref of exactly 0 would otherwise divide by zero.
         double rel = std::abs(static_cast<double>(mag[i]) - ref[i]) / std::max(1e-9, static_cast<double>(ref[i]));
         max_rel = std::max(max_rel, rel);
     }
     std::printf("  magnitude max rel error: %.2e\n", max_rel);
-    CHECK(max_rel < 1e-5);
+    CHECK(max_rel < 1e-5);              // relative, so it holds across the whole input range
 
     size_t idx = 0;
     float pk = findPeakWithIndex(mag.data(), n, idx);
-    auto it = std::max_element(ref.begin(), ref.end());
+    auto it = std::max_element(ref.begin(), ref.end());   // the reference is the same array, in a different order of comparison
     CHECK(static_cast<size_t>(it - ref.begin()) == idx);
-    CHECK_NEAR(pk, *it, 1e-3 * (*it));
+    CHECK_NEAR(pk, *it, 1e-3 * (*it));                    // slack: absorbs the order a running max accumulates in
     CHECK_NEAR(peakMagnitude(mag.data(), n), *it, 1e-3 * (*it));
 
     // peak at index 0 and in the scalar tail
+    // 19 = 16 (two AVX2 vectors) + 3 scalar; the two probes are the two ends.
     AlignedVector small(19, 0.0f);
     small[0] = 5.0f; CHECK(findPeakWithIndex(small.data(), 19, idx) == 5.0f && idx == 0);
     small[18] = 9.0f; CHECK(findPeakWithIndex(small.data(), 19, idx) == 9.0f && idx == 18);
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_window_normalization =====================
+// WHAT:  WindowGenerator::generateWindow() produces a window whose mean is 1 under CoherentGain and
+//        whose sum is 2 under FullScale, for every window type the generator implements.
+// WHY:   not recorded in this file. These are the two normalizations' defining properties - they are
+//        what make the two magnitude scales mean anything downstream (see the WindowNorm block in
+//        DSPModules.h: CoherentGain is the legacy scale whose windowed full-scale sine peaks at
+//        N_win/2, FullScale is the one where a sine of amplitude A reads back as A).
+// HOW TO CHANGE: this loops over all six types (0..5 = Kaiser, Hann, Hamming, Blackman,
+//        Blackman-Harris, Rectangular - see Parameters::WindowType). Adding a window type means
+//        raising the 6 and nothing else here; a type added to the enum but not to this loop is
+//        untested, and the check count will not change to tell you so.
 static void test_window_normalization()
 {
     section("WindowGenerator normalization");
     AlignedVector w;
-    for (int type = 0; type < 6; ++type) {
+    for (int type = 0; type < 6; ++type) {           // every WindowType except COUNT
+        // 15.0 is the Kaiser beta (Parameters::kaiserBeta's default); it is ignored by the other
+        // five types. 3175 is the default window length: 72 ms at 44.1 kHz.
         WindowGenerator::generateWindow(type, 15.0, 3175, w, WindowNorm::CoherentGain);
         double mean = 0; for (float v : w) mean += v; mean /= w.size();
-        CHECK_NEAR(mean, 1.0, 1e-4);
+        CHECK_NEAR(mean, 1.0, 1e-4);                 // 1e-4: accumulations over 3175 floats, nothing more
         WindowGenerator::generateWindow(type, 15.0, 3175, w, WindowNorm::FullScale);
         double sum = 0; for (float v : w) sum += v;
         CHECK_NEAR(sum, 2.0, 1e-4);
@@ -167,24 +305,41 @@ static void test_window_normalization()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_warp =====================
+// WHAT:  PerceptualWarping::applyWarp() resamples a linear magnitude spectrum onto the warped
+//        frequency axis in two ways: when the warp comes out as the identity it is a verbatim copy,
+//        and otherwise each output bin is a linear interpolation between two linear bins, which this
+//        recomputes in scalar and compares. It also checks the identity/not-identity flag actually
+//        agrees with what applyWarp() does, and that the target grid stays inside [0, Nyquist].
+// WHY:   not recorded in this file.
+// HOW TO CHANGE: the scalar reference below re-derives the bin mapping from targetHz() rather than
+//        reading it out of the warp tables, so it is an independent check of the table build - keep
+//        it that way (copying m_i0/m_w into the test would only assert that they equal themselves).
 static void test_warp()
 {
     section("PerceptualWarping");
-    const size_t nlin = 513;
+    const size_t nlin = 513;                    // a 1024-point R2C transform has 1024/2 + 1 bins
     AlignedVector src(nlin), out;
+    // A smooth, non-constant signal: the scalar reference models linear interpolation of a smooth
+    // curve, so a bound on the difference is a statement about the kernel and not about the data.
     for (size_t i = 0; i < nlin; ++i) src[i] = static_cast<float>(std::sin(i * 0.05) * 10.0 + i * 0.01);
     PerceptualWarping w;
 
     // identity: linear scale, fmax == nyquist, bins == nlin
+    // Scale 5 is Linear, whose perceptual grid IS the linear grid, so the warp blend cannot make a
+    // difference here - 1.0 (fully perceptual) still lands on the identity. 22050.0 is the Nyquist
+    // of 44.1 kHz; 20.0 is the Log Floor Hz, which the Linear scale never reads.
     w.buildWarpTables(5, 22050.0, nlin, 22050.0, 1.0, 20.0, nlin);
     CHECK(w.isIdentity());
     w.applyWarp(src, out);
     bool same = out.size() == nlin;
-    for (size_t i = 0; same && i < nlin; ++i) same = (out[i] == src[i]);
+    for (size_t i = 0; same && i < nlin; ++i) same = (out[i] == src[i]);   // bit equality: it is a memcpy
     CHECK(same);
 
     // log scale: gather path vs scalar reference
-    const size_t n_out = 1000;
+    const size_t n_out = 1000;                  // != nlin, so this is the gather path and not the bypass
+    // Scale 0 is Log; 0.963 is Parameters::warp's default Log blend (value copied from the
+    // implementation, not derived here).
     w.buildWarpTables(0, 22050.0, n_out, 22050.0, 0.963, 20.0, nlin);
     CHECK(!w.isIdentity());
     w.applyWarp(src, out);
@@ -192,69 +347,112 @@ static void test_warp()
     const auto& hz = w.targetHz();
     double max_err = 0.0;
     for (size_t i = 0; i < n_out; ++i) {
-        double frac = hz[i] / 22050.0 * (nlin - 1);
+        double frac = hz[i] / 22050.0 * (nlin - 1);       // where this target bin falls on the linear grid
+        // i0 is clamped to nlin-2 so that the i0+1 tap below always exists - the same clamp the
+        // table build uses, including for the top bin.
         size_t i0 = static_cast<size_t>(std::min<double>(nlin - 2, std::floor(frac)));
         double wt = frac - i0;
         double ref = src[i0] + wt * (src[i0 + 1] - src[i0]);
         max_err = std::max(max_err, std::abs(ref - out[i]));
     }
     std::printf("  warp max error vs scalar reference: %.2e\n", max_err);
-    CHECK(max_err < 1e-3);
+    CHECK(max_err < 1e-3);                      // absolute, on values of order 10: float rounding in the gather
+    // computeTargetHzGrid clamps every target to [0, fmax]; the 1e-6 is float slack on that clamp.
     CHECK(hz.front() >= 0.0 && hz.back() <= 22050.0 + 1e-6);
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_decibel =====================
+// WHAT:  DecibelConverter::convertToDB() in its two modes: mode 1 writes dB relative to the
+//        reference (the loudest bin lands on 0 dB, everything quieter is negative and is floored),
+//        mode 2 writes a 0..1 linear readout. The floor is checked by converting an all-zero vector.
+// WHY:   not recorded in this file. The expected values are computed here rather than tabulated
+//        (20*log10(32/64) = -6.02 dB one octave down from the peak), so this pins the definition
+//        of the scale, not a set of recorded numbers.
+// HOW TO CHANGE: the 1.0f / peak reference is what makes a.back() land on 0 dB; if the caller's
+//        reference convention changes, the two "expected 0 dB" checks change with it.
 static void test_decibel()
 {
     section("DecibelConverter");
-    AlignedVector s(64);
-    for (size_t i = 0; i < s.size(); ++i) s[i] = static_cast<float>(i + 1);
+    AlignedVector s(64);                        // 64 bins: a power of two, so index 32 is exactly half of it
+    for (size_t i = 0; i < s.size(); ++i) s[i] = static_cast<float>(i + 1);   // ramp 1..64: peak at the last bin
     AlignedVector a = s, b = s;
     float peak = peakMagnitude(s.data(), s.size());
+    // 80.0 is the converter's dB range: the floor is -80 dB, which is the value the zero-vector
+    // check at the bottom of this function expects.
     DecibelConverter::convertToDB(1, 80.0, 1.0f / peak, a);
     CHECK_NEAR(a.back(), 0.0, 6e-3);                                 // loudest bin -> 0 dB (LUT: <= 0.0042 dB)
     CHECK_NEAR(a[31], 20.0 * std::log10(32.0 / 64.0), 6e-3);           // -6.02 dB
     DecibelConverter::convertToDB(2, 80.0, 1.0f / peak, b);
     CHECK_NEAR(b.back(), 1.0, 1e-3);
-    for (float v : b) CHECK(v >= 0.0f && v <= 1.0f);
+    for (float v : b) CHECK(v >= 0.0f && v <= 1.0f);                 // mode 2 is bounded by construction
     // tiny values clamp to the floor
-    AlignedVector z(16, 0.0f);
+    AlignedVector z(16, 0.0f);                  // 16 = two AVX2 registers, every lane at the floor
     DecibelConverter::convertToDB(1, 80.0, 1.0f, z);
-    for (float v : z) CHECK_NEAR(v, -80.0, 1e-4);
+    for (float v : z) CHECK_NEAR(v, -80.0, 1e-4);                    // the clamp is exact, so this is tight
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_ballistics =====================
+// WHAT:  BallisticsFilter::apply() moves the displayed value a fixed fraction of the way toward the
+//        input each frame, using the attack fraction while rising and the release fraction while
+//        falling, and coefFromMs() converts a time constant into that per-frame fraction.
+// WHY:   not recorded in this file.
+// HOW TO CHANGE: the two expected values are the definition of the coefficients, not recorded
+//        measurements - 0.5 covers half the gap, 0.9 covers a tenth of it. If the argument
+//        convention is ever changed to "fraction retained" rather than "fraction covered", both
+//        expectations invert and this test is what tells you.
 static void test_ballistics()
 {
     section("BallisticsFilter");
     BallisticsFilter f;
+    // 32 = two unrolled AVX2 bodies of 16; prev starts at 0 so the first call is a pure attack.
     AlignedVector cur(32, 1.0f), prev(32, 0.0f);
     f.apply(0.5f, 0.9f, cur, prev);
     for (float v : prev) CHECK_NEAR(v, 0.5, 1e-6);            // attack: half way
     std::fill(cur.begin(), cur.end(), 0.0f);
     f.apply(0.5f, 0.9f, cur, prev);
     for (float v : prev) CHECK_NEAR(v, 0.45, 1e-6);           // release: 10% of the way down
+    // Both of these are the function's own definition rather than a fit: a non-positive time is
+    // "no smoothing" (coefficient 0), and the coefficient is exp(-dt/tau). 16.6667 ms is one frame
+    // at 60 fps and 100.0 ms is the time constant (tau, the time to reach 63%).
     CHECK_NEAR(BallisticsFilter::coefFromMs(0.0, 16.7), 0.0, 1e-9);
     CHECK_NEAR(BallisticsFilter::coefFromMs(100.0, 16.6667), std::exp(-16.6667 / 100.0), 1e-6);
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_eq_streaming =====================
+// WHAT:  BiquadEQ's two entry points agree: feeding the signal through processBlockInPlace() in
+//        irregular blocks gives the same output as processAudio() over the whole signal in one go.
+//        It then pins the opposite for the legacy behaviour (re-filtering each window from scratch),
+//        and finally that a disabled EQ is a pass-through that leaves the buffer untouched.
+// WHY:   the second half exists because the mismatch is not a rounding error - the legacy path
+//        starts every window with stale filter state, which is audible and is exactly what the
+//        streaming rework removed. The test asserts the difference is real (> 1e-4) so the fix
+//        cannot silently be reverted into "close enough".
+// HOW TO CHANGE: the filter is designed by updateAndCheckActive(gain_db, cutoff_hz, low_gain_db,
+//        low_cutoff_hz, q_factor, amount) - a +6 dB high shelf at 1 kHz and a -3 dB low shelf at
+//        200 Hz, Q 0.707, applied at full amount. Both engines must be given identical settings or
+//        the comparison is meaningless, which is the one thing an edit here must preserve.
 static void test_eq_streaming()
 {
     section("BiquadEQ streaming (block ingest == one-shot)");
-    const size_t total = 3175 * 3;
+    const size_t total = 3175 * 3;              // three default windows of audio (72 ms at 44.1 kHz each)
     std::vector<float> sig(total);
-    std::mt19937 rng(11);
+    std::mt19937 rng(11);                       // fixed seed: reproducible data
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
     for (auto& v : sig) v = d(rng);
 
-    BiquadEQ one(44100.0), blocks(44100.0);
-    CHECK(one.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0));
+    BiquadEQ one(44100.0), blocks(44100.0);     // same settings, two engines: one-shot vs streaming
+    CHECK(one.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0));    // returns "is it active"
     CHECK(blocks.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0));
     AlignedVector whole(sig.begin(), sig.end()), out;
     one.processAudio(whole, 1.0, out);                       // reference: whole signal in one pass
 
     std::vector<float> streamed;
+    // Block sizes deliberately chosen so that no block boundary lines up with another: 735 (one
+    // 60 fps frame at 44.1 kHz), 512 and 1024 (power-of-two sizes that are not multiples of 735),
+    // and 3 (a final stub to force a tiny partial block). The % 5 cycles them.
     size_t pos = 0, sizes[] = { 735, 512, 1024, 735, 3 };
     int k = 0;
     while (pos < total) {
@@ -271,23 +469,38 @@ static void test_eq_streaming()
     // and a windowed-per-frame re-filter (the legacy behaviour) does NOT match the true filter output
     BiquadEQ legacy(44100.0);
     legacy.updateAndCheckActive(6.0, 1000.0, -3.0, 200.0, 0.707, 1.0);
+    // Two overlapping 3175-sample windows, 735 apart - the legacy hop. o2 is compared against the
+    // one-shot output at the offset it actually occupies, out[735 + i].
     AlignedVector w1(sig.begin(), sig.begin() + 3175), w2(sig.begin() + 735, sig.begin() + 735 + 3175), o1, o2;
     legacy.processAudio(w1, 1.0, o1);
     legacy.processAudio(w2, 1.0, o2);
     double legacy_err = 0.0;
     for (size_t i = 0; i < 3175; ++i) legacy_err = std::max(legacy_err, std::abs(static_cast<double>(o2[i]) - out[735 + i]));
     std::printf("  legacy per-window re-filter error vs true output: %.2e (expected > 0: stale state at window start)\n", legacy_err);
-    CHECK(legacy_err > 1e-4);
+    CHECK(legacy_err > 1e-4);                   // the point of this half: the legacy path is measurably wrong
 
     // inactive EQ is a pass-through in place
     BiquadEQ off(44100.0);
-    CHECK(!off.updateAndCheckActive(0.0, 1000.0, 0.0, 200.0, 0.707, 1.0));
-    float x[4] = { 1, 2, 3, 4 };
+    CHECK(!off.updateAndCheckActive(0.0, 1000.0, 0.0, 200.0, 0.707, 1.0));   // amount 0 -> not active
+    float x[4] = { 1, 2, 3, 4 };                // 4 samples, unaligned stack buffer: the pass-through must not read past it
     off.processBlockInPlace(x, 4, 1.0);
-    CHECK(x[0] == 1 && x[3] == 4);
+    CHECK(x[0] == 1 && x[3] == 4);              // first and last unchanged
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_background_plan =====================
+// WHAT:  FFTWEngine::prepare() returns immediately with a usable plan even when the requested policy
+//        wants a measurement (Auto, Patient), and the measurement happens on a background thread
+//        that pollBackgroundPlan() picks up later - while executeRFFT() keeps working the whole time.
+//        It also pins that a measured plan reaches the on-disk wisdom file, so a fresh engine (and
+//        Auto) then gets the same size instantly.
+// WHY:   the 250 ms bound is the point of the whole scheme: a synchronous FFTW_MEASURE at these
+//        sizes stalls the TouchDesigner frame, so "prepare() never blocks the caller" is the
+//        contract being tested, not "prepare() is fast".
+// HOW TO CHANGE: this test writes a private wisdom file (fft_tests_wisdom.txt) precisely so it
+//        neither reads nor modifies the user's cache. The file is shared with the later planner
+//        tests and with test_v23_helpers - they assume the wisdom written here is already on disk,
+//        so do not turn the wisdom override or the remove() at the top into something per-test.
 static void test_background_plan()
 {
     section("FFTWEngine Auto planner (instant + background measure)");
@@ -301,16 +514,18 @@ static void test_background_plan()
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  prepare(65536, Auto) returned in %.1f ms: %s\n", ms, e.getPlanStatus().c_str());
     CHECK(ms < 250.0);                                       // never a MEASURE-length stall on the calling thread
+    // 65536 + 1 zero samples with a single impulse; the impulse makes every bin's magnitude exactly
+    // 1, so the magnitude checks below do not depend on the window or on any scaling choice.
     AlignedVector frame(65536, 0.0f), mag; AlignedComplexVector scratch;
     frame[100] = 1.0f;
     e.executeRFFT(frame, mag, scratch);                      // executes while the background thread may be measuring
-    CHECK(mag.size() == 32769);
+    CHECK(mag.size() == 32769);                              // N/2 + 1 for a real-to-complex transform of 65536
     for (int i = 0; i < 400 && !e.pollBackgroundPlan(); ++i) {   // wait for the upgrade (or wisdom-only instant plan)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));   // 400 x 10 ms = a 4 s ceiling, then the check fails
         e.executeRFFT(frame, mag, scratch);
     }
     std::printf("  final: %s\n", e.getPlanStatus().c_str());
-    CHECK(e.getPlanStatus().find("FFTW_MEASURE") != std::string::npos);
+    CHECK(e.getPlanStatus().find("FFTW_MEASURE") != std::string::npos);   // the upgrade really was a measurement
     e.executeRFFT(frame, mag, scratch);
     CHECK_NEAR(mag[0], 1.0, 1e-4);                           // impulse -> flat magnitude 1
 
@@ -323,7 +538,7 @@ static void test_background_plan()
     CHECK(ms < 250.0);
     AlignedVector pframe(2048, 0.0f), pmag; AlignedComplexVector pscratch;
     pframe[7] = 1.0f;
-    for (int i = 0; i < 1500 && !pe.pollBackgroundPlan(); ++i) {
+    for (int i = 0; i < 1500 && !pe.pollBackgroundPlan(); ++i) {   // 1500 x 10 ms = 15 s: patient planning is slower
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         pe.executeRFFT(pframe, pmag, pscratch);             // executing while the patient planner runs is fine
     }
@@ -340,6 +555,7 @@ static void test_background_plan()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_backend_selection =====================
 // The FFT Backend toggle. Runs identically whether or not oneMKL is installed on this machine,
 // because both are legitimate outcomes and the test asserts the contract rather than the install:
 //   1. asking for oneMKL either loads it, or falls back to FFTW3 *with a working plan* - never a
@@ -348,6 +564,18 @@ static void test_background_plan()
 //      transform (a backend switch is a performance choice, not a numerical one);
 //   3. switching back and forth re-plans cleanly and leaves no plan behind for the wrong library
 //      (a plan freed by the other library's destroy_plan is heap corruption, see FftBackend.h).
+//
+// WHAT:  For every backend the registry offers: it produces a plan, the engine reports a backend,
+//        and its magnitude spectrum matches FFTW3's bin for bin. Then the same engine is switched
+//        between all of them three times over and re-checked each time. When oneMKL happens to be
+//        resident, it also checks that the Intel OpenMP layer was NOT pulled in with it.
+// WHY:   the third point above is the real subject: a plan belongs to the library that created it,
+//        and the toggle path hands the engine a plan from the *previous* library on every switch.
+//        Checked by value because the damage would otherwise be silent heap corruption, not a crash.
+// HOW TO CHANGE: the spectrum comparison is against a reference produced by the FFTW3 entry in the
+//        registry, so it assumes backend 0 is FFTW3; and the menu-value mapping (the kFftw3 = 0
+//        below) is a TouchDesigner-side contract asserted in Parameters.cpp, not here - changing one
+//        without the other is how the menu and the registry drift apart.
 static void test_backend_selection()
 {
     section("FFT backend selection (FFTW3 / oneMKL toggle)");
@@ -358,7 +586,7 @@ static void test_backend_selection()
     CHECK(backendCount() >= 2);
     const int kFftw3 = 0;   // Parameters::Backend::Fftw3 — see the static_assert in Parameters.cpp
 
-    const size_t N = 4096;
+    const size_t N = 4096;                            // a small power of two: fast to plan, 2049 output bins
     AlignedVector frame(N, 0.0f);
     frame[9] = 1.0f;                                  // impulse: |X[k]| == 1 for every k
     AlignedVector reference;
@@ -368,7 +596,7 @@ static void test_backend_selection()
         CHECK(e.hasPlan());
         AlignedComplexVector scratch;
         e.executeRFFT(frame, reference, scratch);
-        CHECK_NEAR(reference[5], 1.0, 1e-3);
+        CHECK_NEAR(reference[5], 1.0, 1e-3);          // bin 5 is as good as any: an impulse is flat
     }
 
     for (int i = 0; i < backendCount(); ++i) {
@@ -389,7 +617,7 @@ static void test_backend_selection()
         for (size_t k = 0; k < reference.size(); ++k)
             worst = std::max(worst, static_cast<double>(std::abs(mag[k] - reference[k])));
         std::printf("     max |mag - FFTW3 mag| over %zu bins: %.2e\n", reference.size(), worst);
-        CHECK(worst < 1e-3);
+        CHECK(worst < 1e-3);                          // magnitudes are 1.0, so this is ~0.1% relative
     }
 
     // Toggling on one engine, repeatedly: the plan in hand belongs to the previous library every
@@ -397,7 +625,7 @@ static void test_backend_selection()
     // library. Checked by value, since the damage would be silent otherwise.
     {
         FFTWEngine e;
-        for (int round = 0; round < 3; ++round) {
+        for (int round = 0; round < 3; ++round) {     // 3 rounds x backendCount() switches below
             for (int i = 0; i < backendCount(); ++i) {
                 e.prepare(N, PlannerPolicy::Fast, &log, &backendById(i));
                 CHECK(e.hasPlan());
@@ -431,6 +659,7 @@ static void test_backend_selection()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_async_single_thread =====================
 // Async off must mean one thread for the whole node. The window -> FFT -> warp -> dB chain is
 // already single-threaded there (the pipeline owner is the cook thread), and the channel fan-out
 // only fires with more than one channel, so the one piece of work that could still escape to another
@@ -440,6 +669,19 @@ static void test_backend_selection()
 //   * on  -> the deferred measurement starts, because prepare()'s early-out sees an unchanged size,
 //            policy and backend and will never re-plan on its own. Without the re-arm the node would
 //            sit on ESTIMATE for the rest of the session.
+//
+// WHAT:  Both halves of that contract, in one engine: with the background disabled nothing is
+//        started and the status says "deferred"; with it enabled again - on the same engine, with
+//        no re-prepare - the deferred upgrade starts and completes, while the engine keeps
+//        executing a valid transform throughout.
+// WHY:   the status wording is checked because it is what the Info DAT shows; a node that said
+//        "measuring in background" while Async was off would be promising an upgrade that is never
+//        coming. The 12288 size and the from_wisdom escape hatch below exist so that the deferral
+//        path is actually reachable rather than assumed.
+// HOW TO CHANGE: this early-returns on a machine whose wisdom already covers N, and the checks
+//        above that point have already run - so the number this test contributes depends on the
+//        machine's wisdom state. Do not "fix" that by hoisting the checks out of the branch; the
+//        branch is what keeps the test honest about a run it cannot reach.
 static void test_async_single_thread()
 {
     section("Async toggle: deferred background upgrade (single-threaded node)");
@@ -495,15 +737,30 @@ static void test_async_single_thread()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_v23_helpers =====================
+// WHAT:  A group of independent v2.3 helper contracts, in the order they appear:
+//        - blockIsSilent(): true for 0.0 / -0.0 only, false as soon as one sample is nonzero, and
+//          it must stop at the count it is given rather than scanning the whole buffer;
+//        - addInto() + scaleInPlace(): the mono-mix helpers compute (a + b) * g exactly;
+//        - the cubic (Catmull-Rom) warp setting against a scalar reference, and that identity still
+//          bypasses it;
+//        - maxLinearIndex() shrinking when Display Max is below Nyquist;
+//        - the partial-magnitude argument of executeRFFT();
+//        - PlanLog's deferred mode (nothing reaches the textport until flush, and flush is
+//          idempotent).
+// WHY:   not recorded in this file, except for the cubic reference, which exists because that path
+//        is SIMD-gathered and had no independent check.
+// HOW TO CHANGE: the 1e-30 sample below is the interesting one - it is denormal-adjacent and exists
+//        to prove blockIsSilent() is testing bits and not comparing against 0.0 with a tolerance.
 static void test_v23_helpers()
 {
     section("v2.3 helpers: silence, mix, cubic warp, partial magnitude, deferred log");
     // silence detection
-    AlignedVector z(735, 0.0f);
+    AlignedVector z(735, 0.0f);                          // 735 = one 60 fps frame of audio
     CHECK(blockIsSilent(z.data(), z.size()));
-    z[3] = -0.0f; CHECK(blockIsSilent(z.data(), z.size()));
-    z[700] = 1e-30f; CHECK(!blockIsSilent(z.data(), z.size()));
-    CHECK(blockIsSilent(z.data(), 5));
+    z[3] = -0.0f; CHECK(blockIsSilent(z.data(), z.size()));   // negative zero is silence too
+    z[700] = 1e-30f; CHECK(!blockIsSilent(z.data(), z.size()));  // a denormal is NOT silence
+    CHECK(blockIsSilent(z.data(), 5));                   // and the count argument is honoured (index 3 only)
 
     // mono mix helpers
     std::vector<float> a(100), b(100), m(100);
@@ -511,70 +768,90 @@ static void test_v23_helpers()
     addInto(a.data(), b.data(), m.data(), 100);
     scaleInPlace(m.data(), 100, 0.5f);
     bool ok = true;
-    for (int i = 0; i < 100; ++i) ok = ok && std::abs(m[i] - (-0.5f * i)) < 1e-6f;
+    for (int i = 0; i < 100; ++i) ok = ok && std::abs(m[i] - (-0.5f * i)) < 1e-6f;   // (i + -2i) * 0.5
     CHECK(ok);
 
     // cubic warp vs scalar Catmull-Rom reference, and identity still bypasses
-    const size_t nlin = 513;
+    const size_t nlin = 513;                             // a 1024-point R2C transform
     AlignedVector src(nlin), out;
+    // Strictly positive and smooth: the reference clamps its result at 0, so a signal that stayed
+    // near zero would make the two agree for the wrong reason.
     for (size_t i = 0; i < nlin; ++i) src[i] = static_cast<float>(1.0 + std::sin(i * 0.07) * 0.5);
     PerceptualWarping w;
-    w.setInterpolation(1);
-    w.buildWarpTables(0, 22050.0, 1000, 22050.0, 0.963, 20.0, nlin);
+    w.setInterpolation(1);                               // 1 = Catmull-Rom cubic (4 taps), the path under test
+    w.buildWarpTables(0, 22050.0, 1000, 22050.0, 0.963, 20.0, nlin);   // Log, 1000 out bins, the default blend
     w.applyWarp(src, out);
     const auto& hz = w.targetHz();
     double max_err = 0.0;
     int last = static_cast<int>(nlin) - 1;
     for (size_t i = 0; i < 1000; ++i) {
         double frac = hz[i] / 22050.0 * (nlin - 1);
+        // The table build snaps near-integer positions to the integer before storing them (so an
+        // exact 1:1 grid is detected as identity); the reference has to do the same or it compares
+        // against a position the kernel never saw.
         double r = std::round(frac); if (std::abs(frac - r) < 1e-6) frac = r;
         int i0 = static_cast<int>(std::min<double>(nlin - 2, std::floor(frac)));
         float t = static_cast<float>(frac - i0);
+        // The kernels clamp the two outer taps to the ends of the array; the reference clamps the
+        // same way (max(i0-1, 0) / min(i0+2, last)).
         float p0 = src[std::max(i0 - 1, 0)], p1 = src[i0], p2 = src[std::min(i0 + 1, last)], p3 = src[std::min(i0 + 2, last)];
         float v = 0.5f * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
         max_err = std::max(max_err, static_cast<double>(std::abs(std::max(0.0f, v) - out[i])));
     }
     std::printf("  cubic warp max error vs scalar reference: %.2e\n", max_err);
-    CHECK(max_err < 1e-4);
+    CHECK(max_err < 1e-4);                               // float rounding in the gather: the curve is smooth
+    // The cubic path reads one tap either side of the linear one, so the highest bin it touches is
+    // within a couple of the array end. This is the value the partial-magnitude optimisation trusts.
     CHECK(w.maxLinearIndex() <= nlin - 1 && w.maxLinearIndex() >= nlin - 3);
     w.setInterpolation(1);
-    w.buildWarpTables(5, 22050.0, nlin, 22050.0, 1.0, 20.0, nlin);
+    w.buildWarpTables(5, 22050.0, nlin, 22050.0, 1.0, 20.0, nlin);     // Linear, out bins == in bins
     CHECK(w.isIdentity());
     w.applyWarp(src, out);
-    CHECK(out[100] == src[100]);
+    CHECK(out[100] == src[100]);                         // identity means memcpy: bit equality, one spot check
     // Display Max below Nyquist -> fewer magnitude bins needed
-    w.buildWarpTables(0, 11025.0, 1000, 22050.0, 0.963, 20.0, nlin);
+    w.buildWarpTables(0, 11025.0, 1000, 22050.0, 0.963, 20.0, nlin);   // fmax is half Nyquist here
     std::printf("  maxLinearIndex at half Nyquist: %zu of %zu\n", w.maxLinearIndex(), nlin);
-    CHECK(w.maxLinearIndex() < nlin / 2 + 4);
+    CHECK(w.maxLinearIndex() < nlin / 2 + 4);            // +4: the cubic taps either side, plus slack
 
     // partial magnitude: only the first n_mag bins are written
     PlanLog log;
     FFTWEngine e;
     e.prepare(1024, PlannerPolicy::Fast, &log);
-    AlignedVector frame(1024, 0.0f), mag(513, -1.0f); AlignedComplexVector scratch;
-    frame[0] = 1.0f;
+    AlignedVector frame(1024, 0.0f), mag(513, -1.0f); AlignedComplexVector scratch;   // -1.0 marks "untouched"
+    frame[0] = 1.0f;                                     // impulse at sample 0 -> flat magnitude 1
     e.executeRFFT(frame, mag, scratch, 100);
     CHECK_NEAR(mag[0], 1.0, 1e-5);
-    CHECK_NEAR(mag[99], 1.0, 1e-5);
+    CHECK_NEAR(mag[99], 1.0, 1e-5);                      // the last bin actually requested
     CHECK(mag[512] == -1.0f);                 // untouched beyond the requested (16-rounded) count
     e.executeRFFT(frame, mag, scratch, 0);
-    CHECK_NEAR(mag[512], 1.0, 1e-5);
+    CHECK_NEAR(mag[512], 1.0, 1e-5);                     // 0 = "all of them", so the marker is overwritten
 
     // deferred log: nothing hits the textport until flushed, history is kept
     PlanLog dl;
     dl.setDeferred(true);
     dl.log("a"); dl.log("b");
     CHECK(dl.size() == 2);
-    CHECK(dl.flushToTextport() == 2);
-    CHECK(dl.flushToTextport() == 0);
+    CHECK(dl.flushToTextport() == 2);                    // returns how many lines it wrote
+    CHECK(dl.flushToTextport() == 0);                    // and there is nothing left to write
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_plan_log_tail =====================
 // PlanLog::snapshotTail() / version() - the two accessors the info callbacks use to avoid
 // re-copying the whole history per cook. The property that matters is not "it is fast" but "it
 // returns exactly what snapshot() would have returned, minus the entries nobody reads": the popup
 // renders those lines, so a tail that disagreed with the full snapshot would silently change what
 // the middle-click shows.
+//
+// WHAT:  version() moves when and only when the history content changes (not when accessors are
+//        called), and snapshotTail(n) is exactly the last n entries of snapshot() for every n,
+//        including n larger than the history and a history that has just been truncated.
+// WHY:   the equivalence is what protects the popup; the truncation case below is the one moment a
+//        tail and a full snapshot could plausibly disagree, because log() drops the older half once
+//        the history hits kMaxPlanLogEntries.
+// HOW TO CHANGE: this test reads the cap from FFTDSP::kMaxPlanLogEntries rather than hard-coding it,
+//        so changing the cap changes how long this test runs but not what it asserts. Keep it that
+//        way - a literal here would silently stop exercising the truncation path.
 // ------------------------------------------------------------------------------------------
 static void test_plan_log_tail()
 {
@@ -584,7 +861,7 @@ static void test_plan_log_tail()
     std::vector<std::string> full, tail;
 
     // Empty history: both accessors agree, and asking for more than exists is not an error.
-    CHECK(log.version() == 0);
+    CHECK(log.version() == 0);                  // a fresh log is version 0, the value the cache starts from
     log.snapshotTail(3, tail);
     CHECK(tail.empty());
     log.snapshotTail(0, tail);
@@ -614,7 +891,7 @@ static void test_plan_log_tail()
     CHECK(tail[2] == "four");
 
     // n >= size: the whole history
-    log.snapshotTail(99, tail);
+    log.snapshotTail(99, tail);                 // 99 is just "more than the 4 entries there are"
     CHECK(tail.size() == 4);
     CHECK(tail.front() == "one");
     CHECK(tail.back() == "four");
@@ -622,7 +899,7 @@ static void test_plan_log_tail()
     // The equivalence that protects the popup: for every n, the tail is exactly the last n entries of
     // the full snapshot.
     full = log.snapshot();
-    for (size_t n = 0; n <= full.size() + 2; ++n) {
+    for (size_t n = 0; n <= full.size() + 2; ++n) {   // +2: two values of n past the end, where n >= size
         log.snapshotTail(n, tail);
         const size_t expect = n < full.size() ? n : full.size();
         CHECK(tail.size() == expect);
@@ -634,8 +911,8 @@ static void test_plan_log_tail()
     // reaches kMaxPlanLogEntries, so the tail is read off a history that just lost its older half - the
     // one moment where a tail and a full snapshot could plausibly disagree.
     PlanLog big;
-    const size_t cap = FFTDSP::kMaxPlanLogEntries;
-    for (size_t i = 0; i < cap + 40; ++i)
+    const size_t cap = FFTDSP::kMaxPlanLogEntries;   // read from the implementation, not hard-coded
+    for (size_t i = 0; i < cap + 40; ++i)            // +40: enough entries past the cap to force one truncation
         big.log("entry_" + std::to_string(i), false);
     CHECK(big.size() <= cap);
     std::vector<std::string> bigFull, bigTail;
@@ -657,6 +934,7 @@ static void test_plan_log_tail()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_clip_line =====================
 // clipLine: the popup's per-line bound.
 //
 // The middle-click popup is the one surface whose rendering has been observed to depend on the
@@ -667,13 +945,21 @@ static void test_plan_log_tail()
 // not only that a long line is shortened but that a short one is handed through *byte for byte*:
 // the clipped text is what a user reads, and silently altering a line that already fits would be a
 // worse bug than a long popup.
+//
+// WHAT:  clipLine(s, maxChars) returns s untouched when it fits, and otherwise maxChars characters
+//        followed by a 3-character marker. Boundaries are pinned exactly (fits, one short, exactly
+//        at the bound, one over, and maxChars == 0).
+// WHY:   see above. The 3-character marker is the reason the clipped length is maxChars + 3 and not
+//        maxChars, and the reason the "three lines" total at the bottom is 3 * 76 rather than 3 * 72.
+// HOW TO CHANGE: 72 is the bound the plugin actually calls this with, so the checks below are only
+//        meaningful at that value - the function itself is generic, but this test is not.
 // ------------------------------------------------------------------------------------------
 static void test_clip_line()
 {
     section("clipLine (popup tail bound)");
 
     // Fits exactly: unchanged, and no marker added.
-    const std::string exact(72, 'x');
+    const std::string exact(72, 'x');           // exactly the bound: the <= branch, not the substr branch
     CHECK(FFTDSP::clipLine(exact, 72) == exact);
     CHECK(FFTDSP::clipLine(exact, 72).size() == 72);
 
@@ -682,9 +968,9 @@ static void test_clip_line()
     CHECK(FFTDSP::clipLine("", 72).empty());
 
     // One over the bound: trimmed to exactly the bound, then marked.
-    const std::string over(73, 'y');
+    const std::string over(73, 'y');            // one character over: the first input that is clipped
     const std::string cut = FFTDSP::clipLine(over, 72);
-    CHECK(cut.size() == 72 + 3);
+    CHECK(cut.size() == 72 + 3);                // see the WHAT block: "..." is appended, not substituted
     CHECK(cut.compare(0, 72, std::string(72, 'y')) == 0);
     CHECK(cut.substr(72) == "...");
 
@@ -694,35 +980,51 @@ static void test_clip_line()
         "fftw-3.3.11-sse2-avx-avx2-avx2_128 [C:\\Users\\Z\\Downloads\\PROJECTS\\TD_PROJECTS\\"
         "PluginBuilder\\Plugin_FFT\\__Plugins__\\FFT\\libfftw3f-3.3.11-avx2.dll, wisdom on] - plan "
         "kernels: AVX2 (256-bit vectors, FMA-capable codelets)";
-    CHECK(plan.size() > 200);
+    CHECK(plan.size() > 200);                   // guards that the literal above is still the long one
     const std::string clipped = FFTDSP::clipLine(plan, 72);
-    CHECK(clipped.size() == 75);
+    CHECK(clipped.size() == 75);                // 72 + the 3-character marker
     CHECK(clipped.compare(0, 72, plan.substr(0, 72)) == 0);
-    CHECK(clipped.compare(0, 12, "fftw-3.3.11-") == 0);
+    CHECK(clipped.compare(0, 12, "fftw-3.3.11-") == 0);   // 12 = the length of the version prefix that identifies it
     // The path is no longer in the popup's view of the line - which is the point: the same path is on
     // the Binary: line, and it is what made this line's length unbounded.
     CHECK(clipped.find("__Plugins__") == std::string::npos);
 
     // maxChars == 0 is degenerate but must not read past the string or return the whole thing.
-    CHECK(FFTDSP::clipLine("abc", 0) == "...");
+    CHECK(FFTDSP::clipLine("abc", 0) == "...");   // 0 characters kept, marker still added
 
     // Three real lines at the real bound: the popup's tail contribution is now a constant, which is
     // what makes the character count in the info_callback_calls row comparable between cooks.
     size_t total = 0;
-    for (int i = 0; i < 3; ++i) total += FFTDSP::clipLine(plan, 72).size() + 1;
-    CHECK(total == 3 * 76);
+    for (int i = 0; i < 3; ++i) total += FFTDSP::clipLine(plan, 72).size() + 1;   // +1 for the newline
+    CHECK(total == 3 * 76);                     // (72 + 3) + 1, times 3
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_triple_buffer_and_signal =====================
+// WHAT:  Two concurrency primitives, in three parts. Single-threaded TripleBuffer: the roles rotate
+//        so a writer never touches what the reader is holding, the reader always gets the LATEST
+//        published payload, and publish() reports whether it overwrote something unread. Two-thread
+//        TripleBuffer: under a 200 ms producer/consumer hammering, no acquire ever sees a torn or
+//        out-of-order payload. WorkerSignal: a signal issued before wait() is not lost, wait()
+//        consumes it, a cross-thread signal wakes a blocked waiter, and waitFor() honours its
+//        timeout with a high-resolution timer instead of the system clock tick.
+// WHY:   the two-thread half is the one that matters: a torn payload is exactly the bug a lock-free
+//        handoff can have and the one thing that would be invisible in a single-threaded test. The
+//        non_monotonic counter guards the other half of "latest wins" - that a payload cannot go
+//        backwards in time.
+// HOW TO CHANGE: the 256-float payload is sized so that a torn read is easy to produce but the
+//        whole payload still fits in cache (the test has to lose the race often enough to be
+//        meaningful). The timings below are deliberately generous - this is a smoke test with real
+//        threads on a real scheduler, not a benchmark - so do not tighten them into flakes.
 static void test_triple_buffer_and_signal()
 {
     section("TripleBuffer / WorkerSignal (v2.4 lock-free handoff)");
-    struct Payload { uint64_t a{ 0 }, b{ 0 }; std::vector<float> data; };
+    struct Payload { uint64_t a{ 0 }, b{ 0 }; std::vector<float> data; };   // a and b must always be equal; data follows a
 
     // single thread: roles rotate, latest wins, dropped flag
     TripleBuffer<Payload> tb;
     CHECK(!tb.acquire());                       // nothing published yet
-    CHECK(tb.front().a == 0);
+    CHECK(tb.front().a == 0);                   // front is still readable before the first acquire
     tb.back().a = 1; tb.back().b = 1;
     CHECK(!tb.publish());                       // nothing was pending -> not dropped
     tb.back().a = 2; tb.back().b = 2;
@@ -734,11 +1036,13 @@ static void test_triple_buffer_and_signal()
     // the three slots are always distinct roles: writing back never touches front
     Payload* f = &tb.front();
     for (int i = 0; i < 10; ++i) { tb.back().a = 100 + i; CHECK(&tb.back() != f); tb.publish(); }
-    CHECK(f->a == 2);
-    CHECK(tb.acquire() && tb.front().a == 109);
+    CHECK(f->a == 2);                           // the pointer taken above still holds the old payload
+    CHECK(tb.acquire() && tb.front().a == 109);   // 100 + 9: the last value written in the loop
 
     // two threads: the consumer must never observe a torn payload (a != b or data[k] != a)
     TripleBuffer<Payload> tb2;
+    // Every slot is filled up front: the producer below writes only the first kSlots of the vector,
+    // so a slot that started empty would make the length check trivially true.
     for (size_t i = 0; i < TripleBuffer<Payload>::kSlots; ++i) tb2.slot(i).data.assign(256, 0.0f);
     std::atomic<bool> stop{ false };
     std::atomic<uint64_t> produced{ 0 };
@@ -746,14 +1050,14 @@ static void test_triple_buffer_and_signal()
         for (uint64_t n = 1; !stop.load(); ++n) {
             Payload& p = tb2.back();
             p.a = n;
-            for (auto& v : p.data) v = static_cast<float>(n & 0xFFFF);
+            for (auto& v : p.data) v = static_cast<float>(n & 0xFFFF);   // 0xFFFF: exact in a float, so the compare below is bit-exact
             p.b = n;
             tb2.publish();
             produced.store(n);
         }
     });
     uint64_t last = 0, acquired = 0, torn = 0, non_monotonic = 0;
-    auto t_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    auto t_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);   // a fixed budget: the counts, not the duration, are what is checked
     while (std::chrono::steady_clock::now() < t_end) {
         if (tb2.acquire()) {
             const Payload& p = tb2.front();
@@ -769,7 +1073,7 @@ static void test_triple_buffer_and_signal()
     std::printf("  produced %llu, consumer acquired %llu, torn %llu, non-monotonic %llu\n",
                 static_cast<unsigned long long>(produced.load()), static_cast<unsigned long long>(acquired),
                 static_cast<unsigned long long>(torn), static_cast<unsigned long long>(non_monotonic));
-    CHECK(acquired > 0);
+    CHECK(acquired > 0);                        // the loop actually ran: guards the two checks below from being vacuous
     CHECK(torn == 0);
     CHECK(non_monotonic == 0);
     CHECK(tb2.acquire() || true);                   // drain
@@ -780,10 +1084,10 @@ static void test_triple_buffer_and_signal()
     sig.signal();
     auto t0 = std::chrono::steady_clock::now();
     sig.wait();
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));   // 50 ms: a real wait would be far longer than this
     std::atomic<int> woke{ 0 };
     std::thread waiter([&] { sig.wait(); woke.store(1); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));   // 20 ms: long enough for the thread to reach wait()
     CHECK(woke.load() == 0);                        // still blocked: the earlier signal was consumed
     sig.signal();
     waiter.join();
@@ -791,78 +1095,118 @@ static void test_triple_buffer_and_signal()
     // waitFor: times out close to the requested 2 ms even when the system clock ticks at 15.6 ms
     // (high-resolution waitable timer), and returns true immediately when a signal is pending
     double worst_ms = 0.0;
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 20; ++i) {                  // 20 calls: enough chances to catch a bad tick phase
         auto s = std::chrono::steady_clock::now();
-        CHECK(!sig.waitFor(2));
+        CHECK(!sig.waitFor(2));                     // 2 ms request; nothing signals it, so every call must time out
         worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count());
     }
     std::printf("  waitFor(2 ms): worst %.2f ms over 20 calls (high-res timer: %s)\n", worst_ms, sig.highResolutionTimer() ? "yes" : "no");
-    CHECK(worst_ms >= 1.0);
+    CHECK(worst_ms >= 1.0);                         // it did wait, and did not return early
+    // 6.0 ms: the 15.6 ms system tick would be the floor WITHOUT a high-res timer, so this is the
+    // only check here that can tell a working timer from a coarse clock - hence the guard.
     if (sig.highResolutionTimer()) CHECK(worst_ms < 6.0);
     sig.signal();
-    CHECK(sig.waitFor(1000));
+    CHECK(sig.waitFor(1000));                       // a pending signal returns true instead of timing out
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_pipeline_sine =====================
+// WHAT:  The whole window -> pad -> FFT -> warp chain on a known 1 kHz sine at 44.1 kHz, once per
+//        magnitude normalization: the spectrum has the right length, the peak lands on 1 kHz, its
+//        height is the value the two normalizations predict, and the warped log grid puts the peak
+//        back at 1 kHz as well.
+// WHY:   this is the closest this suite gets to an end-to-end check: it is the test that would catch
+//        a window, a pad offset or an FFT factor being wrong by something other than a rounding
+//        error. The two peak-height checks are the two documented normalizations' definitions.
+// HOW TO CHANGE: win and N are the pair the plugin uses at its defaults (3175 = 72 ms at 44.1 kHz;
+//        32768 = the default pad). If you change one, check the two expected magnitudes below -
+//        0.5 and 0.5 * win / 2 both depend on win, and the second is the legacy scale's whole point.
 static void test_pipeline_sine()
 {
     section("FFTWEngine pipeline (1 kHz sine @ 44.1 kHz)");
-    const double sr = 44100.0, f0 = 1000.0;
-    const size_t win = 3175, N = 32768;
+    const double sr = 44100.0, f0 = 1000.0;         // a plain tone, one bin's worth of ambiguity at most
+    const size_t win = 3175, N = 32768;             // the default window length and the default FFT size
     PlanLog log;
     FFTWEngine engine;
-    engine.prepare(N, PlannerPolicy::Fast, &log);
+    engine.prepare(N, PlannerPolicy::Fast, &log);   // Fast: this test measures the numbers, not the planner
     CHECK(engine.fftSize() == N);
 
-    for (int norm = 0; norm < 2; ++norm) {
+    for (int norm = 0; norm < 2; ++norm) {          // 0 = CoherentGain (legacy), 1 = FullScale
         AlignedVector window;
         WindowGenerator::generateWindow(1 /*Hann*/, 15.0, win, window, norm ? WindowNorm::FullScale : WindowNorm::CoherentGain);
         AlignedVector frame(N, 0.0f), sig(win);
-        for (size_t i = 0; i < win; ++i) sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * f0 * i / sr));
+        for (size_t i = 0; i < win; ++i) sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * f0 * i / sr));   // amplitude 0.5, in a double before the cast
+        // Zero-pad symmetrically around a 32768-point frame; the & ~7 rounds the start down to a
+        // multiple of 8 so the window multiply below stays on the vector path.
         size_t pad_start = ((N - win) / 2) & ~static_cast<size_t>(7);
         multiplyInto(sig.data(), window.data(), frame.data() + pad_start, win);
 
         AlignedVector mag; AlignedComplexVector scratch;
         engine.executeRFFT(frame, mag, scratch);
-        CHECK(mag.size() == N / 2 + 1);
+        CHECK(mag.size() == N / 2 + 1);             // 16385 for a real-to-complex transform of 32768
         size_t idx = 0;
         float pk = findPeakWithIndex(mag.data(), mag.size(), idx);
-        double peak_hz = idx * sr / N;
+        double peak_hz = idx * sr / N;              // bin index -> Hz on the unwarped grid
         std::printf("  norm=%s peak %.1f Hz, magnitude %.4f\n", norm ? "FullScale" : "CoherentGain", peak_hz, pk);
+        // Two bins plus 1 Hz: the bin spacing here is sr/N = 1.35 Hz and the peak of a windowed sine
+        // can sit a bin or so away from the true tone without anything being wrong.
         CHECK_NEAR(peak_hz, f0, 2.0 * sr / N + 1.0);
+        // The two normalizations, stated as the amplitudes they are meant to read back:
+        // FullScale: a sine of amplitude A reads A, so 0.5. CoherentGain: the legacy scale, where a
+        // windowed full-scale sine peaks at N_win / 2. The tolerances scale with the value, so both
+        // are relative-ish (0.02 absolute vs 2% of the ~794 expected here).
         if (norm) CHECK_NEAR(pk, 0.5, 0.02);                    // amplitude 0.5 -> 0.5
         else      CHECK_NEAR(pk, 0.5 * win / 2.0, 0.02 * win);   // legacy: A * N_win / 2
 
         // warped log grid must place the peak at ~1 kHz too
         PerceptualWarping w;
+        // Log scale, full band (fmax == nyquist == 22050 = sr/2), 16384 output bins, the default
+        // 0.963 blend, 20 Hz log floor, gathering from the 16385 linear bins.
         w.buildWarpTables(0, 22050.0, 16384, sr / 2.0, 0.963, 20.0, N / 2 + 1);
         AlignedVector warped;
         w.applyWarp(mag, warped);
         float wpk = findPeakWithIndex(warped.data(), warped.size(), idx);
-        (void)wpk;
+        (void)wpk;                                  // the peak VALUE is not what is checked here, only where it landed
+        // 15 Hz is deliberately loose: this is the warped bin centre nearest the peak, not an
+        // interpolated peak position, so the bound describes the axis model rather than the tone.
         CHECK_NEAR(w.targetHz()[idx], f0, 15.0);
     }
-    CHECK(log.size() >= 1);
+    CHECK(log.size() >= 1);                         // prepare() said something worth reading in the Info DAT
 }
 
+// ------------------------------------------------------------------------------------------
+// ===================== test_pipeline_process =====================
+// WHAT:  AnalysisPipeline::process() driven the way the node drives it - a Parameters::Values
+//        snapshot plus an AnalysisJob - through three scenarios that share one pipeline instance:
+//        1. one channel, linear grid, so the output width, the peak and the whole Status block are
+//           checked against the parameter values that produced them;
+//        2. a second pass on the same instance with reset = false, to show the plan is reused;
+//        3. three channels, which takes the std::execution::par fan-out, and must give the same peak;
+//        4. a silent channel, which must short-circuit to an all-zero spectrum.
+// WHY:   not recorded in this file beyond the inline notes. The axis-rate check below is the one
+//        that carries a contract (2 * fmax), because that number is published to TouchDesigner and is
+//        NOT info->sampleRate - see the note next to the check.
+// HOW TO CHANGE: the three section banners in this function print in the middle of the body, and the
+//        first one sits after the first process() call rather than at the top - moving them changes
+//        the printed order, so leave them where they are unless you mean to change the output.
 static void test_pipeline_process()
 {
     const double sr = 44100.0, f0 = 1000.0;
-    const int win_samples = 3175;
-    const int N = 32768;
+    const int win_samples = 3175;                       // 72 ms at 44.1 kHz, the default window
+    const int N = 32768;                                // the default pad size
     const int bins = N / 2 + 1;                         // 16385 → identity warp
 
     Parameters::Values p;
     p.scale     = Parameters::Scale::Linear;
-    p.warp      = 0.0;
+    p.warp      = 0.0;                                  // blend 0 + Linear + bins == nlin: the linear grid
     p.bins      = bins;
     p.padSize   = N;
     p.winMode   = Parameters::WinMode::Samples;
     p.winSamples = win_samples;
     p.window    = Parameters::WindowType::Hann;
-    p.magNorm   = Parameters::MagNorm::CoherentGain;
-    p.loudness  = Parameters::Loudness::Off;
-    p.weighting = Parameters::Weighting::Off;
+    p.magNorm   = Parameters::MagNorm::CoherentGain;    // the legacy scale, so the peak check below is the legacy one
+    p.loudness  = Parameters::Loudness::Off;            // weighting dB, ballistics and EQ are all off: this
+    p.weighting = Parameters::Weighting::Off;           // test is about the pipeline's structure, not the chain
     p.ballEnable = false;
     p.eqEnable   = false;
 
@@ -871,31 +1215,33 @@ static void test_pipeline_process()
 
     AlignedVector sig(win_samples);
     for (int i = 0; i < win_samples; ++i)
-        sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * f0 * i / sr));
+        sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * f0 * i / sr));   // amplitude 0.5, as elsewhere
 
     AnalysisJob job;
     job.numChannels = 1;
     job.sampleRate  = sr;
     job.winSamples  = win_samples;
-    job.dtMs        = 1000.0 / 60.0;
+    job.dtMs        = 1000.0 / 60.0;                    // one 60 fps frame
     job.reset       = true;
     job.p           = p;
-    job.windows.push_back(sig);
+    job.windows.push_back(sig);                         // one channel: windows and silent are indexed by channel
     job.silent.push_back(0);
 
     AnalysisResult res;
     pipeline.process(job, res);
 
+    // (prints here rather than at the top of the function; see HOW TO CHANGE)
     section("AnalysisPipeline::process() — 1 kHz sine, single channel");
-    CHECK(res.spectra.size() == 1);
+    CHECK(res.spectra.size() == 1);                     // one spectrum per channel
     CHECK(res.spectra[0].size() == static_cast<size_t>(bins));
-    CHECK(res.peakMag > 0.0f);
+    CHECK(res.peakMag > 0.0f);                          // the channel is not silent, so the peak must be real
+    // Same tolerance as test_pipeline_sine: two bins (sr/N = 1.35 Hz) plus 1 Hz.
     CHECK_NEAR(res.peakHz, f0, 2.0 * sr / N + 1.0);
 
     AnalysisPipeline::Status st = pipeline.status();
-    CHECK(!st.plan.empty());
-    CHECK(st.fftSize == static_cast<size_t>(N));
-    CHECK(st.capacity == static_cast<size_t>(win_samples));
+    CHECK(!st.plan.empty());                            // a description of the live plan, for the Info DAT
+    CHECK(st.fftSize == static_cast<size_t>(N));        // padSize won: fftSizeFrom(p, 3175) == 32768
+    CHECK(st.capacity == static_cast<size_t>(win_samples));   // the FIFO is exactly one window long
     CHECK(st.outputBins == bins);
     CHECK_NEAR(st.axisRate, sr, 1.0);                  // 2 * fmax, fmax clamped to Nyquist = sr/2 → sr
     CHECK(st.linearGrid);                              // Linear + warp=0 + bins==nlin → identity
@@ -907,36 +1253,51 @@ static void test_pipeline_process()
 
     // Multi-channel: the parallel path (std::execution::par) must produce the same peak.
     section("AnalysisPipeline::process() — multi-channel parallel fan-out");
-    job.numChannels = 3;
+    job.numChannels = 3;                                // > 1 channel is what switches the fan-out on
     job.windows.assign(3, sig);
     job.silent.assign(3, 0);
     AnalysisResult res3;
     pipeline.process(job, res3);
     CHECK(res3.spectra.size() == 3);
     for (size_t c = 0; c < 3; ++c)
-        CHECK_NEAR(res3.peakHz, f0, 2.0 * sr / N + 1.0);
-    CHECK(pipeline.parallelActive());
+        CHECK_NEAR(res3.peakHz, f0, 2.0 * sr / N + 1.0);   // one peak for the whole result, so this is really
+                                                          // "the reported peak is still the tone" per iteration
+    CHECK(pipeline.parallelActive());                   // and the parallel path is what ran
 
     // Silence short-circuit: linear-magnitude path zeroes the output.
     section("AnalysisPipeline::process() — silence short-circuit");
     job.numChannels = 1;
-    job.silent[0] = 1;
+    job.silent[0] = 1;                                  // declared silent by the ingest side
     AlignedVector zeros(win_samples, 0.0f);
-    job.windows.assign(1, zeros);
+    job.windows.assign(1, zeros);                       // and actually all-zero, so the two agree
     job.reset = false;
     AnalysisResult res0;
     pipeline.process(job, res0);
     CHECK(res0.spectra.size() == 1);
     bool all_zero = true;
     for (float v : res0.spectra[0]) if (v != 0.0f) all_zero = false;
-    CHECK(all_zero);
+    CHECK(all_zero);                                    // skipped, not merely quiet
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_identity_grid_and_rate =====================
 // The linear-grid ("no resampling") case is not a mode of its own: Scale = Linear + Warp Blend = 0
 // + Display Max >= Nyquist + Output Bins = nlin makes the warp come out as the identity, and
 // applyWarp() then memcpy's the magnitude through untouched. These checks pin that equivalence and
 // the frequency-axis model that goes with it.
+//
+// WHAT:  Two things at once, because they are the same statement seen from two sides. (1) The
+//        identity grid: targetHz() is exactly i*sr/1024 for a 513-bin grid, the top bin sits on
+//        Nyquist, and applyWarp() copies bit for bit. (2) The axis model that goes with it:
+//        axisRate = 2 * (top of the axis), so the last bin sits on Nyquist - which is what makes
+//        axisRate equal the input rate ONLY while the band runs to Nyquist, and twice Display Max
+//        whenever it does not. Also pins the Bark round trip, which used to fold over past ~6.5 kHz.
+// WHY:   axisRate is published to TouchDesigner (as hz_per_sample / output_spectrum_axis) and is a
+//        different number from info->sampleRate, which is bins x me.time.rate. Getting that
+//        distinction wrong was a real bug - see the note in test_rate_model.
+// HOW TO CHANGE: 1024 is the FFT size the 513-bin grid belongs to; it appears as a literal here
+//        (sr / 1024.0) because the grid does not carry its own FFT size. If nlin changes, every
+//        1024 below has to change with it.
 static void test_identity_grid_and_rate()
 {
     section("linear grid (identity warp, no resampling) + spectrum frequency axis");
@@ -947,7 +1308,7 @@ static void test_identity_grid_and_rate()
     PerceptualWarping w;
 
     // --- linear grid: the output grid IS the linear FFT grid, copied verbatim ---
-    w.buildWarpTables(5 /*Linear*/, nyq, nlin, nyq, 0.0, 20.0, nlin);
+    w.buildWarpTables(5 /*Linear*/, nyq, nlin, nyq, 0.0, 20.0, nlin);   // blend 0.0 is the "no resampling" half
     CHECK(w.isIdentity());
     CHECK(w.outputBins() == nlin);
     // every bin must land exactly on its own linear index: bin i of an N-point R2C transform is i*sr/N
@@ -956,11 +1317,11 @@ static void test_identity_grid_and_rate()
         max_bin_err = std::max(max_bin_err, std::abs(w.targetHz()[i] - i * sr / 1024.0));
     }
     std::printf("  linear grid: max bin freq error %.2e Hz (bin spacing %.2f Hz)\n", max_bin_err, sr / 1024.0);
-    CHECK(max_bin_err < 1e-9);
+    CHECK(max_bin_err < 1e-9);                      // 1e-9: the grid is built in double, so this is exact
     CHECK_NEAR(w.targetHz()[nlin - 1], nyq, 1e-9);          // top bin sits on Nyquist
     w.applyWarp(src, out);
     bool identical = out.size() == nlin;
-    for (size_t i = 0; identical && i < nlin; ++i) identical = (out[i] == src[i]);
+    for (size_t i = 0; identical && i < nlin; ++i) identical = (out[i] == src[i]);   // bit equality: it is a memcpy
     CHECK(identical);
 
     // --- axis model: axisRate = 2 * (top of the axis), so the last bin sits on Nyquist ---
@@ -969,22 +1330,24 @@ static void test_identity_grid_and_rate()
     // what hz_per_sample / output_spectrum_axis report; info->sampleRate is bins x me.time.rate.
     const double raw_axis = 2.0 * w.targetHz()[w.outputBins() - 1];
     CHECK_NEAR(raw_axis, sr, 1e-9);
+    // nlin - 1 = 512, so raw_axis / (2*512) is 44100/1024: the same number from the other direction.
     CHECK_NEAR(raw_axis / (2.0 * static_cast<double>(nlin - 1)), sr / 1024.0, 1e-9);
     CHECK(raw_axis == 44100.0);                              // same band as the input signal
 
     // Linear grid held to Display Max below Nyquist: the axis stops at Display Max, so the axis
     // rate is twice that, whatever the bin count. This is where it stops equalling the input rate.
     {
-        const double fmax = 10000.0;
-        const size_t n_out = 1000;
+        const double fmax = 10000.0;                // a Display Max well below the 22050 Nyquist
+        const size_t n_out = 1000;                  // 1000 != 513, so this is the gather path
         w.buildWarpTables(5, fmax, n_out, nyq, 0.0, 20.0, nlin);
         CHECK(!w.isIdentity());                              // 1000 bins gathered from 513: not 1:1
-        CHECK_NEAR(w.targetHz()[0], 0.0, 1e-12);
+        CHECK_NEAR(w.targetHz()[0], 0.0, 1e-12);             // a Linear axis starts at DC
         CHECK_NEAR(w.targetHz()[n_out - 1], fmax, 1e-9);     // last bin sits exactly on Display Max
-        CHECK_NEAR(2.0 * w.targetHz()[n_out - 1], 20000.0, 1e-9);
+        CHECK_NEAR(2.0 * w.targetHz()[n_out - 1], 20000.0, 1e-9);   // 2 * 10000: the axis rate
         CHECK_NEAR(w.targetHz()[n_out - 1] / static_cast<double>(n_out - 1), 10000.0 / 999.0, 1e-9);
         // More bins over the same band: the count of bins describing the band changes, the band
         // does not, so the axis rate must not move with Output Bins.
+        // 4000 and 257 are arbitrary bin counts chosen only to be far from 1000 in both directions.
         w.buildWarpTables(5, fmax, 4000, nyq, 0.0, 20.0, nlin);
         CHECK_NEAR(2.0 * w.targetHz()[3999], 20000.0, 1e-9);
         w.buildWarpTables(5, fmax, 257, nyq, 0.0, 20.0, nlin);
@@ -992,29 +1355,32 @@ static void test_identity_grid_and_rate()
     }
     // A full-Nyquist band over 1000 bins: same 0..nyquist band as the input, so the axis rate is
     // the input rate for every scale, whatever Order the bins land in.
+    // 7 is every scale_code computeTargetHzGrid knows (0 Log .. 6 Mel+Log); see that switch.
     for (int scale = 0; scale < 7; ++scale) {
         w.buildWarpTables(scale, nyq, 1000, nyq, 0.0, 20.0, nlin);
-        CHECK_NEAR(2.0 * w.targetHz()[999], sr, 1e-9);
+        CHECK_NEAR(2.0 * w.targetHz()[999], sr, 1e-9);   // 999 = the last of the 1000 bins
     }
     // Every scale is monotonic and ends exactly on fmax, which is what makes axisRate = 2*fmax exact
     // at the top of the axis even where the bins in between are non-uniform.
     for (int scale = 0; scale < 7; ++scale) {
-        w.buildWarpTables(scale, 16000.0, 2000, nyq, 1.0, 20.0, nlin);
+        w.buildWarpTables(scale, 16000.0, 2000, nyq, 1.0, 20.0, nlin);   // blend 1.0: the pure Scale axis
         CHECK(std::is_sorted(w.targetHz().begin(), w.targetHz().end()));
-        CHECK_NEAR(w.targetHz()[1999], 16000.0, 1e-6);
-        CHECK_NEAR(2.0 * w.targetHz()[1999], 32000.0, 1e-6);
+        CHECK_NEAR(w.targetHz()[1999], 16000.0, 1e-6);   // 1999 = the last of the 2000 bins
+        CHECK_NEAR(2.0 * w.targetHz()[1999], 32000.0, 1e-6);   // 2 * fmax
     }
     // Bark used to fold over past ~6.5 kHz (barkToHz divided by 0.78 where the inverse of
     // hzToBark's 1.22*z-4.422 needs 1.22), which left the top bin back down at 0 Hz.
     {
+        // 6543 sits just past the ~6.5 kHz where the old formula started folding; the rest bracket
+        // the range - DC, the log floor, the 1 kHz anchor, both sides of the fold, and Nyquist.
         const double f[] = { 0.0, 20.0, 1000.0, 6543.0, 8000.0, 16000.0, 22050.0 };
         for (double f_hz : f) {
             CHECK_NEAR(PerceptualWarping::barkToHz(PerceptualWarping::hzToBark(f_hz)), f_hz, 1e-6);
         }
     }
     // A perceptual scale reads a narrowed band, so fewer magnitude bins are needed than the FFT has.
-    w.buildWarpTables(0, 1000.0, 2000, nyq, 1.0, 20.0, nlin);
-    CHECK(w.maxLinearIndex() < nlin / 20 + 4);
+    w.buildWarpTables(0, 1000.0, 2000, nyq, 1.0, 20.0, nlin);   // Log axis that stops at 1 kHz
+    CHECK(w.maxLinearIndex() < nlin / 20 + 4);          // 513/20 + 4: a 1 kHz band needs a small fraction of the bins
     CHECK(!w.isIdentity());
 
     // --- end to end: a sine at bin 100 of a 1024-point FFT reads back as bin 100's exact Hz ---
@@ -1022,33 +1388,47 @@ static void test_identity_grid_and_rate()
         PlanLog log;
         FFTWEngine e;
         e.prepare(1024, PlannerPolicy::Fast, &log);
-        const size_t bin = 100;
-        const double f0 = bin * sr / 1024.0;
+        const size_t bin = 100;                         // an arbitrary but non-trivial bin index
+        const double f0 = bin * sr / 1024.0;            // 100 * 44100/1024 = 4306.64 Hz
         AlignedVector frame(1024, 0.0f), mag, raw;
         AlignedComplexVector scratch;
+        // An integer number of cycles is not required: no window is applied, because the point here
+        // is the bin-to-Hz mapping, not spectral leakage.
         for (size_t i = 0; i < 1024; ++i) frame[i] = static_cast<float>(std::sin(2.0 * PI_D * f0 * i / sr));
         e.executeRFFT(frame, mag, scratch);                 // no window: the sine lands in one bin
         PerceptualWarping rw;
-        rw.buildWarpTables(5, nyq, mag.size(), nyq, 0.0, 20.0, mag.size());
+        rw.buildWarpTables(5, nyq, mag.size(), nyq, 0.0, 20.0, mag.size());   // Linear over the FFT's own 513 bins
         CHECK(rw.isIdentity());
         rw.applyWarp(mag, raw);
         size_t idx = 0;
         findPeakWithIndex(raw.data(), raw.size(), idx);
-        CHECK(idx == bin);
-        CHECK_NEAR(rw.targetHz()[idx], f0, 1e-9);
+        CHECK(idx == bin);                                  // the peak is where the sine was put
+        CHECK_NEAR(rw.targetHz()[idx], f0, 1e-9);           // 1e-9: the grid is exact, so this is not a tolerance
         // the raw grid's axis is 2*nyquist = the input rate, so bin i reads back at i*axisRate/N Hz
         const double axis_rate = 2.0 * rw.targetHz()[rw.outputBins() - 1];
         CHECK_NEAR(axis_rate, sr, 1e-9);
-        CHECK_NEAR(idx * axis_rate / 1024.0, f0, 1e-9);
+        CHECK_NEAR(idx * axis_rate / 1024.0, f0, 1e-9);     // 1024 = the transform size, as above
     }
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_rate_model =====================
+// WHAT:  RateModel.h - the pure functions behind every number the node reports about rate, size and
+//        spacing: outputBinCountFrom, sampleRateToTouchDesigner, axisRate, hzPerBin, throughput,
+//        fftSizeFrom and windowSamplesFrom - each on the inputs where its behaviour changes (at a
+//        clamp, at a fallback, at a degenerate size).
+// WHY:   recorded inline, and the important one is the reported-rate check: it must depend on the
+//        bin count and the cook rate and NOT on the input sample rate, which was the v2.5.0/2.6.0
+//        mistake. The two calls with different cook rates below are that bug, written down.
+// HOW TO CHANGE: these are TD-free restatements of contracts that also live on the node side. If a
+//        parameter default moves (bins, displayMax, winMs, padSize), the expectations here move with
+//        it - they are all stated in terms of the parameter, not as literal expected outputs.
 static void test_rate_model()
 {
     section("RateModel (TD-free sample-rate / axis model)");
-    Parameters::Values p;            // defaults: Scale=Log, Display Max=24000, Bins=16384, WinMode=Ms(50/72), pad=32768
-    const double sr = 48000.0;
+    Parameters::Values p;            // defaults: Scale=Log, Display Max=24000, Bins=16384, WinMode=Samples
+                                     // (3175 samples = 72 ms), pad=16384 (index 4 of kPadValues)
+    const double sr = 48000.0;       // deliberately not 44100, so a hard-coded rate would show up here
 
     // outputBinCountFrom is the single source of truth for the output width.
     CHECK(outputBinCountFrom(p) == p.bins);
@@ -1056,55 +1436,67 @@ static void test_rate_model()
     // Reported sample rate is bins * cook_rate — and crucially must NOT depend on the input sample
     // rate (that was the v2.5.0/2.6.0 mistake). Same params + rate, different input → same number.
     p.bins = 16384;
-    const double td_rate_low  = sampleRateToTouchDesigner(p, 60.0);
-    const double td_rate_high = sampleRateToTouchDesigner(p, 30.0);
-    CHECK(td_rate_low  == 16384.0 * 60.0);
+    const double td_rate_low  = sampleRateToTouchDesigner(p, 60.0);   // 60 fps cook
+    const double td_rate_high = sampleRateToTouchDesigner(p, 30.0);   // 30 fps cook
+    CHECK(td_rate_low  == 16384.0 * 60.0);                            // exact equality: it is a product, not a measurement
     CHECK(td_rate_high == 16384.0 * 30.0);
 
     // Axis rate: 2 * min(Display Max, Nyquist). Default Display Max=24000 >= Nyquist(48000/2=24000) → sr_in.
     CHECK_NEAR(axisRate(p, sr, 0.0), sr, 1e-6);
     // Display Max below Nyquist clamps the band to 2*Display Max (this node stops at Display Max).
     p.displayMax = 10000.0;
-    CHECK_NEAR(axisRate(p, sr, 0.0), 20000.0, 1e-6);
+    CHECK_NEAR(axisRate(p, sr, 0.0), 20000.0, 1e-6);                  // 2 * 10000, not 48000
     // A published axis rate from the live tables wins and is returned verbatim (never jumps).
-    CHECK_NEAR(axisRate(p, sr, 31415.0), 31415.0, 1e-9);
+    CHECK_NEAR(axisRate(p, sr, 31415.0), 31415.0, 1e-9);              // the literal is arbitrary: any value would do
     // Non-positive rate falls back through to the scalar sample rate.
     CHECK(axisRate(p, 0.0, 0.0) == 0.0);
 
     // Hz-per-bin on a uniform grid is fmax/(bins-1) == axis_rate/(2*(bins-1)).
     p.displayMax = 24000.0;
     p.bins = 1025;                       // e.g. fft_size 2048 → 1025 linear bins, identity grid
-    CHECK_NEAR(hzPerBin(p, sr, 0.0), (sr * 0.5) / (1025 - 1), 1e-6);
+    CHECK_NEAR(hzPerBin(p, sr, 0.0), (sr * 0.5) / (1025 - 1), 1e-6);  // 2*24000 bins over the band: 48000/(2*1024)
     // n_out < 2 → undefined spacing, report 0.
-    p.bins = 1;
+    p.bins = 1;                          // the smallest degenerate width
     CHECK(hzPerBin(p, sr, 0.0) == 0.0);
 
     // Throughput = bins * 1000 / dt_ms (measured, not nominal-rate).
     p.bins = 16384;
-    CHECK_NEAR(throughput(p, 16.6667), 16384.0 * 1000.0 / 16.6667, 1e-6);
-    CHECK(throughput(p, 0.0) == 0.0);
+    CHECK_NEAR(throughput(p, 16.6667), 16384.0 * 1000.0 / 16.6667, 1e-6);   // 16.6667 ms = one 60 fps frame
+    CHECK(throughput(p, 0.0) == 0.0);              // a zero frame time has no rate: report 0, not infinity
 
     // fftSizeFrom: next power of two >= winSamples, and >= padSize.
     Parameters::Values q;
     q.padSize = 32768;
     CHECK(fftSizeFrom(q, 3175) == 32768);          // pad wins (32768 > nextpow2(3175)=4096)
-    q.winSamples = 50000;
+    q.winSamples = 50000;                          // larger than any pad: the window now sets the size
     CHECK(fftSizeFrom(q, 50000) == 65536);         // window needs 65536 (next pow2 > 50000)
+    // 256 and 1 are the smallest sizes this can be exercised at without leaving the power-of-two path.
     q.padSize = 256;
     CHECK(fftSizeFrom(q, 1) == 256);              // pad alone (256 >= nextpow2(1)=1)
 
     // windowSamplesFrom: ms mode clamps and rounds; sample mode is the raw value.
     Parameters::Values r;
     r.winMode = Parameters::WinMode::Milliseconds;
-    r.winMs = 72.0;
+    r.winMs = 72.0;                                // 72 ms at 48 kHz -> 3456 samples, rounded not truncated
     CHECK(windowSamplesFrom(r, sr) == static_cast<int>(std::lround(72.0 * sr / 1000.0)));
     r.winMs = 200000.0;                           // clamps to kMaxWinSamples
     CHECK(windowSamplesFrom(r, sr) == Parameters::kMaxWinSamples);
     r.winMode = Parameters::WinMode::Samples;
-    CHECK(windowSamplesFrom(r, sr) == r.winSamples);
+    CHECK(windowSamplesFrom(r, sr) == r.winSamples);   // the sample count is passed through untouched
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== test_equal_loudness =====================
+// WHAT:  EqualLoudness::computeCurve() for the three weightings, on a fixed frequency list:
+//        A and C are anchored at 1.0 (0 dB) at 1 kHz, A attenuates 31.5 Hz far more than C does, A
+//        has its small peak just above 1 kHz, and ITU-R 468 rises to its ~6.3 kHz peak and then
+//        falls. Every weight is bounded as a legal positive linear magnitude.
+// WHY:   the anchor at 1 kHz is the property everything downstream relies on, so it is asserted
+//        exactly; the rest are shape invariants, chosen because they hold for any correct A/C curve
+//        and so do not need a dB table to be re-derived whenever the implementation is touched.
+// HOW TO CHANGE: the frequency list is indexed directly (a[5] is 1 kHz, a[6] is 2 kHz, g[7] is
+//        6.3 kHz), so inserting a frequency in the middle renumbers every index below - which is
+//        why the list is fixed and commented rather than generated.
 static void test_equal_loudness()
 {
     section("EqualLoudness (A/C/468) golden vectors");
@@ -1124,9 +1516,10 @@ static void test_equal_loudness()
     // A rolls off steeper than C at low frequencies (A(31.5) << C(31.5)), and C stays closer to 1.0
     // than A at high frequencies (C(10k) nearer 1 than A(10k)). A @ 31.5 Hz is ~-40 dB (weight ~0.01).
     CHECK(a[0] < c[0]);                          // A(31.5) more attenuated than C(31.5)
-    CHECK(a[0] < 0.02);                           // deep low-frequency attenuation (~-40 dB)
+    CHECK(a[0] < 0.02);                           // deep low-frequency attenuation (~-40 dB); 0.02 is a 2x margin over ~0.01
     // Every weight is a legal linear magnitude in (0, inf); sanity-bound the whole curve so a refactor
     // can't silently invert or explode a band.
+    // 100.0 is a loose ceiling: no weighting in this range legitimately amplifies by 40 dB.
     for (float w : a) { CHECK(w > 0.0f && w < 100.0f); }
     for (float w : c) { CHECK(w > 0.0f && w < 100.0f); }
     // A has its small peak just above 1 kHz, so A(2000) > A(1000) = 1.
@@ -1140,6 +1533,13 @@ static void test_equal_loudness()
 }
 
 // ------------------------------------------------------------------------------------------
+// ===================== main =====================
+// The runner. There is no discovery mechanism: a test runs if and only if it is called here, in the
+// order written, which is the order the header's table of contents lists.
+//
+// HOW TO CHANGE: adding a test means writing the function, adding the call below, and updating the
+// table of contents and the check count in the header. Removing a call silently removes its coverage
+// while the suite still reports success, so the header list and this block have to be kept in step.
 int main()
 {
     // Unbuffered stdout, for the same reason as the bench: piped output is block-buffered by the MSVC
@@ -1147,6 +1547,8 @@ int main()
     // running. With this, the last line printed is the crash site - and that line is the whole
     // diagnosis, because the alternative is bisecting by re-running with tests commented out.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // The build answer (was this compiled with AVX2?) and the runtime one (can this CPU run it?) are
+    // independent, and the interesting rows in a failure report are the ones where they disagree.
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
 #if defined(__AVX2__)
                 "build",
@@ -1174,6 +1576,8 @@ int main()
     test_identity_grid_and_rate();
     test_rate_model();
     test_equal_loudness();
+    // The line the header's "the check count is a signal" section is about. Exit code is 0 only when
+    // every check passed, which is what ctest --output-on-failure keys off.
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

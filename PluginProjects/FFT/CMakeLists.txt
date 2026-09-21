@@ -60,6 +60,7 @@ if(FFT_BUILD_BENCH)
     td_plugin_add_bench(FFT fft_threads_probe SOURCES bench/fftw_threads_probe.cpp)
     # Reports which fftwf DLL is loaded, its version, whether that build has the threads API, which
     # SIMD codelets it actually selects, and the per-size r2c cost. Swapping the DLL next to this exe
-    # is how the 3.3.5 -> 3.3.11 AVX2 comparison in 3rdParty/fftw3/README.md was measured.
+    # is how two FFTW builds are compared; no such A/B is recorded in 3rdParty/fftw3/README.md (that
+    # file keeps the FFTW3-vs-oneMKL comparison), so re-run the probe to take one.
     td_plugin_add_bench(FFT fft_version_probe SOURCES bench/fftw_version_probe.cpp)
 endif()

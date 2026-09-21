@@ -11,6 +11,67 @@ standalone with CMake + Ninja and ships headless tests and a per-stage benchmark
 
 ---
 
+## How to use this documentation
+
+Five markdown files, five different jobs. Read the one that matches your question rather than reading
+them in order:
+
+| File | What it is for | Read it when |
+|---|---|---|
+| **README.md** (this file) | The user-facing description: what the node does, every parameter, how to build it, the performance numbers, and the debugging history of the middle-click popup | You are using the node, or you are about to change something and want to know what it is for |
+| [CHANGELOG.md](CHANGELOG.md) | Version history, newest first, one entry per release | You want to know *when* something changed, or which build introduced a behaviour |
+| [FFT_REALTIME_OPTIMIZATION_ANALYSIS.md](FFT_REALTIME_OPTIMIZATION_ANALYSIS.md) | The measured performance analysis: where the time goes, stage by stage | You are looking for something to make faster and want to know what is actually expensive |
+| [FFT_REALTIME_PERFORMANCE_ROADMAP.md](FFT_REALTIME_PERFORMANCE_ROADMAP.md) | Forward-looking ideas that are **not** implemented | You want to know what has been considered, and why it was not done |
+| [PluginProjects/FFT/3rdParty/fftw3/README.md](PluginProjects/FFT/3rdParty/fftw3/README.md) | The vendored FFTW build, the oneMKL alternative, and the license terms of both | You are rebuilding or replacing the FFT library |
+
+Two conventions used throughout, so the numbers can be trusted:
+
+- **Every performance figure names the machine it was measured on.** Times move with thermals and with
+  the FFT plan that happens to be live, so an absolute number without a machine on it means nothing
+  here; the *direction* of a comparison is the durable part. Machine names are used consistently:
+  "i7-class desktop" is the original development machine, "i9-13900H" is the current one.
+- **Claims that could not be verified are labelled as such.** The section on the popup has a
+  "What is *not* established" list written for exactly this reason. Please keep that habit when you
+  add anything: say whether a statement is measured, derived, or a guess.
+
+---
+
+## Where to change what
+
+A map for the first modification, so you do not have to read the whole tree to find one thing. Every
+path is relative to `PluginProjects/FFT/`.
+
+| If you want to change... | Edit |
+|---|---|
+| the DSP maths (window, FFT call, magnitude, warp, weighting, dB, ballistics, FIFO, EQ, the FFTW engine) | `source/DSPModules.h` - one header, sections are numbered and each has a banner |
+| the order the stages run in, or the caching of the window / warp / weighting tables | `source/AnalysisPipeline.h` and `source/AnalysisPipeline.cpp` |
+| what a parameter *means* (its range, its default, its menu entries, how it is read) | `source/Parameters.h` (definitions) and `source/Parameters.cpp` (the one `eval()` that reads them all) |
+| the sample-rate / window-length / bin-count / axis arithmetic | `source/RateModel.h` - TouchDesigner-free and shared by the node, the bench and the tests, so all three agree by construction |
+| the TouchDesigner side: the cook, the async handoff, the Info CHOP / Info DAT / popup text, the error and warning strings | `source/FFT.cpp` (with `source/FFT.h` for the members) |
+| which FFT library is loaded, or how it is located at run time | `source/FftBackend.h` |
+| the regression tests | `tests/dsp_tests.cpp` - the check count is a signal: it must not go down |
+| the benchmarks | `bench/bench.cpp` |
+
+Two rules that are easy to break and hard to debug, both stated at length where they apply:
+
+1. **A parameter that feeds a cached table must be added to that table's key**
+   (`WindowKey` / `WarpKey` / `WeightKey` in `source/AnalysisPipeline.h`). Nothing enforces this at
+   compile time, and forgetting it produces a table that is silently stale until the user changes
+   that one parameter.
+2. **Nothing that allocates, locks or prints may be added to the cook path.** The plugin's whole
+   real-time argument is that a steady-state cook does none of the three; see *Performance* below and
+   *The cost of the info chain* for what happens when that is violated.
+
+And one convention to follow when writing a comment:
+
+> **Refer to code by symbol, not by line number.** Comments in this project cite each other a lot
+> ("who calls this", "where the key is checked"). A symbol name survives an edit; a line number does
+> not, and this pass is the demonstration: adding comments shifts every line below them, and a note
+> that said `source/FFT.cpp:239` was correct when written and wrong an hour later. Prefer
+> `FFT::pollParameters()` and add a file name only when the symbol is ambiguous across files.
+
+---
+
 ## Features
 
 - **FFTW3 R2C engine**, vendored as **3.3.11 built with AVX2 + FMA** (see `3rdParty/fftw3/VERSION`), with a
@@ -44,18 +105,29 @@ standalone with CMake + Ninja and ships headless tests and a per-stage benchmark
 
 ```text
 PluginProjects/FFT/
-├── CMakeLists.txt        <-- 15 lines: include(PluginBuilder_V2/cmake/TDPlugin.cmake) + td_add_plugin(...)
+├── CMakeLists.txt        <-- short: include(PluginBuilder_V2/cmake/TDPlugin.cmake) + td_add_plugin(...)
 ├── plugin.json           <-- manifest read by PluginBuilder (family, optype, deps)
+├── _c.bat / _b.bat       <-- standalone configure / build helpers (vcvars64 + cmake); see Building > Standalone
 ├── source/
 │   ├── DSPModules.h      <-- TouchDesigner-independent DSP (FIFO, EQ, window, warp, weighting, dB, ballistics, FFTW engine)
+│   ├── AnalysisPipeline.h/.cpp <-- the stage ORDER and the table caches; the only caller of DSPModules.h
 │   ├── FftBackend.h      <-- FFT library registry + runtime loader (FFTW3 / oneMKL, no import library)
-│   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, per-channel pipeline, telemetry)
+│   ├── RateModel.h       <-- window length / FFT size / bin count / axis arithmetic, shared by node, bench and tests
+│   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, cook, async handoff, telemetry)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook)
 ├── tests/dsp_tests.cpp   <-- headless golden-vector tests (607 checks, incl. lock-free handoff stress)
 ├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --info N, --backend fftw3|mkl)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
+├── bench/fftw_version_probe.cpp <-- reports the vendored library's version and available flags
 └── 3rdParty/fftw3/       <-- vendored FFTW 3.3.11 AVX2 (VERSION record, header, .def/.lib, runtime DLL)
 ```
+
+Three of the source files are header-only by design: `DSPModules.h`, `FftBackend.h` and `RateModel.h`
+contain their implementations in the header and are included by more than one translation unit (the
+node, the tests and the bench). Their free functions are declared `inline` for that reason. Before
+compiling one of them standalone, or moving a function out of one into a `.cpp`, check who else
+includes it - the tests and the bench link against these headers directly and would otherwise be left
+with an undefined symbol at link time, not at compile time.
 
 ## Building
 
@@ -74,6 +146,21 @@ build\bin\Release\fft_bench.exe --channels 8        # per-stage timings
 build\bin\Release\fft_bench.exe --channels 1 --db 0 --weight 0 --ball 0 --cook 300   # cook-thread cost (async / inline)
 build\bin\Release\fft_bench.exe --info 2000         # info-callback / middle-click access cost
 ```
+
+`_c.bat` and `_b.bat` in `PluginProjects/FFT/` are that sequence with the absolute paths already filled
+in: `_c.bat` configures, `_b.bat` builds. Extra arguments pass through to CMake / the build, e.g.
+`_b.bat --target fft_tests` builds one target, or `_c.bat -DFFT_BUILD_BENCH=OFF` configures without the
+benchmark. Both call `vcvars64.bat` themselves, so they do not need a Developer Command Prompt - but they
+must be invoked with an absolute path from PowerShell. Delete `build/` when changing the vendored FFTW
+version: `td_plugin_use_fftw3` resolves the library from the version tag, and a stale `CMakeCache.txt`
+would keep pointing at the previous one.
+
+`fft_tests` prints a check count as well as a pass/fail. **607 checks, 0 failures** is the current
+baseline, and the count is deliberately treated as a signal: a refactor that removes a check is as
+suspicious as one that fails one, so compare the number, not just the exit code. The oneMKL and
+from-wisdom test branches are genuinely machine-dependent - a different total on another machine is not
+a regression, but a different total on this one is.
+
 `PLUGIN_BUILDER_DIR` defaults to the sibling `../../../PluginBuilder_V2`; pass `-DPLUGIN_BUILDER_DIR=` otherwise.
 A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
 The oneMKL DLLs are never deployed by the build: they are 521 MB, entirely optional, and the user's to install

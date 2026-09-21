@@ -33,6 +33,40 @@ AVX2 code uses ALIGNED loads/stores only where alignment is guaranteed by constr
 Everywhere else the unaligned variants are used. MSVC emits vmovups for both, so this
 is a correctness/portability guarantee (Clang/GCC would fault on a misaligned vmovaps),
 not a performance change.
+
+How to read this file
+---------------------
+The sections are numbered, and those numbers are cited from other files and from the
+README, so treat "section 6c" as a stable address, not as decoration:
+
+    0    AlignedAllocator            everything AVX2 in here allocates through this
+    0a   DenormalGuard               FTZ/DAZ around any code that runs IIR or envelopes
+    0b   cpuSupportsAVX2()           the guard that keeps the node from faulting on an old CPU
+    0c   PlanLog + python_logger     where every log line in the plugin ends up
+    0d   TripleBuffer                the two lock-free cook <-> worker handoffs
+    0e   WorkerSignal                the worker's sleep/wake primitive
+    1    FIFOBuffer                  the per-channel ring buffer at the head of the pipeline
+    2    BiquadEQ                    the optional shelf EQ, applied at ingest
+    3    WindowGenerator             the taper applied to each analysis window
+    4    PerceptualWarping           the index-to-Hz remapping (Log/Mel/ERB/...) + its tables
+    5    EqualLoudness              A / C / ITU-R 468 weighting curves
+    6a   FastLog10                   the mantissa-LUT 20*log10
+    6b   SIMD helpers                multiplyInto / multiplyInPlace / peak search
+    6c   DecibelConverter            magnitude -> dB, and dB -> normalized [0,1]
+    7    BallisticsFilter            the attack/release envelope follower
+    8    IFFTEngine                  the FFT engine interface, and the AVX2 magnitude kernel
+    9    FFTWEngine                  the one implementation: planning, wisdom, backend choice
+
+Everything here is TouchDesigner-independent on purpose: the plugin, the unit tests
+(tests/dsp_tests.cpp) and the benchmark (bench/bench.cpp) all include this header, so a
+change here is compiled three times and must not drag in a TouchDesigner type.
+
+Where a function is a stage of the per-channel analysis, its doc block says so and names
+the stage; AnalysisPipeline::runChannel() in AnalysisPipeline.h is the one place that calls
+them in order, and is the fastest way to see the pipeline end to end.
+
+Building what this file belongs to: see README.md, "Building". Running the tests that pin
+it: PluginProjects/FFT/tests/dsp_tests.cpp (the suite reports its own check count).
 ===========================================================================
 */
 
@@ -73,24 +107,54 @@ not a performance change.
 ===========================================================================
   0. 32-BYTE ALIGNED ALLOCATOR (for AVX2 SIMD load/store alignment)
 ===========================================================================
+WHAT: A std::allocator that hands out memory aligned to `Align` (32 bytes by default), so that
+      AlignedVector (below) can be used with the aligned AVX2 intrinsics (_mm256_load_ps).
+
+WHY:  The default allocator guarantees only alignof(max_align_t), which is 16 bytes. Every AVX2
+      kernel in this file that uses an aligned load would fault (not merely run slowly) on a
+      16-byte-aligned buffer, so the type of the container has to carry the guarantee rather than
+      each call site remembering to check.
+
+HOW TO CHANGE: Nothing to tune here. If a future CPU needs 64-byte alignment, change the default
+      of `Align` and every AlignedVector in the project moves with it - but the SIMD code that
+      explicitly uses the 32-byte intrinsics would also have to be revisited, so do not treat this
+      as a knob.
+
+      The one non-obvious requirement is the `rebind` member and the templated converting
+      constructor: std::vector's implementation asks an allocator for the allocator of a different
+      element type (it allocates raw bytes internally), so a bespoke allocator without rebind is a
+      compile error rather than a runtime problem.
+
+      `construct` / `destroy` place and remove elements in already-allocated storage. They are the
+      pre-C++17 form of the allocator traits protocol; std::allocator_traits supplies defaults if
+      they are absent, so they are only here to keep the behaviour explicit.
 */
 template<typename T, std::size_t Align = 32>
 struct AlignedAllocator {
     using value_type = T;
 
+    // Required by std::vector: "give me the allocator for a different element type". The Align is
+    // propagated unchanged, so a rebind cannot silently lose the alignment guarantee.
     template<typename U> struct rebind { using other = AlignedAllocator<U, Align>; };
 
     AlignedAllocator() noexcept = default;
+    // The converting constructor is also part of the protocol: an allocator must be constructible
+    // from the rebound one, and this one is alignment-only so nothing needs to be copied over.
     template<typename U> AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
 
     T* allocate(std::size_t n) {
+        // A zero-size allocation is legal to request and must not be passed to _aligned_malloc,
+        // which treats a size of 0 as an error and sets errno.
         if (n == 0) return nullptr;
 #ifdef _MSC_VER
         void* ptr = _aligned_malloc(n * sizeof(T), Align);
 #else
+        // MSVC's _aligned_malloc memory must be released with _aligned_free (see deallocate), so
+        // the two branches cannot share a single allocator function - the pairing is per-platform.
         void* ptr = nullptr;
         if (posix_memalign(&ptr, Align, n * sizeof(T)) != 0) ptr = nullptr;
 #endif
+        // The standard requires allocation failure to be reported as an exception, not as null.
         if (!ptr) throw std::bad_alloc();
         return static_cast<T*>(ptr);
     }
@@ -106,18 +170,32 @@ struct AlignedAllocator {
     void construct(U* p, Args&&... args) { new (static_cast<void*>(p)) U(std::forward<Args>(args)...); }
     template<typename U>
     void destroy(U* p) noexcept { p->~U(); }
+    // All instances of this allocator are interchangeable (it holds no state), so every allocator
+    // of the same element type compares equal - which is what lets std::vector move storage
+    // between containers without reallocating.
     bool operator==(const AlignedAllocator&) const noexcept { return true; }
     bool operator!=(const AlignedAllocator&) const noexcept { return false; }
 };
 
 namespace FFTDSP {
 
+// The two container types the DSP core uses for sample data. Prefer these over std::vector<float>
+// anywhere a buffer may be handed to an AVX2 kernel that uses aligned loads; a plain
+// std::vector<float> is only 16-byte aligned and would fault there.
 using AlignedVector = std::vector<float, AlignedAllocator<float, 32>>;
 using AlignedComplexVector = std::vector<std::complex<float>, AlignedAllocator<std::complex<float>, 32>>;
 
+// Both are the double-precision value of pi, in the two precisions this file works in; PI_D is the
+// one the filter and window maths uses (it is computed in double even where the result is float).
+// PI_F is the float form, kept for call sites that need a float constant in a __m256 broadcast.
+// Neither is currently referenced outside this line - they are here so the trig helpers have one
+// definition of pi to share rather than each spelling the literal out.
 constexpr float PI_F = 3.14159265358979323846f;
 constexpr double PI_D = 3.14159265358979323846;
 
+// True when `p` is 32-byte aligned, i.e. safe to pass to an aligned AVX2 load. It exists for
+// assertions and for the tests, not for hot code: a runtime branch here would cost more than the
+// unaligned load it was protecting. Not currently called from the plugin, tests or bench.
 inline bool isAligned32(const void* p) noexcept {
     return (reinterpret_cast<std::uintptr_t>(p) & 31u) == 0;
 }
@@ -129,6 +207,19 @@ inline bool isAligned32(const void* p) noexcept {
 IIR filters and envelope followers decay into denormal floats on silence; every
 operation on a denormal costs ~100 cycles. Set flush-to-zero + denormals-are-zero
 for the duration of a cook / worker job and restore the previous MXCSR afterwards.
+
+WHAT: An RAII object: construct it at the top of a block, and the FPU's control register is
+      restored to exactly what it was when the block ends (including on an exception).
+
+HOW TO USE: One instance per analysis entry point - the pipeline owner constructs it once around
+      a whole job, not once per channel and not per sample. Nobody else needs to remember the flag,
+      which is the point of it being a type rather than a pair of calls.
+
+HOW TO CHANGE: It is thread-local by nature (MXCSR is a per-thread register), so a new thread that
+      does IIR work must construct its own guard - it does not inherit the setting reliably.
+      The two bits are the x86 names: bit 15 FTZ flushes subnormal *results*, bit 6 DAZ treats
+      subnormal *inputs* as zero. Both are needed: DAZ alone still lets a decaying IIR write
+      denormals that the next iteration must read.
 */
 struct DenormalGuard {
     unsigned int saved;
@@ -139,11 +230,25 @@ struct DenormalGuard {
 };
 
 // True if every sample is exactly 0.0 / -0.0 (digital silence). ~0.05 us for 735 samples.
+//
+// WHY this exists instead of just running the pipeline: a fully silent input still costs a full
+// FFT and a full warp, and TouchDesigner cooks the node continuously whether or not it has audio.
+// Detecting silence lets the pipeline skip the analysis for that channel entirely - but only on the
+// plain linear-magnitude path: dB modes still need the floor value written and ballistics still
+// need to decay, so AnalysisPipeline::runChannel only takes the short-circuit when both are off.
+//
+// HOW it works: it ORs the *bit patterns* rather than comparing to 0.0f, so -0.0f counts as
+// silence while any nonzero sample (including a denormal, which == 0.0f is false for anyway but
+// which a `<` comparison could get wrong under FTZ) clears the accumulator. The AVX2 path
+// therefore reads the values as integers with the sign bit masked off, and the scalar tail does
+// the same with memcpy.
 inline bool blockIsSilent(const float* x, size_t n) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
     __m256i acc = _mm256_setzero_si256();
-    const __m256i mask = _mm256_set1_epi32(0x7FFFFFFF);
+    const __m256i mask = _mm256_set1_epi32(0x7FFFFFFF);   // 0x7FFFFFFF: clear the sign bit
+    // One early exit after the loop rather than a branch per vector: _mm256_testz_si256 is true
+    // only when every lane of the accumulator is zero, i.e. every sample seen was 0.0 or -0.0.
     for (; i + 7 < n; i += 8) {
         acc = _mm256_or_si256(acc, _mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i)), mask));
     }
@@ -157,6 +262,8 @@ inline bool blockIsSilent(const float* x, size_t n) noexcept {
 }
 
 // dst[i] = (a[i] + b[i]) (unaligned ok)
+// Used to mix input channels down to one analysis channel; unaligned is deliberate because the
+// inputs come from TouchDesigner's own CHOP buffers, whose alignment the plugin does not control.
 inline void addInto(const float* __restrict a, const float* __restrict b, float* __restrict dst, size_t n) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
@@ -165,6 +272,7 @@ inline void addInto(const float* __restrict a, const float* __restrict b, float*
     for (; i < n; ++i) dst[i] = a[i] + b[i];
 }
 
+// x[i] *= g, in place. Same unaligned contract as addInto.
 inline void scaleInPlace(float* __restrict x, size_t n, float g) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
@@ -180,20 +288,45 @@ inline void scaleInPlace(float* __restrict x, size_t n, float g) noexcept {
 ===========================================================================
 The plugin is compiled with /arch:AVX2. On a CPU without AVX2 the loader
 must refuse to process instead of dying with an illegal-instruction fault.
+
+WHAT: Returns true when this CPU can execute every instruction the compiled kernels use, so the
+      node can be told to stay idle instead of faulting the whole TouchDesigner process.
+
+WHY it is not simply "is AVX2 present": the kernels also use FMA (every _mm256_fmadd_ps /
+      _mm256_fnmadd_ps in this file), and an AVX2-only CPU without FMA would fault on those. The
+      OS must additionally have enabled the YMM register state (XCR0), or every 256-bit instruction
+      faults regardless of what the silicon supports - which is the case in some VMs and under
+      some hypervisors. So all three are required, and the FMA check is not redundant with AVX2.
+
+HOW TO CHANGE: If a kernel here starts using an instruction set that is not already covered
+      (AVX-512, for example), add its check to this function *and* to the message the node reports —
+      the caller surfaces this as an error string, so a new requirement must say so by name.
+
+CALLED BY: FillCHOPPluginInfo() in FFT.cpp, once per process, when TouchDesigner registers the DLL.
+      The result is cached in that file's g_cpuHasAVX2 and copied per instance into FFT::myCpuOk,
+      which is what the node's error string, the `simd_avx2_active` Info channel and the popup's
+      SIMD line all report. It is also called by the test suite, which prints the answer.
+      Deliberately not called from a hot path: it is a CPUID query, not a bit test.
 */
 inline bool cpuSupportsAVX2() noexcept {
 #if defined(_WIN32)
     // PF_AVX2_INSTRUCTIONS_AVAILABLE == 40 (Windows 10+)
+    // Preferred when available: it is the OS's own answer and already accounts for the
+    // OS/hypervisor having enabled the register state, which is the part CPUID cannot see.
     if (IsProcessorFeaturePresent(40)) return true;
+    // Fallback for systems where that query is unavailable. CPUID leaf 7 / sub-leaf 0, EBX bit 5
+    // is AVX2; leaf 1 ECX bit 27 is OSXSAVE (the OS can save YMM state) and bit 12 is FMA.
     int info[4] = { 0, 0, 0, 0 };
     __cpuid(info, 0);
-    if (info[0] < 7) return false;
+    if (info[0] < 7) return false;   // leaf 7 does not exist, so AVX2 cannot either
     __cpuidex(info, 7, 0);
     const bool avx2 = (info[1] & (1 << 5)) != 0;
     __cpuid(info, 1);
     const bool osxsave = (info[2] & (1 << 27)) != 0;
     const bool fma = (info[2] & (1 << 12)) != 0;
     if (!avx2 || !osxsave || !fma) return false;
+    // OSXSAVE says the OS *can* save the state; XCR0 says it actually enabled XMM (bit 1) and
+    // YMM (bit 2). Both bits must be set or the 256-bit kernels must not run.
     const unsigned long long xcr0 = _xgetbv(0);
     return (xcr0 & 0x6) == 0x6; // XMM + YMM state enabled by the OS
 #else
@@ -209,6 +342,21 @@ printf() from a DLL goes to the OS stdout, which TouchDesigner's Textport does
 not show. PySys_WriteStdout() writes straight to sys.stdout (the Textport) —
 no script compilation, no string escaping problems. The CPython symbols are
 resolved once from the python DLL already loaded in the TouchDesigner process.
+
+WHAT: A log line has two destinations and they are independent. (1) The in-memory history, which
+      the Info DAT's plan_log_* rows read - this always happens. (2) The TouchDesigner Textport,
+      which is optional per line and is the part that has to go through Python.
+
+WHY THE SPLIT: the Textport path calls into CPython, and a worker thread calling Python is a bug
+      waiting to happen (it would need the GIL and could block the analysis). So anything on the
+      worker thread logs with echo disabled, or logs normally while the log is in *deferred* mode,
+      where the message is queued and the cook thread writes it later (see setDeferred /
+      flushToTextport). "Deferred" is therefore the normal state, not an error state.
+
+HOW TO CHANGE: Adding a log line is just log("..."). The rules that matter: never call
+      python_logger::writeToTextport() from a thread other than the cooking one, and prefer
+      log(msg, false) for anything that can repeat every cook (the Textport is a shared, visible
+      surface, and a line per cook is noise the user cannot turn off).
 */
 constexpr size_t kMaxPlanLogEntries = 256;
 
@@ -236,6 +384,8 @@ using EnsureFn  = GILState(*)(void);
 using ReleaseFn = void(*)(GILState);
 using WriteFn   = void(*)(const char*, ...);
 
+// The three resolved CPython symbols, or `ok == false` when the host has no Python. Held as plain
+// function pointers so nothing here is linked against a Python import library.
 struct Api {
     EnsureFn  ensure = nullptr;
     ReleaseFn release = nullptr;
@@ -243,9 +393,18 @@ struct Api {
     bool      ok = false;
 };
 
+// Resolves the three CPython entry points once per process, from whichever Python DLL
+// TouchDesigner has already loaded into this process. `ok` is false when none of them resolved,
+// which is the normal outcome for the tests and the bench (no Python in the process) - callers
+// must treat that as "no Textport", never as an error.
 inline const Api& api() {
     static const Api resolved = [] {
         Api a;
+        // A preference order, not a requirement: the first name that is already loaded wins. The
+        // version-specific names come first so the exact interpreter is used when it is there, and
+        // python3.dll last because it is the version-agnostic forwarder. TouchDesigner's own
+        // GetModuleHandle rather than a load: the plugin must never load a *second* Python into a
+        // process that already has one, and must do nothing at all if TD has none loaded.
         const char* names[] = { "python311.dll", "python312.dll", "python313.dll", "python310.dll", "python3.dll" };
         HMODULE h = nullptr;
         for (const char* n : names) { h = GetModuleHandleA(n); if (h) break; }
@@ -253,22 +412,27 @@ inline const Api& api() {
         a.ensure  = reinterpret_cast<EnsureFn>(GetProcAddress(h, "PyGILState_Ensure"));
         a.release = reinterpret_cast<ReleaseFn>(GetProcAddress(h, "PyGILState_Release"));
         a.write   = reinterpret_cast<WriteFn>(GetProcAddress(h, "PySys_WriteStdout"));
+        // All three or nothing: releasing a GIL state that was never acquired, or writing without
+        // holding it, are both worse than staying silent.
         a.ok = a.ensure && a.release && a.write;
         return a;
     }();
     return resolved;
 }
 
+// Cooking thread only (see the section comment above for why). Takes the GIL around the write,
+// because PySys_WriteStdout is a CPython call and TouchDesigner's own Python may be running.
 inline void writeToTextport(const std::string& msg) {
     const Api& a = api();
     if (!a.ok) return;
     GILState g = a.ensure();
     // PySys_WriteStdout truncates at 1000 bytes; split long messages.
+    // Carriage returns are rewritten to spaces so a stray \r cannot move the Textport cursor.
     std::string line = msg;
     for (char& c : line) if (c == '\r') c = ' ';
     size_t pos = 0;
     while (pos < line.size()) {
-        std::string chunk = line.substr(pos, 900);
+        std::string chunk = line.substr(pos, 900);   // 900, not 1000: leaves room for the newline
         a.write("%s%s", chunk.c_str(), (pos + 900 >= line.size()) ? "\n" : "");
         pos += 900;
     }
@@ -278,12 +442,38 @@ inline void writeToTextport(const std::string& msg) {
 } // namespace python_logger
 #endif
 
+/*
+WHAT: One node instance's log. Holds the history of every line it has logged, plus (in deferred
+      mode) a queue of lines still to be echoed to the Textport.
+
+WHY IT IS NOT JUST A std::vector<std::string>: the log is written from two threads - the pipeline
+      owner logs plan events, the cook thread flushes and reads - so every accessor takes the
+      mutex, and the one question the cook thread asks on every frame ("is there anything to
+      flush?") is answered by a lock-free atomic flag instead, so the real-time path never waits on
+      whoever is logging. The two questions the Info DAT asks about the history ("did it change?",
+      "how many rows?") are likewise answered by a version counter rather than by copying.
+
+MEMORY: bounded. The history is capped at kMaxPlanLogEntries; when it would exceed the cap, log()
+      drops the OLDEST HALF and keeps the newer half. That is why callers cannot assume an entry
+      index is stable across cooks, and why the row count has to be frozen per cook (see
+      FFT::getInfoDATSize).
+
+HOW TO CHANGE: log() is the only writer. If a new reader needs the history, add an accessor here
+      rather than reaching for the members; if a new reader needs "has it changed since I last
+      looked", use version(), not a comparison of snapshots.
+*/
 class PlanLog {
 public:
     // deferred = true: messages are queued and written to the Textport by flushToTextport()
     // (call it from the cooking thread). Worker threads must never call into Python directly.
+    // Set to true by the FFT operator's constructor, so this is the normal mode in TouchDesigner.
     void setDeferred(bool deferred) { std::lock_guard<std::mutex> lock(m_mutex); m_deferred = deferred; }
 
+    // Appends a line to the history, and (echoToTextport) either writes it straight to the Textport
+    // or queues it for the next flushToTextport(), depending on the deferred flag.
+    // echoToTextport = false is for lines that should be in the history but are not worth printing
+    // every cook - the Info DAT will still show them.
+    // Safe to call from any thread.
     void log(const std::string& msg, bool echoToTextport = true) {
         bool deferred;
         {
@@ -326,6 +516,8 @@ public:
 #endif
         return pending.size();
     }
+    // A full copy of the history. Simple, and O(entries) with an allocation per line - so it is the
+    // wrong choice for anything called repeatedly. Prefer entry(), snapshotTail() or version().
     std::vector<std::string> snapshot() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_history;
@@ -346,11 +538,18 @@ public:
         out.insert(out.end(), m_history.begin() + static_cast<std::ptrdiff_t>(start), m_history.end());
     }
     // Single entry (used per Info DAT row so the whole history is not copied for every row)
+    // Out of range returns an empty string rather than throwing: the caller is walking rows whose
+    // count was decided earlier in the same cook, so an index past the end is possible by design.
     std::string entry(size_t i) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return i < m_history.size() ? m_history[i] : std::string();
     }
+    // How many entries the history holds right now. Note this can change between two calls in the
+    // same cook (the pipeline owner is logging concurrently), which is exactly why the Info DAT
+    // freezes the count - see FFT::getInfoDATSize.
     size_t size() const { std::lock_guard<std::mutex> lock(m_mutex); return m_history.size(); }
+    // Drops the history and bumps the version, so a reader caching the old content notices. Does not
+    // touch the pending queue: lines already logged still reach the Textport.
     void clear() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_history.clear();
@@ -382,14 +581,26 @@ cook thread never takes a mutex the worker might be holding while descheduled.
 template <typename T>
 class TripleBuffer {
 public:
+    // Using it, from the producer:
+    //     buf.back() = value;            // fill the slot the producer owns
+    //     const bool dropped = buf.publish();
+    // and from the consumer:
+    //     if (buf.acquire()) use(buf.front());
+    //     else               reuseTheLastOne();
+    // Exactly one thread may be the producer and exactly one the consumer. That is the whole
+    // contract: there is no lock, so two producers (or two consumers) would corrupt the index
+    // packing with no diagnostic. The FFT operator uses one instance per direction for this reason.
     TripleBuffer() = default;
     TripleBuffer(const TripleBuffer&) = delete;
     TripleBuffer& operator=(const TripleBuffer&) = delete;
 
     // ---- producer side ----
+    // The slot the producer may write. Valid until the next publish(); the producer must not hold
+    // onto it across a publish, because publish() reassigns which slot this is.
     T& back() noexcept { return m_slots[m_back]; }
     // Makes back() the latest complete slot. Returns true if the previously published slot
-    // had NOT been acquired by the consumer yet (i.e. it was dropped).
+    // had NOT been acquired by the consumer yet (i.e. it was dropped) - telemetry, not an error:
+    // "latest wins" means dropping an intermediate result is the designed behaviour.
     bool publish() noexcept {
         const uint32_t prev = m_mid.exchange(m_back | kDirty, std::memory_order_acq_rel);
         m_back = prev & kIndexMask;
@@ -398,6 +609,9 @@ public:
 
     // ---- consumer side ----
     // Returns true if a newer slot was acquired; front() then refers to it (and stays valid until the next acquire()).
+    // Returns false when nothing was published since the last acquire, in which case front() is
+    // still the previously acquired content and the caller is expected to reuse it (the operator's
+    // "hold the previous spectrum" behaviour).
     bool acquire() noexcept {
         if ((m_mid.load(std::memory_order_acquire) & kDirty) == 0) return false;
         m_front = m_mid.exchange(m_front, std::memory_order_acq_rel) & kIndexMask;
@@ -405,9 +619,14 @@ public:
     }
     const T& front() const noexcept { return m_slots[m_front]; }
     T& front() noexcept { return m_slots[m_front]; }
+    // Whether acquire() would report a new slot. A cheap pre-check for a caller that wants to look
+    // before it leaps; never a substitute for acquire(), which is what actually claims the slot.
+    // Not currently called by the plugin or the tests - acquire()'s return value covers their needs.
     bool hasNew() const noexcept { return (m_mid.load(std::memory_order_acquire) & kDirty) != 0; }
 
-    // All three slots (setup only, when no other thread is running)
+    // All three slots (setup only, when no other thread is running). This is how a producer
+    // pre-allocates the buffers inside the slots before any handoff happens, so the steady state
+    // allocates nothing - see FFT::startWorker.
     T& slot(size_t i) noexcept { return m_slots[i]; }
     static constexpr size_t kSlots = 3;
 
@@ -443,6 +662,25 @@ needs signal() after it has gone dormant.
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002   // Windows 10 1803+ SDKs define it
 #endif
 
+/*
+WHAT: The one primitive the analysis worker blocks on. signal() wakes it; wait() blocks until it is
+      woken; waitFor(ms) blocks until it is woken or the timeout expires, whichever comes first.
+
+WHY TWO WAITS: the worker is woken by the cook thread, and waking a thread costs 4-5 us of kernel
+      time on the *signalling* side - which is the cook thread, i.e. the one thread that must never
+      be delayed. So while jobs are flowing the worker does not get woken at all: it polls with
+      waitFor(2 ms) and picks up whatever the lock-free job slot holds. signal() is used only for
+      the transition out of dormancy, where a 2 ms delay would actually be visible (see FFT.cpp's
+      worker loop and myWorkerDormant).
+
+SEMANTICS: signal() is lost if nobody is waiting, so this is a wake-up, not a counter. There is no
+      "how many times was I signalled" - the job queue is the source of truth for how much work
+      there is, and this only says "look again".
+
+HOW TO CHANGE: The two implementations (Win32 event + waitable timer, or mutex + condvar
+      elsewhere) must keep the same semantics, and waitFor must return false on timeout rather
+      than blocking indefinitely - the worker's poll loop depends on that to notice a stop request.
+*/
 class WorkerSignal {
 public:
     WorkerSignal() noexcept {
@@ -468,6 +706,9 @@ public:
     // worker miss frames).
     bool highResolutionTimer() const noexcept { return m_highRes; }
 
+    // Wakes whichever of wait()/waitFor() is blocked. Callable from any thread; on Windows it takes
+    // no lock at all, because this is the call the cook thread makes and it must not be able to
+    // block behind a descheduled worker.
     void signal() noexcept {
 #ifdef _WIN32
         if (m_event) SetEvent(m_event);
@@ -477,6 +718,9 @@ public:
 #endif
     }
     // Blocks until signal() was called since the last wait() (the signal is consumed).
+    // Blocks indefinitely - the caller has no way out, so use it only for a state the caller is
+    // certain will be signalled, which in this project is exactly one: the worker's dormant state,
+    // where any stop request or new job signals it. Everywhere else uses waitFor().
     void wait() noexcept {
 #ifdef _WIN32
         if (m_event) WaitForSingleObject(m_event, INFINITE);
@@ -527,13 +771,49 @@ private:
 ===========================================================================
  1. CIRCULAR RING BUFFER (FIFOBuffer)
 ===========================================================================
+WHAT: The history of the last `capacity` input samples of ONE channel, so that any window length up
+      to `capacity` can be read out of it at any time. add() appends new samples (overwriting the
+      oldest once full); get() produces a linear, oldest-first copy for the analysis to consume.
+
+WHY IT IS NEEDED: TouchDesigner hands the node a block of audio per cook whose size is whatever
+      arrived since the last cook, while the analysis needs a window that is fixed and usually much
+      longer (72 ms is 3175 samples at 44.1 kHz, and a cook may deliver 735). So the sample history
+      has to outlive the cook, and the window has to be readable as one contiguous buffer.
+
+WHY NOT A std::deque / a growing vector: this is on the ingest path of every cook. add() and get()
+      take no lock, allocate nothing after construction, and are two memcpys (add) / one or two
+      memcpys plus a possible memset (get). resize() is the only allocating call, and it is called
+      only when the window length changes.
+
+THE LAYOUT:
+    m_data[0 .. m_capacity-1]   the ring; data wraps from the end back to index 0
+    m_idx                       the write cursor: the next byte to write is m_data[m_idx]
+    m_filled                    how many of the m_capacity slots hold real audio; saturates at
+                                m_capacity, so it cannot distinguish "full" from "overfull", which
+                                is fine because past that point the oldest samples are gone anyway.
+      m_idx is computed as `end % m_capacity` when a write does not wrap, and as `count - first`
+      when it does; add() reads that carefully, because getting it wrong corrupts the timeline
+      silently rather than failing loudly.
+
+THE ONE CONTRACT THAT MATTERS TO CALLERS: get() right-aligns and zero-pads while the buffer is
+      still filling, so the NEWEST sample is always at out[capacity-1] no matter how much audio has
+      arrived so far. A freshly created node therefore produces a window of mostly zeros rather
+      than garbage, and a full buffer and a partially filled one put "now" in the same place.
+      This is also why the pipeline does not need to know whether the node just started.
+
+HOW TO CHANGE: capacity comes from FFT::execute, which computes it from the window-length parameter
+      via windowSamplesFrom() (RateModel.h), so the buffer is exactly as long as the window and the
+      two cannot disagree. The default of 3175 is the default window (72 ms at 44.1 kHz), not a
+      tuned number: do not change it here, change the parameter default if that is the intent.
 */
 class FIFOBuffer {
 public:
     explicit FIFOBuffer(size_t capacity = 3175) { resize(capacity); }
 
+    // Sets the capacity, clearing the contents. Called from the ingest path whenever the window
+    // length changes (which resets the analysis anyway), so the loss of history is deliberate.
     void resize(size_t capacity) {
-        m_capacity = std::max<size_t>(1, capacity);
+        m_capacity = std::max<size_t>(1, capacity);   // 0 would make the modulo below divide by zero
         m_data.assign(m_capacity, 0.0f);
         m_idx = 0;
         m_filled = 0;
@@ -542,6 +822,9 @@ public:
     size_t capacity() const noexcept { return m_capacity; }
     size_t filled() const noexcept { return m_filled; }
 
+    // Appends `count` samples from `signal`. If more samples arrive than the buffer holds, the
+    // newest m_capacity of them are kept and the rest are discarded - there is nowhere else for
+    // them to go, and a window can never be longer than m_capacity anyway.
     inline void add(const float* signal, size_t count) noexcept {
         if (count == 0 || !signal) return;
         if (count >= m_capacity) {
@@ -552,9 +835,11 @@ public:
         }
         size_t end = m_idx + count;
         if (end <= m_capacity) {
+            // Does not wrap: one copy, and the cursor lands at end (which may equal m_capacity).
             std::memcpy(m_data.data() + m_idx, signal, count * sizeof(float));
             m_idx = end % m_capacity;
         } else {
+            // Wraps: two copies, head then tail. `first` is how many fit before the end.
             size_t first = m_capacity - m_idx;
             std::memcpy(m_data.data() + m_idx, signal, first * sizeof(float));
             std::memcpy(m_data.data(), signal + first, (count - first) * sizeof(float));
@@ -564,6 +849,7 @@ public:
     }
 
     // Linearized copy of the buffer (oldest sample first); right-aligned & zero-padded while filling.
+    // Unwraps the ring into `out`, which is resized to m_capacity if it is not already that size.
     inline void get(AlignedVector& out) const noexcept {
         if (out.size() != m_capacity) out.resize(m_capacity);
         if (m_filled < m_capacity) {
@@ -599,13 +885,37 @@ private:
 ===========================================================================
  2. DIRECT FORM II TRANSPOSED BIQUAD EQUALIZER (RBJ shelves)
 ===========================================================================
+WHAT: Two second-order IIR filters in series - a high shelf and a low shelf - with the coefficients
+      recomputed only when a parameter changes. This is the node's optional EQ page.
+
+WHY "DIRECT FORM II TRANSPOSED": it is the standard biquad topology for floating-point audio. It
+      needs only two state variables (z1, z2) instead of four, and its round-off behaviour is better
+      than the direct forms because the large intermediate sums are not stored. The recurrence below
+      is the textbook one and should not be rewritten to look "simpler" - the other orderings are
+      numerically worse for exactly the low-frequency, high-Q cases a shelf EQ is used for.
+
+WHY RBJ: the coefficient formulas are Robert Bristow-Johnson's Audio EQ Cookbook shelves, which is
+      what makes the cutoff/gain/Q parameters mean what a user expects from any other EQ.
+
+HOW TO CHANGE: The coefficient design is in BiquadEQ::designShelf and the per-sample recurrence in
+      BiquadSection::process. If you add a third filter (a peak/notch, say), it goes in series in
+      both processBlockInPlace and processAudio - they must be kept in the same order, because the
+      tests assert that the two paths produce the same samples.
 */
 struct BiquadSection {
+    // Coefficients with a0 already divided out (so a0 is implicitly 1). A shelf that is switched
+    // off carries b0 = 1, b1 = b2 = a1 = a2 = 0, i.e. an identity filter.
     float b0{ 1.0f }, b1{ 0.0f }, b2{ 0.0f };
     float a1{ 0.0f }, a2{ 0.0f };
+    // The two state variables. They are the filter's memory of past samples, which is why they must
+    // be preserved across blocks and are only cleared by reset() - see processBlockInPlace.
     float z1{ 0.0f }, z2{ 0.0f };
+    // False when this shelf is a no-op (gain below the 0.01 dB threshold that designShelf applies).
+    // process() then returns its input untouched, which is what makes an all-off EQ cost nothing.
     bool active{ false };
 
+    // One sample through the Direct Form II Transposed recurrence. Inline and branch-light: this is
+    // called once per input sample, i.e. 44100 times a second per channel.
     inline float process(float x) noexcept {
         if (!active) return x;
         float y = b0 * x + z1;
@@ -613,13 +923,37 @@ struct BiquadSection {
         z2 = b2 * x - a2 * y;
         return y;
     }
+    // Clears the filter's memory (no click, no carry-over). Called when the EQ is switched on or
+    // the sample rate changes, so a stale state cannot be applied to a different signal.
     void reset() noexcept { z1 = 0.0f; z2 = 0.0f; }
 };
 
+/*
+WHAT: The two shelves, their coefficient cache, and the two ways to run audio through them.
+
+WHY THE CACHE: designing a shelf costs four trigonometric calls, and the parameters only change when
+      the user moves a slider - but the design was previously redone on every cook. m_design_key
+      holds the five values the coefficients were built from, so a cook whose parameters did not
+      change skips the design entirely. If you add a parameter that feeds the coefficients, it must
+      be added to the key or the filter will silently ignore it.
+
+WHY TWO PROCESSING ENTRY POINTS: they are the same filter, differing only in where they put the
+      output and who calls them.
+        processBlockInPlace(data, n, amount)  - in place, streaming. This is the one the plugin uses,
+              from FFT::ingest, on the new samples only. Filtering each sample exactly once as it
+              arrives is what keeps the IIR state continuous and costs one pass over the new audio.
+              (The alternative - filtering the whole analysis window every cook - was measured at 4x
+              the work and additionally restarts the filter from a stale state at each window start.)
+        processAudio(in, amount, out)         - out of place, whole buffer. Not used by the plugin:
+              it is the reference the tests compare the streaming path against, and it is what the
+              bench measures the ingest path against.
+*/
 class BiquadEQ {
 public:
     explicit BiquadEQ(double sampling_rate = 44100.0) : m_sample_rate(sampling_rate) {}
 
+    // Changes the rate the coefficients are designed for, and invalidates the cache (they are
+    // frequency-dependent, so every coefficient has to be rebuilt). Called from FFT::ingest.
     void setSampleRate(double sr) noexcept {
         if (m_sample_rate != sr) {
             m_sample_rate = sr;
@@ -627,6 +961,10 @@ public:
         }
     }
 
+    // Designs one RBJ shelf into `sec`. `is_high` selects which of the two shelf shapes is built
+    // from the same formulas (that is the `s` sign below). A gain smaller than 0.01 dB is treated
+    // as "off": the shelf is deactivated and its state cleared, so a user who wants no EQ gets
+    // bit-exact passthrough rather than a filter that is nearly-but-not-quite transparent.
     void designShelf(bool is_high, double cutoff_hz, double gain_db, double q_factor, BiquadSection& sec) noexcept {
         if (std::abs(gain_db) < 0.01) { sec.active = false; sec.reset(); return; }
         cutoff_hz = std::clamp(cutoff_hz, 1.0, m_sample_rate * 0.49);
@@ -652,6 +990,12 @@ public:
         sec.active = true;
     }
 
+    // Re-designs both shelves if any of the five shaping parameters changed, and answers the one
+    // question the ingest path asks: "is there anything to apply?" - true only when at least one
+    // shelf is active AND the blend amount is above zero. The caller uses that to skip the whole EQ
+    // pass, so it must stay cheap; the tuple compare above does that.
+    // Note the amount is deliberately NOT part of the cache key: it is an output blend, not a
+    // coefficient, so moving it does not invalidate the design.
     bool updateAndCheckActive(double gain_db, double cutoff_hz, double low_gain_db, double low_cutoff_hz,
                               double q_factor, double amount) noexcept {
         std::tuple<double, double, double, double, double> key{ gain_db, cutoff_hz, low_gain_db, low_cutoff_hz, q_factor };
@@ -663,6 +1007,14 @@ public:
         return (m_high_shelf.active || m_low_shelf.active) && (amount > 0.0);
     }
 
+    // Runs a whole buffer through the EQ, writing to a separate output. See the class comment for
+    // which caller uses this (the tests and the bench, not the plugin).
+    // The two shelves are in series, high then low, and `amount` is a dry/wet blend:
+    // amount = 1 gives the filtered signal, amount = 0 gives the input back unchanged, and in
+    // between is a linear crossfade - so a user can dial the EQ in without it ever being a bypass
+    // that clicks. State (z1/z2) carries across calls: calling this twice in a row is not the same
+    // as calling it once with the concatenation only in that the filter was not restarted, which is
+    // the behaviour the tests pin.
     inline void processAudio(const AlignedVector& original_audio, double amount, AlignedVector& processed_output) noexcept {
         if (original_audio.empty()) { processed_output.clear(); return; }
         if (processed_output.size() != original_audio.size()) processed_output.resize(original_audio.size());
@@ -690,12 +1042,18 @@ public:
         }
     }
 
+    // Clears both shelves' state, so the next audio starts from silence rather than from whatever
+    // the filter was holding. Called when the input is restarted (the node's Reset pulse), so a
+    // restart cannot ring the old signal into the new one.
     void reset() noexcept { m_high_shelf.reset(); m_low_shelf.reset(); }
 
 private:
-    double m_sample_rate{ 44100.0 };
-    BiquadSection m_high_shelf;
-    BiquadSection m_low_shelf;
+    double m_sample_rate{ 44100.0 };   // the rate the coefficients are designed for
+    BiquadSection m_high_shelf;        // boost/cut above cutoffHz
+    BiquadSection m_low_shelf;         // boost/cut below lowCutoffHz
+    // The five parameter values m_high_shelf / m_low_shelf were designed from. An all-zero
+    // initial value is deliberate: it cannot equal a real design (a real one would have to be
+    // 0 dB gain at 0 Hz, which deactivates the shelf), so the first cook always designs.
     std::tuple<double, double, double, double, double> m_design_key;
 };
 
@@ -703,14 +1061,52 @@ private:
 ===========================================================================
  3. WINDOW GENERATOR
 ===========================================================================
+WHAT: Builds the taper that is multiplied into each analysis window before the FFT.
+
+WHY A WINDOW IS NEEDED AT ALL: an FFT only ever sees a finite slice of a continuous signal, which
+      is the same as multiplying by a rectangle. A rectangle's spectrum has high sidelobes, so a
+      strong tone leaks across the whole display as a raised floor. A taper trades a slightly wider
+      main lobe (worse frequency resolution) for much lower sidelobes (less leakage), which is the
+      trade the Window Type menu offers:
+        Kaiser          - beta-tunable; the default (beta 15) is the low-sidelobe end
+        Hann            - the general-purpose choice, -31 dB sidelobes
+        Hamming         - similar to Hann but with a non-zero edge, -43 dB first sidelobe
+        Blackman        - -58 dB sidelobes, wider main lobe
+        BlackmanHarris  - -92 dB sidelobes, the quietest offered, widest main lobe
+        Rectangular     - no taper at all; best resolution, worst leakage. Correct only for
+                          signals that already fit the window exactly, or for measuring noise.
+
 Normalization modes:
   CoherentGain : mean(window) == 1  (legacy behaviour; peak of a full-scale sine == N_win/2)
   FullScale    : sum(window) == 2   (one-sided spectrum of a sine with amplitude A reads A)
+
+WHY NORMALIZATION IS NOT COSMETIC: it fixes what a bin's value means, which is what the dB
+      reference in section 6c is measured against. CoherentGain keeps a full-scale sine reading
+      N_win/2 in the magnitude spectrum, which is the historical behaviour every earlier version of
+      this node produced and what an existing project's dB offsets were tuned against; FullScale
+      makes the same sine read its own amplitude, which is what a dB-full-scale meter wants. Changing
+      either one shifts every dB reading, so this is a compatibility knob, not a tuning knob.
+
+HOW TO CHANGE - adding a window type needs three edits, in step:
+      1. the WindowType enum in Parameters.h (its position is the menu order),
+      2. the names/labels arrays in Parameters.cpp at the same position (the static_asserts there
+         are what catch a mismatch),
+      3. a `case` in generateWindow() below, whose integer matches that position.
+      Miss (3) and the new menu entry silently builds the Kaiser window.
 */
 enum class WindowNorm : int { CoherentGain = 0, FullScale = 1 };
 
 class WindowGenerator {
 public:
+    // Modified Bessel function of the first kind, order 0, I0(x). Needed only by the Kaiser window
+    // (it is the shape of that taper), where the argument is beta*sqrt(1-...), so it is evaluated
+    // inside the per-sample loop and has to be cheap.
+    //
+    // Two polynomial approximations from Abramowitz & Stegun (9.8.1 for x < 3.75, 9.8.2 above),
+    // accurate to about 1e-7 - far below what a float window coefficient can represent, so this is
+    // not a source of error. The split at 3.75 is where the two series' accuracy bands meet, not a
+    // tunable threshold; I0 grows like exp(x)/sqrt(x), which is why the upper branch factors that
+    // out before evaluating the rational part.
     static double besselI0(double x) {
         double ax = std::abs(x);
         if (ax < 3.75) {
@@ -722,13 +1118,28 @@ public:
                (0.39894228 + y * (0.01328592 + y * (0.00225319 + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))));
     }
 
+    // Fills `window` with `length` coefficients of the requested type and normalization.
     // window_type: 0 Kaiser, 1 Hann, 2 Hamming, 3 Blackman, 4 Blackman-Harris, 5 Rectangular
+    //              (positions must match the WindowType enum in Parameters.h - see the section comment)
+    // kaiser_beta: only read for type 0; larger = lower sidelobes, wider main lobe. 15 is the
+    //              default and the value that makes Kaiser the low-leakage choice.
+    // Produced in two passes rather than one: the coefficients are built unnormalized, their sum is
+    // accumulated, and then every coefficient is scaled so that the sum (or the mean) hits the
+    // target EXACTLY. Normalizing by a closed-form factor per window type would leave the result a
+    // fraction of a percent off, and since these coefficients set the absolute level of every dB
+    // reading downstream, "close enough" is not - the measured sum is the honest one.
     static void generateWindow(int window_type, double kaiser_beta, size_t length, AlignedVector& window,
                                WindowNorm norm = WindowNorm::CoherentGain) {
         window.resize(length);
         if (length == 0) return;
+        // length-1, not length: this is the SYMMETRIC window, whose endpoints are exactly equal
+        // (cos(0) and cos(2*pi)). The periodic form (denominator length) is the one for overlap-add
+        // resynthesis, which this node does not do - it analyses one frame and discards it. Using
+        // the wrong one is a small but real spectral error, so do not "fix" this to length.
         double denom = (length > 1) ? static_cast<double>(length - 1) : 1.0;
         double sum = 0.0;
+        // Hoisted out of the loop: the Kaiser case divides by I0(beta) for every sample, and beta is
+        // constant for the whole window.
         double kaiser_inv_I0 = 1.0 / besselI0(kaiser_beta);
 
         for (size_t n = 0; n < length; ++n) {
@@ -738,12 +1149,18 @@ public:
                 case 1: w = 0.5 - 0.5 * std::cos(2.0 * PI_D * fn / denom); break;
                 case 2: w = 0.54 - 0.46 * std::cos(2.0 * PI_D * fn / denom); break;
                 case 3: w = 0.42 - 0.5 * std::cos(2.0 * PI_D * fn / denom) + 0.08 * std::cos(4.0 * PI_D * fn / denom); break;
+                // The 4-term Blackman-Harris (its coefficients are the minimum-sidelobe set, which
+                // is why they carry six decimal places and are not memorizable).
                 case 4: w = 0.35875 - 0.48829 * std::cos(2.0 * PI_D * fn / denom)
                             + 0.14128 * std::cos(4.0 * PI_D * fn / denom)
                             - 0.01168 * std::cos(6.0 * PI_D * fn / denom); break;
                 case 5: w = 1.0; break;
                 case 0:
                 default: {
+                    // Kaiser: I0(beta*sqrt(1-t^2)) / I0(beta), with t sweeping -1..1 across the
+                    // window. That placement of sqrt(1-t^2) (as an exponent-like envelope, applied to
+                    // the Bessel argument rather than the result) is the definition - the I0 of the
+                    // Bessel "ratio" form is not the same shape.
                     double term = 2.0 * fn / denom - 1.0;
                     double arg = std::sqrt(std::max(0.0, 1.0 - term * term));
                     w = besselI0(kaiser_beta * arg) * kaiser_inv_I0;
@@ -753,6 +1170,8 @@ public:
             window[n] = static_cast<float>(w);
             sum += w;
         }
+        // sum > 0 rather than != 0: only a pathological type could make it negative, and dividing by
+        // a negative or zero sum would produce a window that is worse than leaving it unnormalized.
         if (sum > 0.0) {
             double target = (norm == WindowNorm::FullScale) ? 2.0 : static_cast<double>(length);
             float scale = static_cast<float>(target / sum);
@@ -765,25 +1184,62 @@ public:
 ===========================================================================
  4. PSYCHOACOUSTIC FREQUENCY SCALES & AVX2 GATHER INTERPOLATION
 ===========================================================================
+WHAT: Turns the FFT's uniform grid of `n_linear_bins` magnitudes into the node's output grid of
+      `n_out` bins, using one of six frequency scales (or a blend between linear and any of them).
+      This is the "warp" stage, and it is a resampling of the magnitude curve - each output bin
+      reads a linearly-interpolated (or cubic) value out of the input.
+
+WHY A TABLE AND NOT A FORMULA PER SAMPLE: the mapping is fixed for a given set of parameters, so it
+      is built once when a parameter changes (buildWarpTables) and then applied as a gather. That is
+      what makes the per-cook cost a single indexed read per output bin rather than a log() or pow().
+
 Tables: uint32 i0 (i1 = i0 + 1 implicit) + float weight = 8 bytes per output bin
 (was 20 bytes with size_t i0/i1). AVX2 path gathers src[i0] and src[i0+1]
 with a single index vector and blends with one FMA.
+
+THE ONE INVARIANT THE TABLES MUST KEEP: every i0 is <= n_linear_bins - 2, because both the linear
+      and the cubic kernels read src[i0 + 1] unconditionally. buildWarpTables enforces it by
+      clamping to max_i0; if you change the index computation, that clamp has to survive, or the
+      gather reads past the end of the magnitude buffer (a silent wrong answer, not a crash).
 */
 class PerceptualWarping {
 public:
     // R2C output bin count of an N-point real FFT: DC..Nyquist inclusive.
     static constexpr size_t linearBinCount(size_t fft_size) noexcept { return fft_size / 2 + 1; }
 
+    /*
+    The six scales, as monotonic forward/inverse pairs. Every one of them is only ever used as
+    "sample the scale uniformly from scale(0) to scale(fmax), then invert back to Hz" (see
+    computeTargetHzGrid). That matters more than the constants do, and it is worth being explicit
+    about because it is easy to get wrong in the other direction:
+
+      * the FIRST and LAST output frequencies are pinned exactly, whatever the constants are -
+        the bottom is inverse(forward(0)) and the top is inverse(forward(fmax)), and the inverses
+        are exact algebraic inverses of the forwards;
+      * the constants therefore control only the SHAPE of the grid in between, and cannot make the
+        axis start at the wrong frequency or stop short of fmax;
+      * the units cancel by construction (note erbRateToHz multiplies by the same 123 that
+        erbRateGlasberg divides by), so do not read these as standard-calibrated ERB numbers - they
+        are an internal parameterization whose only job is to be monotonic and smoothly invertible.
+
+    ERB is the quadratic Glasberg & Moore approximation. Bark and Mel are the usual HTK / Traunmuller
+    style mappings. Chroma is a log2 pitch-class axis in semitones relative to A4. Two of these
+    inverses have been wrong before and are pinned by tests now - see the note in barkToHz.
+    */
     static double htkHzToMel(double hz) { return 2595.0 * std::log10(1.0 + hz / 700.0); }
     static double htkMelToHz(double mel) { return 700.0 * (std::pow(10.0, mel / 2595.0) - 1.0); }
 
     static double erbRateGlasberg(double hz) { double x = hz / 123.0; return 6.230 * (x * x) + 93.390 * x + 28.520; }
+    // Solved with the quadratic formula: x = (-b + sqrt(b^2 - 4a(c - erb))) / 2a, taking the
+    // positive root because the forward function is increasing on the domain that matters (x >= 0).
     static double erbRateToHz(double erb) {
         double a = 6.230, b = 93.390, c = 28.520;
         double x = (-b + std::sqrt(std::max(0.0, b * b - 4.0 * a * (c - erb)))) / (2.0 * a);
         return x * 123.0;
     }
 
+    // Traunmuller's Bark approximation with the piecewise corrections that make it match the
+    // critical-band table at the low and high ends.
     static double hzToBark(double hz) {
         double z = (26.81 * hz) / (1960.0 + hz) - 0.53;
         if (z < 2.0) z += 0.15 * (2.0 - z);
@@ -806,7 +1262,23 @@ public:
     static double hzToChroma(double hz) { double f = std::max(1e-5, hz); return 12.0 * std::log2(f / 440.0) + 69.0; }
     static double chromaToHz(double chroma) { return 440.0 * std::pow(2.0, (chroma - 69.0) / 12.0); }
 
+    // Fills target_hz with one frequency per output bin: the grid the output axis actually has.
+    //
     // scale_code: 0 Log, 1 Mel, 2 ERB, 3 Bark, 4 Chroma, 5 Linear, 6 Mel+Log blend
+    // warp_blend: 0 = a plain linear-in-Hz axis whatever `scale_code` says, 1 = the scale's own
+    //             axis, in between = a linear crossfade of the two. This is the Warp Blend slider,
+    //             and it is why scale_code 5 (Linear) and blend 0 produce the same axis.
+    //
+    // HOW IT IS BUILT, in two steps that are worth keeping separate in your head:
+    //   1. sample the chosen scale uniformly: perceptual[i] = inverse(min + (i/(n_out-1))*(max-min)),
+    //      where min/max are the scale evaluated at 0 and at fmax. Because the inverse is the exact
+    //      algebraic inverse, perceptual[0] and perceptual[n_out-1] land exactly on the scale's own
+    //      endpoints - and for the linear-in-Hz scales that is exactly 0 and fmax.
+    //   2. crossfade with the linear grid and clamp into [0, fmax].
+    // The clamp in step 2 is what makes the last bin EXACTLY fmax for every scale and every blend,
+    // which is the property the axis-rate derivation depends on (see targetHz() below and
+    // AnalysisPipeline::updateWarp). A blend of two curves that both end at fmax cannot exceed it,
+    // but the clamp makes that a guarantee rather than an argument.
     static void computeTargetHzGrid(int scale_code, double fmax, size_t n_out, double warp_blend, double log_floor_hz,
                                     std::vector<double>& target_hz) {
         target_hz.resize(n_out);
@@ -865,12 +1337,23 @@ public:
     }
 
     // 0 = linear (2 taps), 1 = Catmull-Rom cubic (4 taps, smoother lobes -> allows a smaller FFT)
+    // Cubic costs two more gathers per output bin; it is worth it when the output grid is much
+    // finer than the FFT's linear grid, where a linear read shows the magnitude curve's corners.
+    // Any value other than 1 selects linear, so an out-of-range parameter cannot corrupt a kernel.
     void setInterpolation(int mode) noexcept { m_interp = (mode == 1) ? 1 : 0; }
     int interpolation() const noexcept { return m_interp; }
 
     // Highest linear bin index the warp reads (+ cubic look-ahead). Magnitudes above it need not be computed.
     size_t maxLinearIndex() const noexcept { return m_max_index; }
 
+    // Builds the mapping tables for one set of parameters. Called whenever the scale, axis or bin
+    // count changes - not per cook (see AnalysisPipeline::updateWarp, which caches on a key).
+    //
+    // The mapping per output bin i is: "where does target_hz[i] sit on the FFT's own grid?"
+    //     frac = target_hz[i] / nyquist * (nlin-1)     <- position in linear-bin units
+    //     i0   = floor(frac), clamped to [0, nlin-2]
+    //     w    = frac - i0, clamped to [0, 1]          <- interpolation weight toward i0+1
+    // so applying the warp is src[i0] + w*(src[i0+1] - src[i0]) - one gather pair and one FMA.
     void buildWarpTables(int scale_code, double fmax, size_t n_out, double nyquist, double warp_blend, double log_floor_hz, size_t nlin) {
         computeTargetHzGrid(scale_code, fmax, n_out, warp_blend, log_floor_hz, m_target_hz);
         m_i0.resize(n_out);
@@ -879,25 +1362,40 @@ public:
         m_max_index = 0;
         double denom = (nlin > 1) ? static_cast<double>(nlin - 1) : 1.0;
         bool is_id = (n_out == nlin);
+        // The clamp described in this class's header comment, and the reason it is not nlin-1:
+        // every kernel reads src[i0+1], so the largest usable i0 leaves one bin of headroom.
         const size_t max_i0 = (nlin >= 2) ? nlin - 2 : 0;
         for (size_t i = 0; i < n_out; ++i) {
             double frac = (nyquist > 0.0) ? (m_target_hz[i] / nyquist) * denom : 0.0;
             // Snap positions that are an integer up to rounding noise, so an exact 1:1 grid
             // (Linear scale with bins == linear bins) is detected as identity (memcpy bypass).
+            // Without it, a value computed as 2047.9999999998 would floor to 2047 with w = 1.0,
+            // which is the same answer but would fail the is_id test below and cost a full gather
+            // pass for a grid that is bit-identical to the input.
             double rounded = std::round(frac);
             if (std::abs(frac - rounded) < 1e-6) frac = rounded;
             size_t i0_val = static_cast<size_t>(std::max(0.0, std::min(static_cast<double>(max_i0), std::floor(frac))));
             float weight = static_cast<float>(std::clamp(frac - static_cast<double>(i0_val), 0.0, 1.0));
             m_i0[i] = static_cast<uint32_t>(i0_val);
             m_w[i] = weight;
+            // How far up the linear grid this output bin reaches. +2 rather than +1 because the
+            // cubic kernel reads one bin further ahead (src[i0+2]); for the linear kernel it asks
+            // for one bin more than it needs, which only costs a little extra magnitude work in the
+            // FFT stage and is why maxLinearIndex() is described as a bound, not an exact count.
             m_max_index = std::max(m_max_index, std::min(nlin - 1, i0_val + 2));
             // identity iff every output bin samples exactly linear bin i (the last bin is
-            // represented as i0 = nlin-2 with weight 1.0 because of the clamp above)
+            // represented as i0 = nlin-2 with weight 1.0 because of the clamp above).
+            // i0_val + weight is the effective sampled position, so this test is exact for both the
+            // clamped last bin and the unclamped middle ones.
             if (is_id && std::abs((static_cast<double>(i0_val) + weight) - static_cast<double>(i)) > 1e-5) is_id = false;
         }
         m_is_identity = is_id;
     }
 
+    // Fills output_spectrum (resized to the table length) with the warped magnitudes.
+    // The identity case is a memcpy, which is not a micro-optimization: it is the exact path a
+    // whole-FFT linear grid takes, and it is what guarantees that configuration's output is
+    // bit-identical to the FFT's own bins rather than a resampled approximation of them.
     inline void applyWarp(const AlignedVector& linear_magnitude, AlignedVector& output_spectrum) const noexcept {
         size_t n_out = m_i0.size();
         if (output_spectrum.size() != n_out) output_spectrum.resize(n_out);
@@ -912,11 +1410,19 @@ public:
         const float* w_ptr = m_w.data();
         size_t i = 0;
         if (m_interp == 1) {
+            // Cubic handles its own tail and its own fallback; it never falls through to the loop below.
             applyWarpCubic(src, dst, idx, w_ptr, n_out, linear_magnitude.size());
             return;
         }
 #if defined(__AVX2__)
         // Guard: gathers index src[i0+1]; tables guarantee i0 <= nlin-2 <= src.size()-2.
+        // The size test is a belt-and-braces check on that table invariant, not a data-dependent
+        // branch: when it fails (only possible if the caller hands in a shorter magnitude array)
+        // the vector block is skipped and the scalar tail below - which reads src[i0] and src[i0+1]
+        // unconditionally too - is what actually runs. So the guard does not make that case safe;
+        // callers must still pass at least m_nlin magnitudes. What it does guarantee is that the
+        // SIMD path never gathers out of bounds, keeping a caller bug a scalar read rather than a
+        // fault inside a vector instruction where the cause is far harder to see.
         if (linear_magnitude.size() >= m_nlin) {
             for (; i + 7 < n_out; i += 8) {
                 __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
@@ -927,6 +1433,9 @@ public:
             }
         }
 #endif
+        // Scalar tail: handles a non-AVX2 build entirely, and the last <8 bins otherwise.
+        // Same formula as the vector block and deliberately written in the same order
+        // (v0 + w * (v1 - v0)) so a build with and without AVX2 agrees to the last bit.
         for (; i < n_out; ++i) {
             size_t i0 = idx[i];
             float w = w_ptr[i];
@@ -934,9 +1443,30 @@ public:
         }
     }
 
-    // Catmull-Rom: v = 0.5*(2p1 + (-p0+p2)t + (2p0-5p1+4p2-p3)t^2 + (-p0+3p1-3p2+p3)t^3), clamped >= 0
+    // Catmull-Rom cubic interpolation - the smoother kernel, selected by setInterpolation(1).
+    //
+    // WHAT: reads four neighbouring linear bins around each output bin and evaluates the
+    // Catmull-Rom polynomial at the fractional position w. It is a pass-through at integer
+    // positions (w = 0 returns p1 exactly), so it degrades to the linear kernel's answer when the
+    // grid happens to line up, and only changes the shape in between.
+    //
+    // WHY IT EXISTS: with only two taps the warped spectrum shows a straight-line segment between
+    // every pair of linear bins, which reads as visible corners on a log axis where the low bins
+    // are stretched far apart. Four taps round those corners off, which is what allows a smaller
+    // FFT to be used for a given visual smoothness - the trade is two extra gathers per bin.
+    //
+    // WHAT TO CHANGE IF YOU EVER NEED TO: the four surrounding indices are clamped, not gathered
+    // with wraparound - p0 clamps up to 0 and p2/p3 clamp down to the last bin - so the two end
+    // bins interpolate against a duplicated edge sample rather than reading off the array. Any
+    // rewrite has to keep that clamping, because the tables only guarantee i0 <= nlin-2 and the
+    // cubic needs i0-1 and i0+2 as well. The vectorized body is untested by construction against
+    // the scalar one except through the vectorization tests; keep both in the polynomial form
+    // written out in the line comment below, and keep the final max(0, v) (a cubic overshoot at
+    // a spectral peak would otherwise put a negative magnitude into the dB path).
     void applyWarpCubic(const float* __restrict src, float* __restrict dst, const uint32_t* __restrict idx,
                         const float* __restrict w_ptr, size_t n_out, size_t src_size) const noexcept {
+        // Too few bins for four taps (or a magnitude array shorter than the tables expect) -
+        // fall back to the linear kernel, which the guard above has already shown is in range.
         if (src_size < 4 || src_size < m_nlin) {
             for (size_t i = 0; i < n_out; ++i) { size_t i0 = idx[i]; dst[i] = src[i0] + w_ptr[i] * (src[i0 + 1] - src[i0]); }
             return;
@@ -992,27 +1522,59 @@ public:
     the whole-FFT raw grid (fmax = sr_in/2) reports exactly sr_in, and per-bin spacing is
     sr_out / (2*(n_out-1)), which for that raw grid is sr_in/fft_size, the FFT's own resolution.
     */
+    // The three query accessors below are what the rest of the plugin reads this object through.
+    // targetHz() is the important one: it is the axis the CHOP reports the sample rate from (see the
+    // block comment above), and AnalysisPipeline::status() reads targetHz().front() for the axis
+    // bottom. isIdentity() is read to pick the memcpy bypass and to decide whether the axis is a
+    // plain linear one. outputBins() is the contract for how long the output spectrum must be.
     const std::vector<double>& targetHz() const noexcept { return m_target_hz; }
     bool isIdentity() const noexcept { return m_is_identity; }
     size_t outputBins() const noexcept { return m_i0.size(); }
 
 private:
-    std::vector<double> m_target_hz;
-    std::vector<uint32_t> m_i0;
-    std::vector<float> m_w;
-    size_t m_nlin{ 0 };
-    size_t m_max_index{ 0 };
-    int m_interp{ 0 };
-    bool m_is_identity{ false };
+    std::vector<double> m_target_hz;   // axis in Hz, one entry per output bin (kept as double: the
+                                       // rate derivation is done in double and this is its input)
+    std::vector<uint32_t> m_i0;        // source bin index of the lower tap, per output bin
+    std::vector<float> m_w;            // weight toward the upper tap, per output bin
+    size_t m_nlin{ 0 };                // source (linear) bin count the tables were built against -
+                                       // applyWarp compares the incoming magnitude size to it
+    size_t m_max_index{ 0 };           // see maxLinearIndex()
+    int m_interp{ 0 };                 // 0 linear, 1 cubic
+    bool m_is_identity{ false };       // see buildWarpTables()
 };
 
 /*
 ===========================================================================
  5. EQUAL-LOUDNESS WEIGHTING CURVES (IEC 61672 / ITU-R 468)
 ===========================================================================
+Turns the frequency axis into a per-bin gain, so that a spectrum drawn through it reads the way
+the ear hears it rather than the way a microphone measures it: a 50 Hz rumble and a 5 kHz tone at
+the same physical level stop looking equally loud, which is what makes the display useful for
+judging a mix by eye.
+
+WHAT EACH CURVE IS FOR (weighting_code):
+  0  off            no weighting - a flat multiply, and the pipeline skips the weighting stage
+  1  A-weighting    the classic "how loud does this seem" curve from IEC 61672; strongly rolls off
+                    the low end. Use it when the user is asking "is this annoying/loud?"
+  2  C-weighting    nearly flat across the audio band, gently rolled off below ~30 Hz. Use it when
+                    the user wants near-true level but without DC/rumble dominating.
+  3  ITU-R 468      the "how much does this hiss annoy" curve; its high-frequency boost makes it
+                    the right one for judging noise and codec artefacts rather than music.
+
+HOW TO CHANGE: the code is an index into the same enum the UI dropdown uses (Parameters.h,
+Weighting), and both the names and this switch have to gain a case together - the same three-place
+rule as the window types. Anything unrecognised falls through with w = 1.0, i.e. it silently
+becomes "off" rather than failing.
+
+COST: one call per axis rebuild, not per cook - the curve depends only on the frequency axis. The
+result is cached by AnalysisPipeline::updateWeighting against a key, so a change here costs one
+pass over the bins and nothing afterwards.
 */
 class EqualLoudness {
 public:
+    // Fills weights[] with one gain per entry of freqs_hz (so the two must be the same length -
+    // the function resizes weights to match rather than assuming). Every curve is a pure function
+    // of frequency: no state, no history, safe to call from any thread on its own buffers.
     // weighting_code: 0 off, 1 A, 2 C, 3 ITU-R 468
     static void computeCurve(int weighting_code, const std::vector<double>& freqs_hz, AlignedVector& weights) {
         weights.resize(freqs_hz.size());
@@ -1021,6 +1583,12 @@ public:
         // 1 kHz. So: evaluate the same response at f = 1 kHz and divide it out, which puts the curve
         // at exactly 0 dB there. f1k is f^2 at 1 kHz (1e6), because the response formulas below are
         // written in f^2 (and f^4 for A) rather than f, so 1 kHz has to arrive pre-squared to match.
+        //
+        // This normalization is what makes the curves comparable across axis lengths and why the
+        // numbers are read in the standard's own units. Do not "simplify" it away by baking a
+        // constant: the value below is the response formula evaluated at 1 kHz, deliberately, so
+        // that a typo in the formula shows up as a wrong curve in both places at once instead of
+        // hiding behind a hand-copied magic number.
         double inv_ref = 1.0;
         if (weighting_code == 1) {
             const double f1k = 1e6;
@@ -1032,19 +1600,31 @@ public:
             inv_ref = 1.0 / rc_1k;
         }
         for (size_t i = 0; i < freqs_hz.size(); ++i) {
+            // DC cannot be weighted (every formula divides by a term containing f), and a log axis
+            // starts near 20 Hz but a linear one starts at exactly 0, so the floor is load-bearing
+            // for linear axes rather than a safety net. 1e-5 Hz gives the same answer as 0 would in
+            // the limit - the curve is ~0 there either way - without a division by zero.
             double f = std::max(1e-5, freqs_hz[i]);
-            double w = 1.0;
+            double w = 1.0;   // default: unweighted, which is also the fallback for an unknown code
             if (weighting_code == 1) {
+                // IEC 61672 A-weighting: two high-pass-ish poles (20.6, 12194 Hz), one zero, and a
+                // resonance pair at 107.7 and 737.9 Hz. Written in f^2 because the whole response is
+                // even in f, which is why the numerator carries f^4.
                 double f2 = f * f;
                 double num = (12194.0 * 12194.0) * (f2 * f2);
                 double den = (f2 + 20.6 * 20.6) * std::sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) * (f2 + 12194.0 * 12194.0);
                 w = (num / std::max(1e-12, den)) * inv_ref;
             } else if (weighting_code == 2) {
+                // C-weighting: the same shape with the 107.7/737.9 resonance pair removed.
                 double f2 = f * f;
                 double num = (12194.0 * 12194.0) * f2;
                 double den = (f2 + 20.6 * 20.6) * (f2 + 12194.0 * 12194.0);
                 w = (num / std::max(1e-12, den)) * inv_ref;
             } else if (weighting_code == 3) {
+                // ITU-R 468. Unlike A and C this is given by the standard as a fitted polynomial
+                // pair (h1, h2) rather than a physical filter, so the coefficients are quoted
+                // verbatim and must not be re-derived or rounded. The result is |H|, hence the
+                // sqrt of the sum of squares.
                 double f2 = f * f, f3 = f2 * f, f4 = f2 * f2, f5 = f4 * f, f6 = f3 * f3;
                 double h1 = -4.737338981378384e-24 * f6 + 2.043828333266122e-15 * f4 - 1.363894795463638e-7 * f2 + 1.0;
                 double h2 = 1.306612257412824e-19 * f5 - 2.118150887518656e-11 * f3 + 5.559488023498642e-4 * f;
@@ -1065,6 +1645,29 @@ would give). The earlier 256-entry table was 0.034 dB.
 One gather per 8 bins: an interpolated two-gather variant measured 2x slower in the
 dB stage for no visible benefit on a display spectrum. The 8 KB table stays L1-resident.
 Table is a function-local static -> thread-safe initialisation.
+
+WHAT IT IS: 20*log10(x), computed without calling log10. A float is (exponent, mantissa), and
+log10 factors into those two parts:
+
+    20*log10(x) = 20*exponent*log10(2) + 20*log10(1 + mantissa)
+
+The first term is one multiply (the exponent field is right there in the bits, and 20*log10(2) is
+kLog10_2_Scaled). The second term depends only on the mantissa, which is in [1, 2), so it is
+tabulated: the top kTableBits bits of the mantissa index the table. No branch, no convergence loop,
+one multiply and one table read per value - which is what makes a 2048-bin dB conversion affordable
+on the cook thread.
+
+PRECONDITION: x must be a positive normal float. Zero, a denormal, a negative value, inf or NaN
+produce a meaningless number rather than crashing, because the bit trick reads whatever the exponent
+field happens to be (a zero's exponent field reads as -127, so the answer is ~-764 dB). Callers
+rely on this only after flooring: DecibelConverter applies its dB floor to the result, and every
+magnitude reaching it comes from |FFT output|^2 or |FFT output|, neither of which is negative. If
+you ever feed it a value that can be negative, take the absolute value first - do not add a sign
+test inside scaled(), that would put a branch in the hottest loop in the file.
+
+HOW TO CHANGE: kTableBits is the only knob. It costs 2^bits * 4 bytes (11 -> 8 KB, the current
+choice) and buys accuracy at half a bucket, so 12 bits halves the error for another 8 KB of L1 that
+the rest of this pipeline wants. Leave it at 11 unless a measurement says otherwise.
 */
 class FastLog10 {
 public:
@@ -1072,6 +1675,8 @@ public:
     static constexpr int kTableBits = 11;
     static constexpr int kTableSize = 1 << kTableBits;             // 2048 entries (8 KB)
 
+    // The table itself. Build once, then pass the pointer around: this is why every entry point
+    // below has an overload taking `const float* t`. See the precondition note above before use.
     static const float* dbTable() noexcept {
         static const struct Table {
             float v[kTableSize];
@@ -1089,13 +1694,17 @@ public:
     static float scaled(float x, const float* t) noexcept {
         uint32_t bits;
         std::memcpy(&bits, &x, sizeof(bits));
-        int exp = static_cast<int>((bits >> 23) & 0xFF) - 127;
-        int idx = static_cast<int>((bits >> (23 - kTableBits)) & (kTableSize - 1));
+        int exp = static_cast<int>((bits >> 23) & 0xFF) - 127;                     // unbiased exponent
+        int idx = static_cast<int>((bits >> (23 - kTableBits)) & (kTableSize - 1)); // top mantissa bits
         return exp * kLog10_2_Scaled + t[idx];
     }
+    // Convenience overload for one-off calls; in a loop use the two-argument form so the
+    // static-initialization guard is checked once instead of once per sample.
     static float scaled(float x) noexcept { return scaled(x, dbTable()); }
 
 #if defined(__AVX2__)
+    // Same computation, eight lanes at a time: exponent extraction and mantissa indexing are both
+    // pure integer ops, and the gather is the only memory access. Returns 20*log10 for each lane.
     static inline __m256 scaledVec(__m256 v, const float* t) noexcept {
         const __m256i bits = _mm256_castps_si256(v);
         const __m256i exp = _mm256_sub_epi32(_mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF)), _mm256_set1_epi32(127));
@@ -1111,8 +1720,27 @@ public:
 ===========================================================================
  6b. SIMD HELPERS (window, weighting, peak)
 ===========================================================================
+Four small array kernels used by the magnitude and display stages: multiply a window into the time
+block, multiply a weighting curve into the magnitude bins, and find the peak (with or without its
+bin index). Each is written as "vector body if AVX2 is available, scalar tail for the remainder",
+and the tail always produces the same result as the vector body would.
+
+ALIGNMENT IS THE THING TO GET RIGHT. Every `_mm256_load_ps` here (as opposed to `loadu`) requires a
+32-byte-aligned pointer, and these functions are called on the magnitude and window buffers that
+AlignedVector allocated - see AlignedAllocator at the top of this file, which is why the default
+alignment is 32 and not 16. Passing a plain std::vector<float>::data() or a subrange that is not a
+multiple of 8 floats from the start of an aligned buffer will fault, not just run slowly. The
+store side uses `storeu` everywhere, so an unaligned *output* is fine; it is the inputs that must
+be aligned.
+
+WHY THESE ARE FREE FUNCTIONS AND NOT MEMBERS: they take raw pointers and do one loop, so they can
+be called on any buffer (a window, a spectrum, a scratch copy) without the caller owning an object
+of the right type. Nothing here holds state between calls.
 */
 // dst[i] = a[i] * b[i]. a and b must be 32-byte aligned; dst may be unaligned.
+// Two vector loads and one store per 8 floats; the 16-wide loop above it is not four-way
+// unrolling for its own sake but a hint that this is the same loop the compiler would otherwise
+// have to prove non-aliasing for - hence the __restrict on all three pointers.
 inline void multiplyInto(const float* __restrict a, const float* __restrict b, float* __restrict dst, size_t len) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
@@ -1128,6 +1756,10 @@ inline void multiplyInto(const float* __restrict a, const float* __restrict b, f
 }
 
 // spectrum[i] *= curve[i] (both 32-byte aligned)
+// The in-place twin of multiplyInto, used for the weighting stage: the weighting curve is applied
+// to the spectrum buffer itself rather than to a copy, which is why the load and store are the same
+// address and why this one must not be called with a curve shorter than the spectrum - len is the
+// caller's promise that both are at least that long.
 inline void multiplyInPlace(float* __restrict spectrum, const float* __restrict curve, size_t len) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
@@ -1143,6 +1775,10 @@ inline void multiplyInPlace(float* __restrict spectrum, const float* __restrict 
 }
 
 // Maximum value (data 32-byte aligned)
+// The horizontal reduction at the end (store 8 lanes to memory, scan them) is the standard way to
+// finish a vector max; there is no cheaper instruction for it on AVX2. Called on the magnitude
+// spectrum to find the value the dB reference is taken from (AbsFS/FramePeak modes) and to drive
+// the AGC follower. Returns 0 for an empty range so a zero-length axis cannot poison the reference.
 inline float peakMagnitude(const float* __restrict data, size_t n) noexcept {
     if (n == 0) return 0.0f;
     float max_val = data[0];
@@ -1163,6 +1799,14 @@ inline float peakMagnitude(const float* __restrict data, size_t n) noexcept {
 
 // Peak value and index (data 32-byte aligned). Vector loop starts at 0 (aligned) and only
 // inspects a chunk when some lane exceeds the running max.
+//
+// WHY THE SCALAR RESCAN INSIDE THE BRANCH: finding the index of the maximum cannot be done in a
+// register - SIMD gives the value but not "which lane". So the vector loop is used purely as a
+// cheap filter (one compare and a movemask per 8 bins, and on a spectrum most chunks fail it), and
+// only a chunk that actually contains a new maximum is spilled to memory and scanned. The `>`
+// comparison rather than `>=` means the *first* bin wins a tie, which is what makes the reported
+// peak index stable frame to frame when two bins hold the same value - do not change it to >=.
+// peak_idx is always written (0 for an empty range), so the caller never reads a stale index.
 inline float findPeakWithIndex(const float* __restrict data, size_t n, size_t& peak_idx) noexcept {
     peak_idx = 0;
     if (n == 0) return 0.0f;
@@ -1261,24 +1905,51 @@ public:
 ===========================================================================
 attack/release are per-frame smoothing coefficients in [0, 0.99]
 (0 = follow instantly). Use coefFromMs() for frame-rate independent values.
+
+WHAT IT DOES: smooths a spectrum over time - a bin that jumps up follows the attack coefficient,
+a bin that falls follows the release one, which is what makes a display spectrum rise quickly but
+decay gracefully instead of flickering bin to bin. It is the only stage in the pipeline that keeps
+per-bin state across cooks (prev_out doubles as that state), which is why the pipeline has to
+zero it when the node is silent or the mode changes - see runChannel() in AnalysisPipeline.cpp.
+
+HOW TO READ THE COEFFICIENTS: they are "how much of the previous frame to keep", so the code below
+stores them as 1 - coefficient because the update is written as old + factor*(new - old). A value of
+0 means "follow the new value instantly"; larger means slower. Do not change the 0.99 clamp: it is
+what stops a long time constant from making the state effectively permanent (and from a dt of 0
+producing a coefficient of exactly 1, which would freeze the display forever).
+
+HOW TO CHANGE: nothing here needs touching to add a parameter - the attack/release values come from
+Parameters, and coefFromMs is the only intended way to turn a user-facing time in ms into these.
 */
 class BallisticsFilter {
 public:
     // Time constant (ms) -> per-frame coefficient for the given frame delta (ms). tau = time to reach 63%.
+    // Frame-rate independence lives here: exp(-dt/tau) gives the same decay per millisecond whether
+    // the node cooks at 30 or 120 fps, so a user-set 200 ms release means 200 ms at any frame rate.
+    // A non-positive time or delta returns 0 (no smoothing) rather than dividing by zero.
     static float coefFromMs(double time_ms, double dt_ms) noexcept {
         if (time_ms <= 0.0 || dt_ms <= 0.0) return 0.0f;
         return static_cast<float>(std::clamp(std::exp(-dt_ms / time_ms), 0.0, 0.999));
     }
 
+    // One frame of smoothing: prev_out is both the previous state and the output.
+    // The first line handles the two cases where there is nothing to smooth from: a size change
+    // (the state belongs to a different axis, so it is discarded and restarted at the new value)
+    // and both coefficients zero (the caller turned the filter off, so the copy is the result).
+    // Note this function only makes sense with both arrays the same length and 32-byte aligned.
     inline void apply(float attack, float release, const AlignedVector& current, AlignedVector& prev_out) noexcept {
         size_t n = current.size();
         if (prev_out.size() != n || (attack <= 0.0f && release <= 0.0f)) { prev_out = current; return; }
         float att_factor = 1.0f - std::clamp(attack, 0.0f, 0.999f);
         float rel_factor = 1.0f - std::clamp(release, 0.0f, 0.999f);
         const float* src = current.data();
-        float* dst = prev_out.data();
+        float* dst = prev_out.data();   // load *and* store target: this is the carried state
         size_t i = 0;
 #if defined(__AVX2__)
+        // The per-bin attack-or-release choice is a branch in the scalar code and would be a
+        // mispredicting one in SIMD (adjacent bins routinely go opposite ways), so the vector body
+        // selects the coefficient with blendv on a sign-agnostic "is the new value higher" compare
+        // instead. Same arithmetic, no branch. The scalar tail below keeps the if/else form.
         const __m256 v_att = _mm256_set1_ps(att_factor);
         const __m256 v_rel = _mm256_set1_ps(rel_factor);
         const __m256 v_zero = _mm256_setzero_ps();
@@ -1298,6 +1969,8 @@ public:
             _mm256_store_ps(dst + i, _mm256_fmadd_ps(f, diff, d));
         }
 #endif
+        // Scalar tail - also the whole implementation on a non-AVX2 build. Note that a diff of
+        // exactly 0 takes the release branch, matching the vector body's strict > comparison.
         for (; i < n; ++i) {
             float diff = src[i] - dst[i];
             dst[i] += ((diff > 0.0f) ? att_factor : rel_factor) * diff;
@@ -1309,7 +1982,40 @@ public:
 ===========================================================================
  8. FFT ENGINE INTERFACE & AVX2 MAGNITUDE
 ===========================================================================
+Two things live here: the abstract interface the pipeline talks to (IFFTEngine), and the SIMD
+kernel that turns FFTW's complex output into the magnitude bins everything downstream works on.
+
+WHY AN INTERFACE AT ALL: the pipeline needs exactly four operations - build a plan, run a
+transform, report what the plan is, and report whether a plan exists. Everything about *which*
+library performs the transform (the vendored FFTW3 build, or Intel oneMKL's FFTW3-compatible
+interface) sits behind this interface, so the pipeline never names either one and the backend
+choice stays a runtime parameter. If a third backend is ever added, it is a new implementation of
+this interface and nothing else in the plugin changes.
+
+The four methods are not all pure virtual on purpose: pollBackgroundPlan, setBackgroundAllowed and
+backendReport have safe no-op defaults, so an engine that has no background planning, no library
+and no report does not have to write three empty overrides to compile.
 */
+
+// How much effort the FFTW planner is allowed to spend, in increasing order of cost and speed.
+// The UI dropdown maps onto these four (Parameters.h, FFT Plan) - keep the two in step.
+//
+// Auto is the default and the one to understand: it never makes the user wait. The first plan for a
+// size is built cheaply (from wisdom if present, otherwise FFTW_ESTIMATE), the node starts running
+// immediately, and a background thread then re-plans the same size with FFTW_MEASURE and swaps the
+// better plan in when it is ready - see startBackgroundMeasure/pollBackgroundPlan below.
+//
+// Patient is the same shape with FFTW_PATIENT as the upgrade target: a few percent faster at
+// execute time for seconds spent planning, once per size per machine (the result is written to
+// wisdom, so it is a first-run cost only).
+//
+// Measured and Fast both block that background upgrade: Measured by doing the expensive plan
+// synchronously up front, Fast by never planning expensively at all. Fast is what you want when
+// the node must not stall under any circumstance and the transform is not the bottleneck.
+//
+// IF YOU ARE NOT SURE WHICH TO PICK: Auto. It is the only one that is both fast on the first frame
+// and optimal on every frame after, and it degrades gracefully when Async is off - it reports the
+// deferred upgrade in the plan status instead of silently measuring on the cook thread.
 enum class PlannerPolicy : int {
     Auto = 0,     // instant plan (wisdom or ESTIMATE), FFTW_MEASURE upgraded on a background thread
     Fast = 1,     // ESTIMATE always
@@ -1317,20 +2023,44 @@ enum class PlannerPolicy : int {
     Patient = 3,  // like Auto but the background upgrade is FFTW_PATIENT (~10 % faster execute, seconds of planning once per size)
 };
 
+/*
+The contract every FFT backend must satisfy. An implementation owns one plan for one FFT size for
+one backend library; changing any of those means calling prepare() again.
+
+THREADING CONTRACT (important, and the reason the signatures look the way they do):
+  - prepare() is called from the cooking thread (or from the pipeline's rebuild path) and may
+    block, because planning may be expensive. It is not callable concurrently with itself.
+  - executeRFFT() is const and must be callable from the worker thread *concurrently with* a cook
+    on the main thread, which is why it takes its scratch buffer as an argument instead of hiding
+    one in the object, and why it is marked noexcept: an allocation or throw on the analysis thread
+    would be unrecoverable there. All output buffers must be pre-sized by the caller for the same
+    reason.
+  - pollBackgroundPlan() and setBackgroundAllowed() are called once per cook, on the cooking thread,
+    before any executeRFFT for that cook - so they never race with the background planner's own
+    bookkeeping (the plan swap itself is what the engine locks internally).
+*/
 class IFFTEngine {
 public:
     virtual ~IFFTEngine() = default;
+    // Build (or rebuild) the plan for the given size and policy. `log` may be null; it is where plan
+    // progress and the resulting plan's description are recorded for the Info DAT.
     // backend: which FFTW3-ABI library to plan against (see FftBackend.h). nullptr keeps whatever
     // backend is already selected, or the default when there is none. The library is loaded on first
     // use and kept for the process lifetime, so switching back and forth only re-plans.
     virtual void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log,
                          const FftBackendInfo* backend = nullptr) = 0;
+    // Transform `padded_signal` (fft_size real samples, windowed, zero-padded) and write magnitudes.
     // n_mag: how many magnitude bins the caller will read (0 = all N/2+1). It is a lower bound on
     // what gets written, not an exact count: the AVX2 kernel works in 16-bin blocks, so an
     // implementation is free to produce up to 15 bins more than asked (see the FFTW override). The
     // magnitude_spectrum vector is always sized N/2+1 regardless.
+    // scratch_complex is passed in, not owned, because the caller allocates it once outside the
+    // real-time path - see the threading contract above.
     virtual void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
                              AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept = 0;
+    // Human-readable description of the live plan (which algorithm FFTW chose, whether it is
+    // measured or estimated, its cost estimate). This is the Info DAT's plan line; it is built on
+    // demand, never per cook.
     virtual std::string getPlanStatus() const = 0;
     virtual size_t fftSize() const noexcept = 0;
     // True if a valid plan is ready to execute (i.e. prepare() produced m_plan). Lets the pipeline
@@ -1350,6 +2080,26 @@ public:
 };
 
 // |X| for n_complex interleaved complex floats (raw_c and mptr 32-byte aligned).
+//
+// WHAT IT DOES: FFTW's real-to-complex output is n_complex pairs of (re, im) floats, and everything
+// downstream (warping, weighting, dB, ballistics) works on magnitudes, so this is the one place the
+// complex data is turned into a real spectrum. The interesting part is that it does the conversion
+// *in the interleaved layout it arrives in*, rather than de-interleaving first.
+//
+// HOW: two loads of 8 floats cover 4 complex values each; _mm256_shuffle_ps pulls the real parts
+// out of both loads into one register and the imaginary parts into another; one FMA forms re^2+im^2
+// and the sqrt finishes it. The lane reordering described at reorderLanes below is the price of
+// that shuffle trick, and it is cheaper than the alternative.
+//
+// WHY THE RECIPROCAL SQUARE ROOT: rsqrt + one Newton-Raphson step is accurate to ~23 bits (i.e. to
+// within a float's representable precision) at about half the latency of a hardware sqrt. This runs
+// once per bin per cook, so it is worth the two extra instructions. The 1e-30 floor inside it keeps
+// a zero bin from producing infinity through the reciprocal - the floor is far below any magnitude
+// that survives to the dB stage, so it never changes a displayed value.
+//
+// The scalar tail is the whole implementation on a non-AVX2 build and uses std::sqrt there; the two
+// paths agree to float precision but not bit-for-bit, which is why the vectorization tests compare
+// with a tolerance rather than for equality.
 inline void computeMagnitudeAVX2_FMA(const float* __restrict raw_c, float* __restrict mptr, size_t n_complex) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
@@ -1413,6 +2163,37 @@ support is described as such in the log instead of quietly re-planning every run
 The FFTW planner is not thread-safe: every call that creates or destroys a plan is guarded by a
 process-wide mutex, which also covers a second FFT CHOP in the same project. Executing a plan on
 distinct arrays is thread-safe and is not guarded.
+
+---------------------------------------------------------------------------
+HOW TO READ THIS CLASS (the IFFTEngine implementation for both FFTW3 libraries)
+---------------------------------------------------------------------------
+It owns exactly one thing that matters: m_plan, a transform plan for one FFT size, built by one
+library. Everything else in the class exists to answer "when is it safe to build, replace, or
+destroy that plan?" - which is the whole difficulty here, because the plan is created lazily, may
+be upgraded by a background thread, and is destroyed by a library that may not be the one the node
+is currently pointed at.
+
+The three states a caller can observe:
+  1. No plan yet (hasPlan() false) - prepare() has not run, or it failed. The pipeline turns this
+     into getErrorString() rather than cooking zeros.
+  2. A usable plan (hasPlan() true) - executeRFFT() runs it. This plan may be an ESTIMATE one that
+     is about to be replaced: replacing it does not interrupt execution.
+  3. A background measurement in flight (upgradeInProgress() true) - pollBackgroundPlan() picks up
+     the result on a later cook. Nothing blocks while this runs.
+
+The four entry points that touch the plan, and who calls them:
+  prepare()             - the cooking thread, from the pipeline's rebuild path
+  executeRFFT()         - the analysis worker thread, concurrently with a cook
+  pollBackgroundPlan()  - the cooking thread, once per cook, before any executeRFFT
+  setBackgroundAllowed()- the cooking thread, once per cook, before pollBackgroundPlan
+That ordering is the engine's whole thread-safety argument: the two plan-mutating calls are
+strictly serialized on the cook thread and never run while a channel is executing, so only the
+background planner thread needs the mutex, and only around its own plan creation.
+
+MEMBERS, in the order they are declared at the bottom of the class:
+  m_backend / m_plan / m_fft_size / m_policy / m_planStatus / m_log  - the live plan and its owner
+  m_bg_*                            - the background measurement's state and its result slot
+  m_bg_allowed / m_wants_upgrade    - the Async-toggle bookkeeping (see setBackgroundAllowed)
 */
 class FFTWEngine : public IFFTEngine {
 public:
@@ -1424,11 +2205,26 @@ public:
     FFTWEngine(const FFTWEngine&) = delete;
     FFTWEngine& operator=(const FFTWEngine&) = delete;
 
+    // The process-wide planner lock. Every plan creation and destruction takes it, because the FFTW
+    // planner keeps process-global state (it is the same lock whichever engine or node asked, and
+    // whichever library is in use). Executing a plan does NOT take it - that is thread-safe as long
+    // as the arrays differ, which is what lets the analysis worker run while a cook plans something.
     static std::mutex& plannerMutex() { static std::mutex m; return m; }
 
     // Optional override of the wisdom file location (tests, portable installs). Empty = default.
+    // A function-local static rather than a global so it exists exactly once across the plugin,
+    // tests and bench translation units; the tests use it to point at a scratch file instead of
+    // letting a test run overwrite the user's real wisdom cache.
     static std::string& wisdomPathOverride() { static std::string s; return s; }
 
+    // Where the wisdom file lives by default: %LOCALAPPDATA%\TD_Custom_FFT\fftwf_wisdom.txt.
+    // WHY LOCALAPPDATA AND NOT THE PLUGIN FOLDER: wisdom is a cache of measured plans for *this*
+    // machine's CPU, and it is written by a background thread that may not have write access to the
+    // installed plugin directory (a user-level Documents install does, Program Files does not).
+    // LOCALAPPDATA is per-user and always writable; TEMP is the fallback if it is unset, and an
+    // empty string means "no wisdom" - every caller below treats empty as "do not touch a file"
+    // rather than trying to open a nameless path.
+    // The directory is created here, on first call, so no separate setup step is needed.
     static std::string wisdomPath() {
         if (!wisdomPathOverride().empty()) return wisdomPathOverride();
 #ifdef _WIN32
@@ -1498,6 +2294,10 @@ public:
         return ok[slot];
     }
 
+    // Writes the current planner state to the wisdom file. Called after every successful MEASURE or
+    // PATIENT plan (including the background one), so the expensive measurement is paid at most once
+    // per size per machine. Not called for ESTIMATE plans - an estimate carries no measured
+    // information worth saving, and writing one would put a file on disk for no benefit.
     void exportWisdom(const FftApi& api) {
         if (!api.hasWisdom()) return;
         std::string path = wisdomPathFor(m_backend.info ? *m_backend.info : defaultBackend());
@@ -1510,6 +2310,15 @@ public:
 
     std::string backendReport() const override { return describeBackend(m_backend); }
 
+    // Destroys the live plan and resets the size/status. Safe to call repeatedly and on a node that
+    // never had a plan. It joins the background thread first: a measurement in flight holds a
+    // separate plan that must not be left running when the engine goes away, and FFTW's planner
+    // state must not be torn down underneath it.
+    //
+    // The destroy call goes through the *backend table*, not the library directly, because a plan
+    // must be destroyed by the library that created it. That is also why the state is reset to
+    // "Uninitialized" with the current tag rather than cleared to empty: getPlanStatus() must always
+    // return something readable, including between a backend switch and the next prepare().
     void destroyPlan() noexcept {
         joinBackground();
         if (m_plan) {
@@ -1522,6 +2331,9 @@ public:
         m_planStatus = std::string(tag()) + " (Uninitialized)";
     }
 
+    // One line for the Info DAT's plan row: backend tag plus whichever "used" string prepare() or
+    // pollBackgroundPlan() last set. Never empty, so the row never reads as a blank field when there
+    // is simply no plan yet.
     std::string getPlanStatus() const override {
         return m_planStatus.empty() ? (std::string(tag()) + " (Uninitialized)") : m_planStatus;
     }
@@ -1530,6 +2342,9 @@ public:
     // can fail to create one (rare), in which case the pipeline must surface the failure rather than
     // silently cooking zeros.
     bool hasPlan() const noexcept override { return m_plan != nullptr; }
+    // True while the background measurement is running. Read by the Info DAT to show an upgrade in
+    // progress; it is an atomic load precisely because the reader is the cook thread and the writer
+    // is the planner thread.
     bool upgradeInProgress() const noexcept { return m_bg_running.load(); }
 
     /*
@@ -1708,13 +2523,33 @@ public:
         }
     }
 
+    // Transforms one already-windowed block and writes its magnitudes. Called once per channel per
+    // cook, on the analysis worker thread, while the cook thread may be doing anything else.
+    //
+    // WHAT IT GUARANTEES ABOUT ITS OUTPUT SIZE: magnitude_spectrum is always sized n/2+1 (the full
+    // real-to-complex bin count) so the caller's buffers never change size mid-run - a resize here
+    // would be an allocation on the real-time path. n_mag then limits how much of it is actually
+    // computed; see the round-up note below.
+    //
+    // THE ZERO-FILL BRANCH is the "there is no plan" case, and it is deliberate rather than an
+    // error return: this function is noexcept and runs off the cook thread, so it cannot throw or
+    // log. Writing zeros keeps every downstream stage working on a well-formed array (the pipeline
+    // reports the missing plan through hasPlan() separately), which is far easier to reason about
+    // than a half-written buffer.
     void executeRFFT(const AlignedVector& padded_signal, AlignedVector& magnitude_spectrum,
                      AlignedComplexVector& scratch_complex, size_t n_mag = 0) const noexcept override {
         size_t n = padded_signal.size();
         size_t n_complex = n / 2 + 1;
         if (magnitude_spectrum.size() != n_complex) magnitude_spectrum.resize(n_complex);
         if (scratch_complex.size() != n_complex) scratch_complex.resize(n_complex);
+        // The size check against m_fft_size is not redundant with hasPlan(): a plan built for a
+        // different N would be executed on the wrong-length buffer, and FFTW would read past it.
+        // This can only happen in the window between a parameter change and the rebuild, and the
+        // zero-fill above is the correct answer for that one frame.
         if (m_plan && n == m_fft_size && m_backend.api.executeR2C) {
+            // const_cast: FFTW's r2c execution signature takes a non-const input pointer, but with
+            // FFTW_ESTIMATE/MEASURE plans and no FFTW_PRESERVE_INPUT flag the input array is only
+            // read. This is the documented FFTW contract, not a shortcut around it.
             float* in_ptr = const_cast<float*>(padded_signal.data());
             fftwf_complex* out_ptr = reinterpret_cast<fftwf_complex*>(scratch_complex.data());
             m_backend.api.executeR2C(m_plan, in_ptr, out_ptr);
@@ -1829,6 +2664,16 @@ public:
     }
 
 private:
+    // Blocks until the background measurement thread has finished, then disposes of any plan it
+    // produced but nobody collected (a size change, a backend switch, or engine teardown). Called
+    // from destroyPlan, from pollBackgroundPlan when a swap or a discard happens, and from
+    // startBackgroundMeasure before starting a new one, so there is never more than one alive.
+    //
+    // The join is wrapped in try/catch because a join can throw (a self-join, or a thread that was
+    // somehow already joined); a throw here during teardown would be worse than ignoring it, and
+    // there is nothing sensible to report - this runs in destructors. m_bg_api is the *copy* of the
+    // backend table taken when the thread started, so the leftover plan is destroyed by the library
+    // that made it even if the node has since switched backends.
     void joinBackground() noexcept {
         if (m_bg_thread.joinable()) {
             try { m_bg_thread.join(); } catch (...) {}
@@ -1843,20 +2688,27 @@ private:
         m_bg_running = false;
     }
 
+    // ---- the live plan ----------------------------------------------------
     FftBackend m_backend;                  // active library; loaded once per process and cached
-    fftwf_plan m_plan{ nullptr };
-    size_t m_fft_size{ 0 };
-    PlannerPolicy m_policy{ PlannerPolicy::Auto };
+    fftwf_plan m_plan{ nullptr };          // owned by m_backend's library; see destroyPlan()
+    size_t m_fft_size{ 0 };                // N the plan was built for; 0 = no plan
+    PlannerPolicy m_policy{ PlannerPolicy::Auto };  // the policy m_plan was built under (part of the
+                                           // prepare() early-out key, so changing policy re-plans)
     std::string m_planStatus;              // empty = not prepared yet; getPlanStatus() names the tag
-    PlanLog* m_log{ nullptr };
+    PlanLog* m_log{ nullptr };             // not owned; the node's log, used for plan messages
 
+    // ---- the background measurement ---------------------------------------
+    // The plan is handed back through an atomic pointer rather than a mutex-protected member,
+    // because the cook thread polls it once per cook and must never wait on the planner thread.
+    // The thread itself is joined only at the points listed on joinBackground().
     std::thread m_bg_thread;
     std::atomic<fftwf_plan> m_bg_plan{ nullptr };
     std::atomic<bool> m_bg_running{ false };
     FftApi m_bg_api;                       // the library m_bg_plan was created by
-    size_t m_bg_size{ 0 };
-    unsigned m_bg_rigor{ FFTW_MEASURE };
-    double m_bg_ms{ 0.0 };
+    size_t m_bg_size{ 0 };                 // N the background thread was asked to plan for
+    unsigned m_bg_rigor{ FFTW_MEASURE };   // FFTW_MEASURE or FFTW_PATIENT - which upgrade is wanted,
+                                           // carried from prepare() through to the status string
+    double m_bg_ms{ 0.0 };                 // how long the background measurement took, for the log
     // The node's Async state, as last delivered by setBackgroundAllowed(). Starts true: the engine may
     // be driven by a caller (the headless tests and the bench) that never says otherwise, and those
     // want the background upgrade. See setBackgroundAllowed() for the full contract.
@@ -1869,3 +2721,11 @@ private:
 } // namespace FFTDSP
 
 #endif // DSP_MODULES_H
+
+/*
+End of DSPModules.h. Everything above is header-only (no .cpp exists for this file): the plugin,
+the test suite and the bench each compile it into their own translation unit, which is why every
+function here is inline or a class member, and why nothing in it may reference a TouchDesigner type.
+If you are looking for the code that drives this pipeline per cook, that is FFT.cpp;
+for the per-channel order of stages, AnalysisPipeline.cpp; for the parameters, Parameters.h/.cpp.
+*/
