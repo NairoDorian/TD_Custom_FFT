@@ -570,6 +570,93 @@ static void test_v23_helpers()
 }
 
 // ------------------------------------------------------------------------------------------
+// PlanLog::snapshotTail() / version() - the two accessors the info callbacks use to avoid
+// re-copying the whole history per cook. The property that matters is not "it is fast" but "it
+// returns exactly what snapshot() would have returned, minus the entries nobody reads": the popup
+// renders those lines, so a tail that disagreed with the full snapshot would silently change what
+// the middle-click shows.
+// ------------------------------------------------------------------------------------------
+static void test_plan_log_tail()
+{
+    section("PlanLog snapshotTail / version");
+
+    PlanLog log;
+    std::vector<std::string> full, tail;
+
+    // Empty history: both accessors agree, and asking for more than exists is not an error.
+    CHECK(log.version() == 0);
+    log.snapshotTail(3, tail);
+    CHECK(tail.empty());
+    log.snapshotTail(0, tail);
+    CHECK(tail.empty());
+
+    // version() must track the content, not the calls. setDeferred / flushToTextport / size do not
+    // change the history, so they must not move it - that is the whole basis for caching on it.
+    const uint64_t v0 = log.version();
+    log.setDeferred(true);
+    log.flushToTextport();
+    log.size();
+    CHECK(log.version() == v0);
+
+    log.log("one", false);
+    CHECK(log.version() != v0);
+    const uint64_t v1 = log.version();
+    log.log("two", false);
+    CHECK(log.version() != v1);
+
+    // tail for n < size: the last n, newest last
+    log.log("three", false);
+    log.log("four", false);
+    log.snapshotTail(3, tail);
+    CHECK(tail.size() == 3);
+    CHECK(tail[0] == "two");
+    CHECK(tail[1] == "three");
+    CHECK(tail[2] == "four");
+
+    // n >= size: the whole history
+    log.snapshotTail(99, tail);
+    CHECK(tail.size() == 4);
+    CHECK(tail.front() == "one");
+    CHECK(tail.back() == "four");
+
+    // The equivalence that protects the popup: for every n, the tail is exactly the last n entries of
+    // the full snapshot.
+    full = log.snapshot();
+    for (size_t n = 0; n <= full.size() + 2; ++n) {
+        log.snapshotTail(n, tail);
+        const size_t expect = n < full.size() ? n : full.size();
+        CHECK(tail.size() == expect);
+        for (size_t i = 0; i < expect; ++i)
+            CHECK(tail[i] == full[full.size() - expect + i]);
+    }
+
+    // The case the change is actually about: a log at its cap. log() truncates by half once the history
+    // reaches kMaxPlanLogEntries, so the tail is read off a history that just lost its older half - the
+    // one moment where a tail and a full snapshot could plausibly disagree.
+    PlanLog big;
+    const size_t cap = FFTDSP::kMaxPlanLogEntries;
+    for (size_t i = 0; i < cap + 40; ++i)
+        big.log("entry_" + std::to_string(i), false);
+    CHECK(big.size() <= cap);
+    std::vector<std::string> bigFull, bigTail;
+    bigFull = big.snapshot();
+    big.snapshotTail(3, bigTail);
+    CHECK(bigTail.size() == 3);
+    CHECK(bigTail[0] == bigFull[bigFull.size() - 3]);
+    CHECK(bigTail[1] == bigFull[bigFull.size() - 2]);
+    CHECK(bigTail[2] == bigFull[bigFull.size() - 1]);
+    // ...and the newest entry is still the one just logged, truncation or not
+    CHECK(bigTail[2] == "entry_" + std::to_string(cap + 39));
+
+    // clear() is a content change, so the version moves and the tail goes empty.
+    const uint64_t v2 = big.version();
+    big.clear();
+    CHECK(big.version() != v2);
+    big.snapshotTail(3, bigTail);
+    CHECK(bigTail.empty());
+}
+
+// ------------------------------------------------------------------------------------------
 static void test_triple_buffer_and_signal()
 {
     section("TripleBuffer / WorkerSignal (v2.4 lock-free handoff)");
@@ -1019,6 +1106,7 @@ int main()
     test_ballistics();
     test_eq_streaming();
     test_v23_helpers();
+    test_plan_log_tail();
     test_triple_buffer_and_signal();
     test_background_plan();
     test_backend_selection();

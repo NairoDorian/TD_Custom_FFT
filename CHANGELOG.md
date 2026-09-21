@@ -59,7 +59,7 @@ All notable changes to `Plugin_FFT` are documented here.
   crash used to swallow every line printed before it and look like a run that produced nothing. `fft_tests` and
   `fft_bench` now lose nothing, and the last line printed is the crash site. This was added after exactly that
   happened: a `STATUS_HEAP_CORRUPTION` abort with zero output that a clean rebuild then did not reproduce.
-- Tests: **547 checks** (was 493) - backend selection producing the same transform to float precision on both
+- Tests: **593 checks** (was 493) - backend selection producing the same transform to float precision on both
   libraries and surviving six switches in one engine, the OpenMP check, and the Async single-thread contract.
 
 ### Fixed
@@ -101,7 +101,7 @@ All notable changes to `Plugin_FFT` are documented here.
   reported in the `info_callback_calls` Info DAT row (row 19, ahead of the plan log), together with the popup's last
   character count and the largest cook gap, so the diagnostic needs no textport and - the point of moving it - no
   presence in the popup string at all.
-- **The popup string no longer carries diagnostics of its own, and the instrumentation line is back to every 300.**
+- **The popup string no longer carries diagnostics of its own, and the instrumentation line is gone entirely.**
   Two changes made in `7b419b5` are undone here, together, because they landed together and both reverted cleanly.
   It had cut the entry line from calls 1, 2 and every 300th down to **once per load**, and it had added two lines to
   the popup text itself - `Info callbacks entered: popup N, Info CHOP N, Info DAT N` and `Cook stall: largest gap
@@ -109,11 +109,13 @@ All notable changes to `Plugin_FFT` are documented here.
   string content is where the break was; **which of the two changes caused it is not separated**, and does not need
   to be, because the durable rule is now this: a diagnostic must never be able to change what it measures. Both
   values live in the `info_callback_calls` Info DAT row, which TouchDesigner reads as a value rather than rendering
-  as the popup, so whatever the popup does with its text cannot move that number. The periodic line is restored to
-  the cadence this harness had when the popup was last observed full - one line per 300 cooks, about one every 5 s
-  at 60 fps, carrying the call index, the node's cook count, and the character count handed to TouchDesigner. It is
-  more log noise than a one-shot line, and it is the only thing that separates "TD never entered the callback" from
-  "TD entered it and nothing rendered", which are the two remaining explanations and need opposite fixes.
+  as the popup, so whatever the popup does with its text cannot move that number.
+  The textport line was restored to one-per-300 cooks in this same release, and then **removed outright** once its
+  two facts (the call count and the character count handed over) were readable from that same Info DAT row: with
+  the row carrying both, a print on the real-time info path buys nothing and costs a buffered string per
+  announcement. The question it existed to answer - "is TouchDesigner entering this callback at all?" - is now
+  answered by reading row 19: counters that track `cookCount` 1:1 mean the chain is entered, counters frozen while
+  the node visibly cooks mean it is not.
 - **A corrected claim, and what it means for the bullets above.** The bullet above records that "the empty popup
   really was the cooking flag". That conclusion was drawn from the counters and it was too strong: the counters
   prove TouchDesigner *enters* the info chain every cook, which is not the same as proving the popup rendered,
@@ -131,7 +133,7 @@ All notable changes to `Plugin_FFT` are documented here.
   describe: `myErrorText` is cleared by the first cook that completes, and the error string is gated on a new
   `myPipelineFailing` flag that is set on a throw and **cleared when an analysis publishes a result**. The lifetime
   count is kept and reported as the history it is. A fault that recurs re-latches on the next cook, so nothing is
-  hidden. Tested: 547 checks, 0 failures.
+  hidden. Tested: 593 checks, 0 failures.
 - **`getInfoPopupString` publishes its text once, at the end, on every path.** It had been changed to publish a
   four-line identity block first and then publish the full text again, so `setString` ran twice per call. The
   single-call form - build the whole string, set it once - is the form that was observed rendering the complete
@@ -153,6 +155,47 @@ All notable changes to `Plugin_FFT` are documented here.
   row report it: a value near 16.7 ms is one 60 fps frame, and a value in seconds says the node stopped cooking
   for that long and its information output was blank while it lasted.
 
+- **The info chain cost 60.7 µs of every cook, and now costs 0.4 µs - measured, not estimated.** This is the
+  answer to the other half of the popup report: not "the popup is empty" but *"it sometimes takes time to show up,
+  or takes several middle-clicks"*, with the DLL loaded and the FFT visibly running. The callbacks are called
+  **inside a cook**, so their cost lands on the cook thread, and TouchDesigner drives them one item at a time: 21
+  `getInfoCHOPChan` calls, 276 `getInfoDATEntries` calls, and the popup. Each of those asked for the same
+  `AnalysisPipeline::Status`, and the answer was a mutex lock plus a **by-value copy** of a struct holding two
+  `std::string`s - so ~300 lock acquisitions and ~850 heap allocations per frame, on the real-time thread, against
+  the *same* mutexes the audio worker takes when it logs a plan event. Separately, `getInfoDATSize` copied the whole
+  256-entry plan log to declare its row count and the popup copied it again to render a three-line tail: ~512 string
+  copies per frame. That is what a middle-click query walked, and it is why the delay was worse around a plan
+  rebuild than in the steady state. It also contradicted the "no allocation on the cook thread after warm-up"
+  invariant the rest of the plugin is built around. Three changes, all of them restoring a guarantee the code
+  already claimed:
+  - **`statusSnapshot()` is memoized behind a version stamp** (`myStatusPubVersion` / `myStatusReadVersion`). The
+    published copy only moves when the worker rebuilds a plan or the tables - the write side was *already* gated
+    that way; only the read side re-copied. The steady state is one acquire load and a returned reference. It now
+    returns a reference, so callers bind by reference: a by-value return would have put both string copies straight
+    back on all ~300 calls.
+  - **`PlanLog::version()` and `PlanLog::snapshotTail(n, out)`.** `version()` is bumped under the log's own mutex on
+    every mutation, so a reader can tell "the log did not change" without copying it to find out. `snapshotTail`
+    copies only the entries asked for, into a reused scratch vector, so the popup's tail costs no allocation once
+    warm. `getInfoDATSize` now re-takes its frozen view **only when the version moved**, which is the same guarantee
+    it always had - the copy is still frozen for the whole row walk - but is an integer compare in the steady state.
+  - **A `--info N` mode in `fft_bench` so the number can be re-taken rather than re-argued.** It drives the same
+    access pattern against the real `PlanLog` (the status struct is modelled locally, since the real one is reached
+    through `FFT.h` and the TouchDesigner SDK headers), and prints before/after per cook:
+
+    ```
+    info-callback access cost (298 status reads + the 276-row log view, per cook, 2000 cooks):
+      re-lock + re-copy every call       60.7 us/cook
+      memoized + version-stamped          0.4 us/cook   -99%
+      saved                              60.3 us/cook   (0.36% of a 16.7 ms frame at 60 fps)
+    ```
+
+    For scale, the analysis itself is ~88 µs/cook for one channel at the default settings, so the bookkeeping for
+    reading the node's own status was costing about as much as the DSP it reports on. **What this does not claim:**
+    that TouchDesigner's renderer was timing out. Nothing inside a plugin can observe that. What is established is
+    that a large, measured, allocation-heavy cost was removed from the path a middle-click query walks.
+  - Tests: **593 checks** (was 547) - `PlanLog` version/tail coverage, including the property that matters most for
+    the popup: for every `n`, `snapshotTail(n)` returns exactly the last `n` entries `snapshot()` would have, at the
+    history cap as well, so the displayed lines cannot silently change.
 - **The popup string was shortened, its numbers now read properly, and its length is bounded.** Three separate
   things, all in the same string:
   - **Timing figures were printed with six decimals.** `std::to_string(double)` is `%f`, so a 13 µs cook time

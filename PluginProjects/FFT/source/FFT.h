@@ -116,7 +116,11 @@ private:
 	void stopWorker();
 	void workerLoop();
 	void copyResultsToOutput(CHOP_Output* output, int numChannels);
-	AnalysisPipeline::Status statusSnapshot();
+	// The status struct, memoized. Returns a reference to a copy that is refreshed only when the published
+	// one moves on (see myStatusPubVersion). Callers must bind it by reference: TouchDesigner asks for
+	// this once per Info CHOP channel and once per Info DAT row, so a by-value return here would put the
+	// two std::string copies back on every one of those ~300 calls per cook.
+	const AnalysisPipeline::Status& statusSnapshot();
 
 	// Sample rate reported to TouchDesigner for the spectrum: bins * me.time.rate, the rate of one
 	// output vector per cook. See the definition in FFT.cpp for what it does and does not carry.
@@ -189,8 +193,25 @@ private:
 	std::atomic<double>	myDspUs{ 0.0 };
 	std::atomic<double>	myOutputSampleRate{ 0.0 };    // exact spectrum rate read off the pipeline owner's tables
 	std::mutex			myStatusMutex;                // Info callbacks <-> pipeline owner; never taken by the cook in async mode
-	AnalysisPipeline::Status myStatusCopy;
+	AnalysisPipeline::Status myStatusCopy;        // guarded by myStatusMutex; moves only on a plan rebuild
 	uint64_t			myStatusVersionSeen{ 0 };     // pipeline owner only
+	// Reader-side memo of the above. TouchDesigner calls the info-chain callbacks one channel / one row at
+	// a time - 21 Info CHOP channels plus 276 Info DAT rows plus the popup, per cook - and every one of
+	// them asks for this struct. Taking the lock and copying two std::strings each time was ~850 heap
+	// allocations per frame on the cook thread, which is both a real-time-path violation and the reason a
+	// middle-click query could take a frame or two to answer. myStatusPubVersion is bumped by the pipeline
+	// owner whenever it publishes; this thread compares it and re-copies only when it actually moved, so
+	// the steady state is one atomic load and a returned reference.
+	//
+	// myStatusRead / myStatusReadVersion are written only by the thread that calls statusSnapshot(), which
+	// is TouchDesigner's info thread - the info chain for a node is called serially within a cook.
+	std::atomic<uint64_t> myStatusPubVersion{ 0 };  // bumped under myStatusMutex when myStatusCopy is written
+	AnalysisPipeline::Status myStatusRead;
+	uint64_t			myStatusReadVersion{ 0 };
+	// False until the first copy is taken. Without it the pre-first-publish window (both counters still 0)
+	// would compare equal and be read as "the memo is current", so the popup would report an empty engine
+	// and zeros until the first plan was published.
+	bool				myStatusReadValid{ false };
 	double				myLastCookUs{ 0.0 };
 	float				myPeakFrequencyHz{ 0.0f };
 	float				myPeakMagnitude{ 0.0f };
@@ -225,6 +246,14 @@ private:
 	// same log: PlanLog::log() truncates the history by half at its cap, so reading myLog twice could see
 	// two different lengths and leave TouchDesigner walking rows the plugin never filled. Cook thread only.
 	std::vector<std::string> myInfoDatLog;
+	// Which myLog version myInfoDatLog was copied from. The log only changes when the pipeline logs a plan
+	// event, which is rare, so in the steady state this makes getInfoDATSize() an integer compare instead
+	// of a full copy of up to 256 strings every frame. The freeze above is unaffected: this decides only
+	// whether to re-take the copy, never how many rows the walk that follows sees.
+	uint64_t myInfoDatLogVersion{ 0 };
+	// Scratch for PlanLog::snapshotTail(), reused across cooks so the popup's log tail costs no allocation
+	// once it has grown to size. Cook thread only.
+	std::vector<std::string> myPopupTail;
 };
 
 #endif // FFT_H

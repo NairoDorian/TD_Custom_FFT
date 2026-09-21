@@ -5,6 +5,8 @@
 //                                   [--backend fftw3|mkl]
 //                                   [--cook N]   simulate N cooks of the operator's cook thread
 //                                                (async worker + sync) and report its cost distribution
+//                                   [--info N]   measure N cooks of the info-callback access pattern
+//                                                (the middle-click / Info CHOP / Info DAT path)
 //
 // Prints microseconds per stage per channel and the total per cook, so the real cost of
 // each parameter choice (FFT size, bins, scale, dB mode) can be measured instead of guessed.
@@ -35,9 +37,108 @@ struct Args {
     int interp = 0;            // 0 linear, 1 cubic
     double fmax = 24000.0;     // Display Max Hz (limits the magnitude bins computed)
     int cook = 0;              // > 0: also run the cook-thread simulation for this many cooks
+    int info = 0;              // > 0: also measure the info-callback access cost for this many cooks
     PlannerPolicy planner = PlannerPolicy::Auto;
     int backend = 0;           // registry index: 0 = FFTW3, 1 = oneMKL (see FftBackend.h)
 };
+
+// ---------------------------------------------------------------------------------------------
+// Info-callback access cost (--info N)
+//
+// The info chain is called *inside a cook*, so every microsecond it spends is added to the node's
+// cook time - on the same thread that just ran the analysis. TouchDesigner drives it one item at a
+// time: getNumInfoCHOPChans() then getInfoCHOPChan() per channel, getInfoDATSize() then
+// getInfoDATEntries() per row, then getInfoPopupString(). Those callbacks all ask for the same
+// status struct, and the popup also asks for the tail of the plan log. This measures the *access
+// pattern*, not the DSP: the two loops below do identical work with the same data and differ only
+// in whether each of the ~298 calls re-takes the copy, which is exactly the change being compared.
+//
+// The status struct is modelled locally rather than taken from AnalysisPipeline because the real one
+// is reached through FFT.h, which needs the TouchDesigner SDK headers. The model mirrors the only
+// property that costs anything here: two std::string members, so one copy is two allocations.
+// ---------------------------------------------------------------------------------------------
+static void infoPathBench(int cooks)
+{
+    struct StatusLike {
+        std::string plan = "FFTW3 (FFTW_MEASURE - 707.7 ms, N=32768)";
+        std::string backend = "fftw3 3.3.11-avx2 (AVX2/FMA codelets)";
+        bool planFailed{ false }, linearGrid{ true }, planUpgrading{ false };
+        size_t fftSize{ 32768 }, capacity{ 32768 }, linearBins{ 16385 }, magnitudeBins{ 16384 };
+        double axisRate{ 48000.0 }, axisBottom{ 0.0 };
+        int outputBins{ 16384 };
+    };
+
+    // The measured call counts of one info chain: 21 Info CHOP channels, 276 Info DAT rows (20 fixed
+    // + 256 plan-log rows), and the popup. Reported by the plugin's own counters, not assumed.
+    const int kChopCalls = 21, kDatRows = 276;
+    const int kStatusReads = kChopCalls + kDatRows + 1;
+    // Mirrors FFT.cpp's kTailPlanLogLines, which the popup renders. It is file-local there (the DAT
+    // rows and this bench are the only other things that read the log), so it is repeated here.
+    const size_t kTail = 3;
+
+    PlanLog log;
+    for (size_t i = 0; i < kMaxPlanLogEntries; ++i)
+        log.log("plan event " + std::to_string(i) + " - FFTW3 FFTW_MEASURE N=32768, 707.7 ms", false);
+
+    std::mutex m;
+    StatusLike published;
+    size_t sink = 0;
+
+    // --- before: every call re-locks and re-copies the status; the plan log is copied whole twice per
+    //     cook, once for the DAT rows and once more for the popup's three-line tail.
+    std::vector<std::string> datRows;                     // stands in for the myInfoDatLog member
+    auto t0 = clk::now();
+    for (int it = 0; it < cooks; ++it) {
+        size_t acc = 0;
+        for (int i = 0; i < kStatusReads; ++i) {
+            std::lock_guard<std::mutex> lock(m);
+            const StatusLike s = published;                              // by value: two allocations
+            acc += s.plan.size() + s.backend.size();
+        }
+        datRows = log.snapshot();                                        // 256 string copies
+        for (const auto& r : datRows) acc += r.size();
+        const std::vector<std::string> whole = log.snapshot();            // 256 more, to use three
+        for (size_t i = whole.size() > kTail ? whole.size() - kTail : 0; i < whole.size(); ++i)
+            acc += whole[i].size();
+        sink = acc;
+    }
+    const double us_old = std::chrono::duration<double, std::micro>(clk::now() - t0).count() / cooks;
+
+    // --- after: the status copy is memoized behind a version stamp, the DAT log copy is skipped when
+    //     the log has not moved, and the popup asks for only the entries it renders.
+    std::atomic<uint64_t> pubVersion{ 1 };
+    StatusLike memo;
+    uint64_t memoVersion = 0, datVersion = 0;
+    const uint64_t logVer = log.version();
+    std::vector<std::string> tail;
+    auto t1 = clk::now();
+    for (int it = 0; it < cooks; ++it) {
+        size_t acc = 0;
+        for (int i = 0; i < kStatusReads; ++i) {
+            if (memoVersion != pubVersion.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(m);
+                memo = published;
+                memoVersion = pubVersion.load(std::memory_order_relaxed);
+            }
+            acc += memo.plan.size() + memo.backend.size();
+        }
+        if (logVer != datVersion) { datRows = log.snapshot(); datVersion = logVer; }
+        for (const auto& r : datRows) acc += r.size();
+        log.snapshotTail(kTail, tail);
+        for (const auto& r : tail) acc += r.size();
+        sink = acc;
+    }
+    const double us_new = std::chrono::duration<double, std::micro>(clk::now() - t1).count() / cooks;
+
+    std::printf("\ninfo-callback access cost (%d status reads + the %d-row log view, per cook, %d cooks):\n",
+                kStatusReads, kDatRows, cooks);
+    std::printf("  re-lock + re-copy every call  %9.1f us/cook\n", us_old);
+    std::printf("  memoized + version-stamped    %9.1f us/cook   %+.0f%%\n", us_new, 100.0 * (us_new - us_old) / us_old);
+    std::printf("  saved                         %9.1f us/cook   (%.2f%% of a 16.7 ms frame at 60 fps)\n",
+                us_old - us_new, 100.0 * (us_old - us_new) / 16666.7);
+    std::printf("  (sink %zu - keeps both loops honest)\n", sink);
+}
+
 
 // ------------------------------------------------------------------------------------------
 // Cook-thread simulation: exactly the work FFT::executeImpl does per cook with Async on
@@ -202,6 +303,7 @@ static Args parse(int argc, char** argv)
         else if (k == "--interp") a.interp = std::atoi(v);
         else if (k == "--fmax") a.fmax = std::atof(v);
         else if (k == "--cook") a.cook = std::atoi(v);
+        else if (k == "--info") a.info = std::atoi(v);
         else if (k == "--planner") {
             std::string p = v;
             a.planner = (p == "fast") ? PlannerPolicy::Fast : (p == "measured") ? PlannerPolicy::Measured
@@ -429,5 +531,6 @@ int main(int argc, char** argv)
     }
 
     if (a.cook > 0) cookThreadBench(a, engine, window, warp, n_mag, pad_start);
+    if (a.info > 0) infoPathBench(a.info);
     return 0;
 }

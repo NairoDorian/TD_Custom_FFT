@@ -71,6 +71,9 @@ const int   kMinorVersion = 9;   // keep in step with CHANGELOG.md - the v2.9.0 
 // it carries whatever the engine logged. Bounding where the unbounded input enters is what makes the total
 // bounded without the body having to truncate a number, which would be worse than a long string.
 constexpr size_t kMaxPopupChars     = 1600;
+// How many plan-log lines the popup renders. Named because two more places depend on the number: the
+// Info DAT's row count is derived from what is left after the fixed rows, and bench.cpp's --info
+// measurement mirrors this value (it is file-local here, so it is repeated there with a note).
 constexpr size_t kTailPlanLogLines  = 3;
 
 using clk = std::chrono::steady_clock;
@@ -464,6 +467,9 @@ FFT::runJob(const AnalysisJob& job)
 		std::lock_guard<std::mutex> lock(myStatusMutex);
 		myStatusCopy = myPipeline->status();
 		myStatusVersionSeen = ver;
+		// Release, and inside the lock: a reader that observes this version is guaranteed to see the
+		// myStatusCopy written above it. Readers compare this instead of re-copying (see statusSnapshot).
+		myStatusPubVersion.fetch_add(1, std::memory_order_release);
 	}
 }
 
@@ -668,11 +674,33 @@ FFT::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved)
 // =============================================================================================
 // Info CHOP / DAT / popup / diagnostics (UI callbacks; not part of the real-time path)
 // =============================================================================================
-AnalysisPipeline::Status
+//
+// These callbacks are *called* from inside a cook, so they are the real-time path in the only sense that
+// matters here: every microsecond they spend is a microsecond added to the node's cook time, on the same
+// thread that just ran the analysis. TouchDesigner drives them one item at a time - 21 Info CHOP channels,
+// then ~276 Info DAT rows, then the popup - and each one asks for the same handful of numbers. So the
+// shape of every accessor below is "pay once per cook, then hand out references", and the reason is
+// measured rather than stylistic: the by-value version of statusSnapshot() took the mutex and copied two
+// std::string members on every one of those ~300 calls, which is ~850 heap allocations per frame. That is
+// what made a middle-click query take a frame or two to answer - and, because the same mutexes are held
+// by the audio worker around a plan-log burst, what made it need several attempts.
+const AnalysisPipeline::Status&
 FFT::statusSnapshot()
 {
-	std::lock_guard<std::mutex> lock(myStatusMutex);
-	return myStatusCopy;
+	// Fast path: the published copy has not moved since this thread last copied it, so the previous copy is
+	// still current. One acquire load, no lock, no allocation. The published copy changes only when the
+	// pipeline rebuilds its plan or its tables, which is exactly when myStatusPubVersion moves.
+	//
+	// myStatusReadValid is what covers the window before the first publish, when both version counters are
+	// still 0 and an equality test would wrongly say "already current" - leaving the popup reporting an empty
+	// engine, N = 0 and 0 magnitude bins until the first plan landed. Cheap once, wrong every frame until then.
+	if (!myStatusReadValid || myStatusReadVersion != myStatusPubVersion.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lock(myStatusMutex);
+		myStatusRead = myStatusCopy;
+		myStatusReadVersion = myStatusPubVersion.load(std::memory_order_relaxed);
+		myStatusReadValid = true;
+	}
+	return myStatusRead;
 }
 
 int32_t
@@ -688,7 +716,7 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
-	const AnalysisPipeline::Status s = statusSnapshot();
+	const AnalysisPipeline::Status& s = statusSnapshot();
 	switch (index) {
 	case 0:  chan->name->setString("execute_count");     chan->value = static_cast<float>(myExecuteCount); break;
 	case 1:  chan->name->setString("fft_size");          chan->value = static_cast<float>(s.fftSize); break;
@@ -733,7 +761,16 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 	// them. TouchDesigner only asks for the size once and then walks that many rows, so the fix is to
 	// freeze the view here and have getInfoDATEntries() read exactly this copy. The info callbacks all
 	// run on the cook thread, so the copy cannot change underneath the walk that follows it.
-	myInfoDatLog = myLog.snapshot();
+	//
+	// The freeze is only re-taken when the log actually changed. That is the same guarantee - the copy is
+	// still frozen for the whole walk - but it turns the steady state into an integer compare: this copy
+	// is up to 256 std::strings, and it was being rebuilt on every cook whether or not anything had been
+	// logged since the last one.
+	const uint64_t logVer = myLog.version();
+	if (logVer != myInfoDatLogVersion) {
+		myInfoDatLog = myLog.snapshot();
+		myInfoDatLogVersion = logVer;
+	}
 	infoSize->rows = 20 + static_cast<int32_t>(myInfoDatLog.size());
 	infoSize->cols = 2;
 	infoSize->byColumn = false;
@@ -743,7 +780,9 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 void
 FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entries, void* reserved1)
 {
-	const AnalysisPipeline::Status s = statusSnapshot();
+	// By reference: this function runs once per row (~276 times per cook) and an earlier by-value version
+	// copied two std::strings on each of those calls. See the block comment above statusSnapshot().
+	const AnalysisPipeline::Status& s = statusSnapshot();
 	const double dspUs = myDspUs.load(std::memory_order_relaxed);
 	char tempBuffer[256];
 	auto row = [&](const char* k, const std::string& v) {
@@ -869,35 +908,30 @@ FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entri
 void
 FFT::getInfoPopupString(OP_String* info, void* reserved1)
 {
-	// --- is this callback even being called? -------------------------------------------------
-	// TouchDesigner calls the whole info chain inside a cook, so an empty popup can mean either "TD
-	// never called us" (the chain broke before this callback) or "TD called us and did not render the
-	// text". Those need opposite fixes and are indistinguishable from the popup itself, so entries are
-	// announced in the textport.
-	const uint32_t popupCall = myInfoPopupCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+	// Counted, not announced: the counter is the answer to "is TouchDesigner calling this callback at all?",
+	// and it is read from the info_callback_calls Info DAT row. TouchDesigner calls the whole info chain
+	// inside a cook, so an empty popup can mean either "TD never called us" (the chain broke before this
+	// callback) or "TD called us and did not render the text" - opposite fixes, indistinguishable from the
+	// popup itself, and this counter is what tells them apart. It is deliberately not printed to the
+	// textport: this is the real-time path, and a diagnostic that prints on a cadence is noise in the
+	// stream where the plan log lives.
+	myInfoPopupCalls.fetch_add(1, std::memory_order_relaxed);
 
 	// The text is built whole and handed to TouchDesigner exactly once, at the very end of this function,
 	// on every path - see the note above the setString call for why the single call is load-bearing.
 	// Everything between here and there only appends to `text`.
 	const char* nodePath = (myNodeInfo && myNodeInfo->opPath) ? myNodeInfo->opPath : "<unknown>";
 	const char* dllPath  = (myNodeInfo && myNodeInfo->pluginPath) ? myNodeInfo->pluginPath : "<unknown>";
-	// cookCount is the node's own proof that it is cooking; if it is not climbing, nothing else here is
-	// live. (That failure mode is why getGeneralInfo returns cookEveryFrame = true - see there.)
-	const uint32_t cooks = myNodeInfo ? myNodeInfo->cookCount : 0u;
 	std::string text = std::string("Node: ") + nodePath + " (" + kOpType + ", CHOP)\n";
 	text += "Plugin: TouchDesigner Custom FFT v" + std::to_string(kMajorVersion) + "." + std::to_string(kMinorVersion) + "\n";
 	text += std::string("Binary: ") + dllPath + "\n";
 	text += std::string("Mode: ") + (myAsyncActive ? "async worker" : "sync") + ", " + std::to_string(myAnalysisChannels) + " analysis channel(s)\n";
-	// NO DIAGNOSTIC LINES ABOVE THIS POINT THAT ARE NOT IN THE ORIGINAL. The body below is byte-for-byte
-	// the text that was verified rendering as a full middle-click popup. Two lines were briefly added here
-	// - an "Info callbacks entered" counter line and a "Cook stall" line - and the popup came up empty
-	// afterwards. Whether the text or something else is at fault is not established, but those two values
-	// are diagnostics, and a diagnostic must never be able to change what it is measuring: they now live
-	// in the Info DAT (see the info_callback_calls row), which is read as rows and columns and cannot be
-	// affected by anything about this string. This is the bisection - same content as the known-good
-	// build, so if the popup renders again the cause was in the text, and if it does not, it was not.
+	// The identity block above is the part that must survive at any cost: it is built before the try, so
+	// nothing below can leave the popup empty. It also carries the two facts that identify *which* binary
+	// is answering - the node path and the DLL path - which is the first thing to check when a popup looks
+	// wrong, because a stale second install (see README) produces exactly that.
 	try {
-		const AnalysisPipeline::Status s = statusSnapshot();
+		const AnalysisPipeline::Status& s = statusSnapshot();
 		char buf[256];
 		text += "Engine & Plan: " + s.plan + "\n";
 		text += "FFT: N = " + std::to_string(s.fftSize) + " | window " + std::to_string(s.capacity) + " samples | " + std::to_string(s.magnitudeBins) + " magnitude bins\n";
@@ -956,11 +990,15 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 		// limit is documented on OP_String::setString, so rather than guess at it, the string is held well
 		// clear of the shortest length observed to break - and the actual length is reported in the
 		// info_callback_calls Info DAT row, so if this bound is ever the thing that is wrong, it says so.
-		auto logs = myLog.snapshot();
-		const size_t start_idx = logs.size() > kTailPlanLogLines ? logs.size() - kTailPlanLogLines : 0;
-		for (size_t i = start_idx; i < logs.size(); ++i) {
-			if (text.size() + logs[i].size() + 1 > kMaxPopupChars) break;
-			text += logs[i] + "\n";
+		//
+		// snapshotTail, not snapshot: only the last kTailPlanLogLines entries are ever shown, and snapshot()
+		// copied the entire history - up to 256 strings and their allocations - to throw all but three
+		// away, on every cook. The scratch vector is reused, so once it has reached its size this costs no
+		// allocation at all.
+		myLog.snapshotTail(kTailPlanLogLines, myPopupTail);
+		for (size_t i = 0; i < myPopupTail.size(); ++i) {
+			if (text.size() + myPopupTail[i].size() + 1 > kMaxPopupChars) break;
+			text += myPopupTail[i] + "\n";
 		}
 	} catch (const std::exception& e) {
 		text += std::string("(telemetry truncated after the identity block: ") + e.what() + ")\n";
@@ -986,22 +1024,12 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 	// text is not the problem.
 	myInfoPopupLen.store(static_cast<uint32_t>(text.size()), std::memory_order_relaxed);
 
-	// --- announce this entry, on the cadence this harness had when the popup was last seen in full ---
-	// Calls 1, 2 and every 300th. The first two land immediately after a load, which is when an empty
-	// popup is the symptom being chased; the 300th is a heartbeat (one line every ~5 s at 60 fps) that
-	// answers the question that must be settled before anything else is changed: is TouchDesigner
-	// entering this callback at all? It is a flood compared to a one-shot line, but it is the exact
-	// cadence the report that triggered this fix cites by name ("#2100", "#2400"), it costs one buffered
-	// string per 300 cooks, and it is the only thing that separates "TD never called us" - which is
-	// upstream of every line of text below - from "TD called us and did not render what it was given",
-	// which is a TouchDesigner-side matter. The length is carried on the same line so one paste answers
-	// both halves: no line at all means the callback is not running, and a line with a healthy character
-	// count means a real string was handed over and nothing rendered it.
-	if (popupCall == 1 || popupCall == 2 || (popupCall % 300) == 0) {
-		myLog.log(std::string("[FFT Plugin] getInfoPopupString() called (#") + std::to_string(popupCall)
-		          + ", node cook #" + std::to_string(cooks) + ") - TD is reading this node's custom popup text ("
-		          + std::to_string(text.size()) + " chars handed over)");
-	}
+	// No textport announcement on entry any more. It existed to answer one question - "is TouchDesigner
+	// calling this callback at all?" - and that question is now answered without printing anything: the
+	// call count and the length handed over are both in the info_callback_calls Info DAT row, where they
+	// are read as values on demand. The periodic line cost a buffered string per announcement and put
+	// popup-traffic noise in the textport, which is where the plan log lives; a diagnostic belongs in the
+	// DAT precisely so it cannot be mistaken for the thing it measures.
 }
 
 void

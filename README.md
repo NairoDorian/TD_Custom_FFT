@@ -51,8 +51,8 @@ PluginProjects/FFT/
 │   ├── FftBackend.h      <-- FFT library registry + runtime loader (FFTW3 / oneMKL, no import library)
 │   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, per-channel pipeline, telemetry)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook)
-├── tests/dsp_tests.cpp   <-- headless golden-vector tests (547 checks, incl. lock-free handoff stress)
-├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --backend fftw3|mkl)
+├── tests/dsp_tests.cpp   <-- headless golden-vector tests (593 checks, incl. lock-free handoff stress)
+├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --info N, --backend fftw3|mkl)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
 └── 3rdParty/fftw3/       <-- vendored FFTW 3.3.11 AVX2 (VERSION record, header, .def/.lib, runtime DLL)
 ```
@@ -72,6 +72,7 @@ ninja -C build
 ctest --test-dir build --output-on-failure          # DSP unit tests
 build\bin\Release\fft_bench.exe --channels 8        # per-stage timings
 build\bin\Release\fft_bench.exe --channels 1 --db 0 --weight 0 --ball 0 --cook 300   # cook-thread cost (async / inline)
+build\bin\Release\fft_bench.exe --info 2000         # info-callback / middle-click access cost
 ```
 `PLUGIN_BUILDER_DIR` defaults to the sibling `../../../PluginBuilder_V2`; pass `-DPLUGIN_BUILDER_DIR=` otherwise.
 A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
@@ -333,13 +334,65 @@ A blank popup is one of exactly two things, and they need opposite fixes:
 | | Chain **not** entered | Chain entered, text **not** rendered |
 |---|---|---|
 | `info_callback_calls` Info DAT row | counters **frozen** (they stop advancing while the node cooks) | counters **climb** — popup count tracks `cookCount` 1:1 |
-| Textport | the `getInfoPopupString() called (#N, node cook #M)` line **stops** printing | the line **keeps** printing, with a healthy character count (~1660 before the v2.9 string trim, ~1100-1300 after) |
+| The popup's own character count (same row) | stale, alongside a frozen call count | steady and ordinary; **~1100-1300** after the v2.9 string trim (~1660 before it) |
 | Meaning | the node stopped cooking → fix the cook, not the popup | the string is fine and TouchDesigner did not draw it → **not a plugin problem** |
 | Fix | see *"Making sure the node is cooking"* below | report to Derivative with that evidence |
+
+Both columns are read from the **same Info DAT row**, which is the point: the popup is the symptom, and the row is
+the measurement. Nothing is printed to the textport for this any more — a periodic announcement line used to be
+emitted from `getInfoPopupString`, and it was removed in v2.9.0 (see *"The cost of the info chain"* below for why a
+print on that path is the wrong instrument).
 
 **The popup string is never textually empty** - its first line is always `Node: <path>`, built before anything that
 can throw. So a blank popup is never "the string came out empty"; it is always "the callback did not run, or ran
 and was not drawn". That invariant is deliberate and should be preserved.
+
+### The cost of the info chain: why the popup could take a frame or two to appear
+
+This is the one part of the popup problem that was **measured and then fixed**, as opposed to correlated and left
+alone. It answers the report that the info "sometimes takes time to show up, or takes multiple attempts at the
+middle-click to trigger it" — with the DLL loaded and the FFT visibly running.
+
+The callbacks are called **inside a cook**, so every microsecond they spend is added to the node's cook time on the
+thread that just ran the analysis. TouchDesigner drives them one item at a time, and the counts are not small:
+
+| Callback | Calls per cook | What each call asked for, before v2.9.0 |
+|---|---|---|
+| `getInfoCHOPChan` | **21** | take `myStatusMutex`, copy a `Status` (two `std::string` members → two heap allocations) |
+| `getInfoDATSize` | 1 | take the log mutex, **copy all 256 log strings** to declare the row count |
+| `getInfoDATEntries` | **276** | take `myStatusMutex`, copy a `Status` again — *per row* |
+| `getInfoPopupString` | 1 | take `myStatusMutex` + copy a `Status`, then **copy all 256 log strings again** for a 3-line tail |
+
+That is **~300 mutex acquisitions, ~850 heap allocations and ~512 string copies per cook**, on the real-time thread —
+and on the *same* mutexes the audio worker takes when it logs a plan event, which is why it was worse around a
+rebuild than in the steady state. It also flatly contradicted the "no allocation on the cook thread after warm-up"
+invariant the rest of the plugin is built around.
+
+Fixed by making the access pattern pay once per cook instead of once per call:
+
+- **`statusSnapshot()` is memoized behind a version stamp.** The published copy only moves when the worker rebuilds
+  a plan or the tables, so the reader compares an atomic counter and reuses the previous copy. (The write side was
+  already gated this way; only the read side was re-copying.)
+- **`PlanLog::version()` + `PlanLog::snapshotTail(n, out)`.** The DAT row view is re-taken only when the log actually
+  changed, and the popup copies the three entries it renders into a reused scratch vector instead of the whole
+  history.
+
+Measured with `fft_bench --info 2000`, which drives the same access pattern against the real `PlanLog`:
+
+```
+info-callback access cost (298 status reads + the 276-row log view, per cook, 2000 cooks):
+  re-lock + re-copy every call       60.7 us/cook
+  memoized + version-stamped          0.4 us/cook   -99%
+  saved                              60.3 us/cook   (0.36% of a 16.7 ms frame at 60 fps)
+```
+
+For scale, the analysis itself is ~88 µs/cook for one channel at these settings — so the *bookkeeping for reading
+the node's own status* was costing about as much as the DSP it was reporting on. `fft_bench --info N` is kept so the
+number can be re-taken rather than re-argued.
+
+Note what this does and does not claim. It removes a large, real, measured cost from the path a middle-click query
+walks, and it removes the ~850 allocations and the mutex traffic that could block the cook thread behind the audio
+worker. It does **not** prove TouchDesigner's renderer was timing out; nothing on this machine can measure that.
 
 ### Rule: never put a diagnostic in the popup string
 
@@ -401,6 +454,9 @@ Recorded honestly, because the confident version of this section was wrong three
   is why the cook-driven mechanism above is the one to reach for first.
 - **That any given blank popup is this node's fault.** Establish which branch it is from the table above before
   changing a line of code.
+- **That the info-chain cost was the *whole* cause of the slow popup.** What is measured is that the access pattern
+  cost 60.7 µs/cook and now costs 0.4 µs/cook. Whether TouchDesigner's own query was slow enough to be affected by
+  that - or whether it re-queries, caches, or times out at all - is not observable from inside a plugin.
 
 ### What was tried, and what each attempt actually taught
 
@@ -410,7 +466,8 @@ Recorded honestly, because the confident version of this section was wrong three
 | One `setString` at the end, not two (`6309258`) | Kept. Two calls (short block, then full text) is not the shape observed rendering, and one call is strictly simpler. The safety the two-call order wanted is kept by appending in the `catch` blocks instead of replacing. |
 | Removing the latched error states (`6309258`) | **Kept, independent real defect.** A node can no longer claim a fault it no longer has. |
 | Two diagnostic lines **in the popup string** | **Removed, and the rule above exists because of it.** This is the change that separated working from blank. |
-| Log line once per load, instead of every 300 cooks (`7b419b5`) | **Reverted.** The one-shot line is quieter, but it removes the only signal that distinguishes branch 1 from branch 2 - and it landed in the same commit as the two lines above, so neither could be cleared separately. |
+| Log line once per load, instead of every 300 cooks (`7b419b5`) | **Now removed entirely (v2.9.0).** It went one-shot, then went away: the call count and the character count it carried both live in the `info_callback_calls` Info DAT row, so the line was pure textport noise on the real-time path. |
+| Memoizing `statusSnapshot()` + `snapshotTail()` (v2.9.0) | **Kept, and measured.** 60.7 → 0.4 µs/cook (`fft_bench --info`). This is the only change in this table that was made against a number rather than against a correlation. |
 
 ## License / third party
 

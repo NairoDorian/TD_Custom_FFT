@@ -276,6 +276,10 @@ public:
                 m_history.erase(m_history.begin(), m_history.begin() + static_cast<std::ptrdiff_t>(m_history.size() / 2));
             }
             m_history.push_back(msg);
+            // Bumped under the lock, so it is consistent with the history a caller would have read: a
+            // reader that saw version V saw exactly this content. This is what lets the Info DAT avoid
+            // re-copying the whole history on every cook just to discover that nothing changed.
+            m_version.fetch_add(1, std::memory_order_release);
             deferred = m_deferred;
             if (echoToTextport && deferred) {
                 m_pending.push_back(msg);
@@ -310,19 +314,40 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_history;
     }
+    // Version of the history. Changes whenever snapshot() would return something different - a new entry,
+    // or the half-history truncation log() performs when the buffer is full. A caller that caches a
+    // snapshot can compare this instead of copying the history just to find out it is unchanged.
+    uint64_t version() const noexcept { return m_version.load(std::memory_order_acquire); }
+
+    // The last `n` entries, newest last, into `out` (cleared first). O(n), not O(size): the popup shows
+    // the tail of the log on every cook, and snapshot() there copied all kMaxPlanLogEntries (256) strings
+    // - with their allocations - to then use three of them.
+    void snapshotTail(size_t n, std::vector<std::string>& out) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        out.clear();
+        const size_t start = m_history.size() > n ? m_history.size() - n : 0;
+        out.reserve(m_history.size() - start);
+        out.insert(out.end(), m_history.begin() + static_cast<std::ptrdiff_t>(start), m_history.end());
+    }
     // Single entry (used per Info DAT row so the whole history is not copied for every row)
     std::string entry(size_t i) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return i < m_history.size() ? m_history[i] : std::string();
     }
     size_t size() const { std::lock_guard<std::mutex> lock(m_mutex); return m_history.size(); }
-    void clear() { std::lock_guard<std::mutex> lock(m_mutex); m_history.clear(); }
+    void clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_history.clear();
+        m_version.fetch_add(1, std::memory_order_release);
+    }
 
 private:
     mutable std::mutex m_mutex;
     std::vector<std::string> m_history;
     std::deque<std::string> m_pending;
     std::atomic<bool> m_hasPending{ false };
+    // Mirrors the state of m_history for readers that only need "did it change?" (see version()).
+    std::atomic<uint64_t> m_version{ 0 };
     bool m_deferred{ false };
 };
 

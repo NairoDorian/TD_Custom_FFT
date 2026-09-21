@@ -67,3 +67,6 @@ PluginProjects/FFT/fft_tests_wisdom.txt
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# The DSP tests cache wisdom next to wherever they are run from; only the project-root copy is tracked.
+fft_tests_wisdom.txt
