@@ -2993,14 +2993,22 @@ public:
             m_planStatus = std::string(tag()) + " (" + used + " - " + std::to_string(ms) + " ms, N=" + std::to_string(fft_size) + ")";
             if (log) {
                 log->log(std::string("[FFT Plugin] [") + tag() + "] plan N=" + std::to_string(fft_size) + " " + used + " in " + std::to_string(ms) + " ms");
-                // Which library is doing the work, and which SIMD kernels it chose for this plan.
-                // Reported once per plan (i.e. per size or backend change), never per cook: it costs
-                // one plan serialisation, and it is the only way to tell an AVX2 build from an SSE2
-                // one, or FFTW from oneMKL, at runtime — they produce identical results and accept
-                // identical calls.
-                log->log(std::string("[FFT Plugin] [") + tag() + "] " +
-                             describeBackend(m_backend) + " - " + describePlanSimd(api, m_plan),
-                         backendVersionMatches(m_backend));
+                // Which library is doing the work, and which SIMD kernels it chose for this plan: the
+                // only way to tell an AVX2 build from an SSE2 one, or FFTW from oneMKL, at runtime -
+                // they produce identical results and accept identical calls. Printed in full when the
+                // backend description changes (first plan, a backend switch); on a size change of the
+                // same backend only a changed kernel note is printed, so resizing does not repeat the
+                // same long line for every plan (v2.12).
+                const std::string desc = describeBackend(m_backend);
+                const std::string simd = describePlanSimd(api, m_plan);
+                if (desc != m_loggedBackend) {
+                    log->log(std::string("[FFT Plugin] [") + tag() + "] " + desc + " - " + simd, backendVersionMatches(m_backend));
+                    m_loggedBackend = desc;
+                    m_loggedSimd = simd;
+                } else if (simd != m_loggedSimd) {
+                    log->log(std::string("[FFT Plugin] [") + tag() + "] " + simd);
+                    m_loggedSimd = simd;
+                }
             }
         } else {
             m_planStatus = std::string(tag()) + " (plan creation FAILED)";
@@ -3242,6 +3250,7 @@ private:
     PlannerPolicy m_policy{ PlannerPolicy::Auto };  // the policy m_plan was built under (part of the
                                            // prepare() early-out key, so changing policy re-plans)
     std::string m_planStatus;              // empty = not prepared yet; getPlanStatus() names the tag
+    std::string m_loggedBackend, m_loggedSimd;   // the backend line / kernel note last printed (prepare)
     PlanLog* m_log{ nullptr };             // not owned; the node's log, used for plan messages
 
     // ---- the background measurement ---------------------------------------

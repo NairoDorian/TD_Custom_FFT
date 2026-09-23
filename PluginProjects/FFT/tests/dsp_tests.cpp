@@ -2106,6 +2106,22 @@ static void test_v212_simd_kernels()
         CHECK(empty.size() == cur.size() && std::memcmp(io2.data(), cur.data(), cur.size() * 4) == 0);
     }
 
+    // --- plan log: the long backend line once per backend, one short "plan N=" line per size
+    {
+        PlanLog log;
+        log.setDeferred(true);                                   // queue, do not write to a Textport
+        FFTWEngine engine;
+        for (size_t n : { size_t(4096), size_t(8192), size_t(16384), size_t(8192) })
+            engine.prepare(n, PlannerPolicy::Fast, &log);
+        size_t planLines = 0, backendLines = 0;
+        for (const std::string& line : log.snapshot()) {
+            if (line.find("] plan N=") != std::string::npos) ++planLines;
+            if (line.find("plan kernels:") != std::string::npos && line.find(" [") != line.rfind(" [")) ++backendLines;
+        }
+        CHECK(planLines == 4);                                   // every (re)plan is still reported
+        CHECK(backendLines == 1);                                // the description is not repeated per size
+    }
+
     // --- weighting + reference peak in one pass
     {
         AlignedVector a1(1003), a2, curve(1003);

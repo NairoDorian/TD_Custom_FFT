@@ -95,7 +95,13 @@ P-core) and interleaved A/B runs of the previous build.
   bins. With a dBFS reference, the peak pass is skipped entirely, since that reference never used it.
 
 ### FFT backend and plan flags (measured, nothing to change)
-- FFTW beats oneMKL at every size: 5.9 / 13.6 / 29.1 µs vs 6.0 / 14.4 / 31.9 µs at N = 8K / 16K / 32K.
+- **oneMKL runs the FFT 18–27 % faster than FFTW:** 3.87 / 8.41 / 17.73 µs vs 4.71 / 11.55 / 23.65 µs
+  (FFTW with MEASURE plans) at N = 8K / 16K / 32K, median of 3 pinned runs. FFTW with a PATIENT plan is
+  9.70 µs at 16K, so oneMKL still leads by ~13 %. A first comparison in this release claimed the
+  opposite: it passed `--backend 1` where the bench takes a name (`--backend mkl`), so both runs used
+  FFTW. FFTW stays the default because it is 3 MB, vendored and wisdom-cached. Choose oneMKL (FFT
+  Backend on) for speed. It then loads 5 DLLs (~177 MB) and spends ~39 ms initialising once per
+  process, on the worker thread when Async is on.
 - Preserve-input out-of-place, the current setup, is the fastest execute:
   - `FFTW_DESTROY_INPUT` plus re-zeroing the pad each frame is 1–5 % slower;
   - in-place plus re-zeroing is 10–20 % slower.
@@ -117,6 +123,12 @@ P-core) and interleaved A/B runs of the previous build.
   so shortening one iteration's dependency chain buys nothing.
 - **Polynomial log2 (degree 3–5) for dB:** 30 % slower than the gather table. The 8-segment form above is
   what beat it.
+
+### Changed (Textport)
+- **The long backend line is printed once per backend, not once per plan.** It is repeated only on a
+  backend switch or when the plan's SIMD kernels change. Every plan still gets its short `plan N=... in
+  x ms` line. Resizing on oneMKL used to print the full "FFTW 3.3.4 wrappers to Intel oneMKL [...]" line
+  for every size.
 
 ### Tests
 - `test_v212_simd_kernels` covers:
