@@ -34,7 +34,7 @@ Two conventions that matter if you are adding an entry:
   claims more than was measured is worse than no entry.
 
 For what the node does *now* (rather than when it changed), see [README.md](README.md); for the
-performance analysis and the current plan, see [AUDIT_AND_PLAN_2026-09-23.md](AUDIT_AND_PLAN_2026-09-23.md).
+performance analysis and the current plan, see [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md).
 (The older FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md, which entries
 below still name as history, were retired 2026-09-23; see git history.)
 
@@ -62,6 +62,13 @@ below still name as history, were retired 2026-09-23; see git history.)
     keeps cooking. With Async off it is the cook thread: no measurement starts while Async is off, but one
     already running when it was switched off finishes first;
   - deleting the node or quitting TouchDesigner while a measurement runs.
+
+### Documentation
+- The notes are now living documents with undated names: `AUDIT_AND_PLAN.md` is rewritten as the audit of
+  the current code (v2.12.1) with an open-items-only plan; `ESSENTIATD_LESSONS.md` and `INSTALLER_PLAN.md`
+  are the EssentiaTD review and the installer plan. History stays in this file and in git.
+- `README.md` and `3rdParty/fftw3/README.md` describe the current state only (historical tables and
+  "earlier revision" asides removed).
 
 ## [v2.12.0] - 2026-09-23 — AVX2/FMA pass: load+permute warp, branch-free peak, table-free dB log, vector features
 
@@ -179,9 +186,9 @@ Follow-up commit `de8b13a`, same day, same version number.
 
 ### Documentation
 - FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md are retired (see git
-  history). [AUDIT_AND_PLAN_2026-09-23.md](AUDIT_AND_PLAN_2026-09-23.md) supersedes both.
-- New notes: [ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md](ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md)
-  and [INSTALLER_PLAN_2026-09-23.md](INSTALLER_PLAN_2026-09-23.md).
+  history). [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md) supersedes both.
+- New notes: [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md)
+  and [INSTALLER_PLAN.md](INSTALLER_PLAN.md).
 - `FFT_REFERENCE/` (the original Python prototype) is removed from the repository. It is kept on disk
   and is now gitignored.
 - `PluginProjects/FFT/3rdParty/fftw3/README.md`: the oneMKL file list is now the trimmed set above,
@@ -230,7 +237,7 @@ toggles arrive with their defaults (Raw off, Zero-Padding on).
 
 ## [v2.10.0] - 2026-09-23 — lock-free real-time pipeline, presets, aggregation, spectral features
 
-Summary (the detailed plan and measurements are in `AUDIT_AND_PLAN_2026-09-23.md`):
+Summary (the detailed plan and measurements are in `AUDIT_AND_PLAN.md`):
 - **Async handoff:** wait-free triple buffers between the cook and the worker (`AsyncAnalysis`). Worker
   Wake (Poll 2 ms / Signal) and Worker Priority (Highest / MMCSS "Pro Audio").
 - **Planner:** abandoned MEASURE/PATIENT plans go to a graveyard instead of blocking a cook. PATIENT is

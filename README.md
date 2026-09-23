@@ -14,41 +14,36 @@ standalone with CMake + Ninja and ships headless tests and a per-stage benchmark
 > `td_plugin_optimize`), `plugin.json` manifest (family CHOP, optype `Fftcustom`), vendored API-10
 > headers in `../PluginBuilder_V2/include/`, rename-in-place deploy into `__Plugins__/FFT/`, and the
 > `PluginBuilder.tox` hot-reload loop. Cross-repo CI from the builder folder:
-> `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`. Builder-side history lives in
-> `../PluginBuilder_V2/CHANGELOG.md` and `../PluginBuilder_V2/AUDIT.md` (§6).
+> `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`. Builder-side changes are in
+> `../PluginBuilder_V2/CHANGELOG.md`.
 
 ---
 
 ## How to use this documentation
 
-Six markdown files, six different jobs. Read the one that matches your question rather than reading
-them in order:
+Six markdown files, six different jobs. Read the one that matches your question:
 
 | File | What it is for | Read it when |
 |---|---|---|
-| **README.md** (this file) | The user-facing description: what the node does, every parameter, how to build it, the performance numbers, and the debugging history of the middle-click popup | You are using the node, or you are about to change something and want to know what it is for |
-| [CHANGELOG.md](CHANGELOG.md) | Version history, newest first, one entry per release, with the A/B measurements behind each performance change (v2.12.0 has the current per-stage numbers and the list of optimisations that were measured and *not* kept) | You want to know *when* something changed, which build introduced a behaviour, or what a kernel change actually bought |
-| [AUDIT_AND_PLAN_2026-09-23.md](AUDIT_AND_PLAN_2026-09-23.md) | The 2026-09-23 audit and phased plan: where the time goes, what has shipped since, what is still open (Phase 5) and why the rejected ideas were rejected | You want the current to-do list and its acceptance criteria, or you are looking for something to make faster |
-| [ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md](ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md) | What is worth porting from EssentiaTD (features, cook-model gaps, test harness), with corrections to the older comparison doc | You are adding a feature or a robustness fix and want prior art |
-| [INSTALLER_PLAN_2026-09-23.md](INSTALLER_PLAN_2026-09-23.md) | Plan for a per-user Windows installer: exact DLL set, prerequisite checks, licensing, build pipeline | You want to ship the plugin to another machine |
+| **README.md** (this file) | What the node does, every parameter, building and testing, current performance, the diagnostics | You are using the node, or about to change something and want to know what it is for |
+| [CHANGELOG.md](CHANGELOG.md) | Version history, newest first, with the A/B measurements behind each performance change and the optimisations that were measured and *not* kept | You want to know *when* something changed, or what a kernel change actually bought |
+| [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md) | The current audit and the open plan: where the time goes, what is still open and why rejected ideas were rejected | You want the to-do list and its acceptance criteria, or something to make faster |
+| [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md) | What is worth porting from EssentiaTD (features, cook-model gaps, test harness) | You are adding a feature or a robustness fix and want prior art |
+| [INSTALLER_PLAN.md](INSTALLER_PLAN.md) | Plan for a per-user Windows installer: exact DLL set, prerequisite checks, licensing, build pipeline | You want to ship the plugin to another machine |
 | [PluginProjects/FFT/3rdParty/fftw3/README.md](PluginProjects/FFT/3rdParty/fftw3/README.md) | The vendored FFTW build, the oneMKL alternative, and the license terms of both | You are rebuilding or replacing the FFT library |
 
-Two conventions used throughout, so the numbers can be trusted:
+Two conventions, so the numbers can be trusted:
 
-- **Every performance figure names the machine it was measured on.** Times move with thermals and with
-  the FFT plan that happens to be live, so an absolute number without a machine on it means nothing
-  here; the *direction* of a comparison is the durable part. Machine names are used consistently:
-  "i7-class desktop" is the original development machine, "i9-13900H" is the current one.
-- **Claims that could not be verified are labelled as such.** The section on the popup has a
-  "What is *not* established" list written for exactly this reason. Please keep that habit when you
-  add anything: say whether a statement is measured, derived, or a guess.
+- **Every performance figure names the machine it was measured on** (here, the i9-13900H). Times move
+  with thermals and with the live FFT plan; the *direction* of a comparison is the durable part.
+- **Say whether a statement is measured, derived, or a guess.** Claims that could not be verified are
+  labelled as such.
 
 ---
 
 ## Where to change what
 
-A map for the first modification, so you do not have to read the whole tree to find one thing. Every
-path is relative to `PluginProjects/FFT/`.
+Every path is relative to `PluginProjects/FFT/`.
 
 | If you want to change... | Edit |
 |---|---|
@@ -62,23 +57,19 @@ path is relative to `PluginProjects/FFT/`.
 | the regression tests | `tests/dsp_tests.cpp` - the check count is a signal: it must not go down |
 | the benchmarks | `bench/bench.cpp` |
 
-Two rules that are easy to break and hard to debug, both stated at length where they apply:
+Two rules that are easy to break and hard to debug:
 
 1. **A parameter that feeds a cached table must be added to that table's key**
    (`WindowKey` / `WarpKey` / `WeightKey` in `source/AnalysisPipeline.h`). Nothing enforces this at
    compile time, and forgetting it produces a table that is silently stale until the user changes
    that one parameter.
-2. **Nothing that allocates, locks or prints may be added to the cook path.** The plugin's whole
-   real-time argument is that a steady-state cook does none of the three; see *Performance* below and
-   *The cost of the info chain* for what happens when that is violated.
+2. **Nothing that allocates, locks or prints may be added to the cook path.** The plugin's real-time
+   argument is that a steady-state cook does none of the three; see *Performance* and *The cost of the
+   info chain*.
 
-And one convention to follow when writing a comment:
-
-> **Refer to code by symbol, not by line number.** Comments in this project cite each other a lot
-> ("who calls this", "where the key is checked"). A symbol name survives an edit; a line number does
-> not, and this pass is the demonstration: adding comments shifts every line below them, and a note
-> that said `source/FFT.cpp:239` was correct when written and wrong an hour later. Prefer
-> `FFT::pollParameters()` and add a file name only when the symbol is ambiguous across files.
+And one convention for comments: **refer to code by symbol, not by line number** (`FFT::pollParameters()`,
+not `source/FFT.cpp:239`). A symbol survives an edit; a line number does not. Add a file name only when the
+symbol is ambiguous across files.
 
 ---
 
@@ -92,11 +83,11 @@ And one convention to follow when writing a comment:
   interface** (Performance page, `FFT Backend`). Neither is linked — both export the same `fftwf_*` symbols, so
   the plugin resolves whichever is selected with `LoadLibraryEx` + `GetProcAddress` and calls through that table.
   oneMKL is not redistributed here; see [Using Intel oneMKL instead](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
-- **AVX2 / FMA** everywhere it pays (v2.12 pass, every change A/B-measured — see `CHANGELOG.md`): windowing,
-  magnitude (rsqrt + Newton step, ~23-bit accuracy), warp interpolation (one unaligned load + `vpermps` per tap
-  where the 8 output bins' taps fit one 8-float window, `vgatherdps` elsewhere), weighting fused with the dB
-  reference peak, a table-free `FastLog2Seg` `20·log10` for dB (no gather, 0.00016 dB max error), in-place
-  ballistics, a branch-free 4-chain peak search, and vectorised spectral features.
+- **AVX2 / FMA** everywhere it pays: windowing, magnitude (rsqrt + Newton step, ~23-bit accuracy), warp
+  interpolation (one unaligned load + `vpermps` per tap where the 8 output bins' taps fit one 8-float window,
+  `vgatherdps` elsewhere), weighting fused with the dB reference peak, a table-free `FastLog2Seg` `20·log10` for
+  dB (no gather, 0.00016 dB max error), in-place ballistics, a branch-free 4-chain peak search, and vectorised
+  spectral features.
 - **Psychoacoustic scales**: Logarithmic, Mel, ERB, Bark, Chroma, Linear, Mel+Log blend, with a `Warp Blend`
   slider and an identity (memcpy) bypass when the grid is exactly linear. Where one output bin covers several
   FFT bins, `Warp Aggregation` decides what it reports (Peak by default, so no narrow peak is ever dropped).
@@ -109,12 +100,12 @@ And one convention to follow when writing a comment:
 - **Quality presets** (Visual 60 / Visual 120 / Analysis) that set the pad, interpolation, Kaiser beta mode and
   aggregation together; they never change the output count.
 - **Equal-loudness weighting**: A (IEC 61672), C, ITU-R 468.
-- **dB modes** with **dB Reference**: Frame Peak (legacy, 0 dB = loudest bin), 0 dBFS (absolute), Slow AGC.
-- **Magnitude normalization**: Coherent Gain (legacy, `mean(window) = 1`) or Full Scale (sine amplitude 1 → 1.0).
-- **Window length** in samples (legacy) or in **milliseconds** (sample-rate independent).
-- **Ballistics** as per-frame coefficients (legacy) or in **milliseconds** (frame-rate independent, uses `OP_TimeInfo`).
+- **dB modes** with **dB Reference**: Frame Peak (0 dB = loudest bin), 0 dBFS (absolute), Slow AGC.
+- **Magnitude normalization**: Coherent Gain (`mean(window) = 1`) or Full Scale (sine amplitude 1 → 1.0).
+- **Window length** in samples or in **milliseconds** (sample-rate independent).
+- **Ballistics** as per-frame coefficients or in **milliseconds** (frame-rate independent, uses `OP_TimeInfo`).
 - **Async analysis with a hard real-time cook thread**: the FFT runs on a worker; the cook thread only ingests and copies.
-  Job and result handoff are wait-free triple buffers (`AsyncAnalysis`, v2.10); with `Worker Wake = Poll` (default) the
+  Job and result handoff are wait-free triple buffers (`AsyncAnalysis`); with `Worker Wake = Poll` (default) the
   worker polls every 2 ms on a high-resolution timer (no kernel wake-up per cook) — no mutex, no syscall, no allocation
   on the cook thread after warm-up. `Worker Priority` can register the worker with MMCSS "Pro Audio".
 - **Diagnostics**: Info CHOP (36 channels: `cook_time_us`, `dsp_time_us`, `peak_freq_hz`, `hold_frames`, `jobs_dropped`,
@@ -140,7 +131,7 @@ PluginProjects/FFT/
 │   ├── AsyncAnalysis.h/.cpp <-- cook <-> worker handoff (wait-free triple buffers, wake policy, priority), TD-free
 │   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, cook, telemetry, Info CHOP/DAT, popup)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook, grey-out states)
-├── tests/dsp_tests.cpp   <-- headless golden-vector tests (748 checks at v2.12.0, incl. lock-free handoff stress)
+├── tests/dsp_tests.cpp   <-- headless golden-vector tests (748 checks, incl. lock-free handoff stress)
 ├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --info N, --backend fftw3|mkl, --gate)
 ├── bench/perf_baseline.json <-- baseline for the perf-regression gate (`ctest -L perf`)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
@@ -148,30 +139,24 @@ PluginProjects/FFT/
 └── 3rdParty/fftw3/       <-- vendored FFTW 3.3.11 AVX2 (VERSION record, header, .def/.lib, runtime DLL)
 ```
 
-A working copy may also have an `FFT_REFERENCE/` folder at the repository root. It is a local-only reference
-folder (git-ignored, not part of the repository), so nothing in the build, the tests or this documentation
-depends on it.
+A working copy may also have an `FFT_REFERENCE/` folder at the repository root. It is local-only
+(git-ignored); nothing in the build, the tests or this documentation depends on it.
 
-Three of the source files are header-only by design: `DSPModules.h`, `FftBackend.h` and `RateModel.h`
-contain their implementations in the header and are included by more than one translation unit (the
-node, the tests and the bench). Their free functions are declared `inline` for that reason. Before
-compiling one of them standalone, or moving a function out of one into a `.cpp`, check who else
-includes it - the tests and the bench link against these headers directly and would otherwise be left
-with an undefined symbol at link time, not at compile time.
+`DSPModules.h`, `FftBackend.h` and `RateModel.h` are header-only by design and are included by more than one
+translation unit (the node, the tests and the bench), so their free functions are `inline`. Before moving a
+function out of one into a `.cpp`, check who else includes it: the tests and the bench link against these
+headers directly and would otherwise fail at link time, not at compile time.
 
 ## Building
 
 ### From TouchDesigner (PluginBuilder_V2)
 Drop `PluginBuilder.tox` into `Plugin_FFT.toe`, type `FFT` as the plugin name — PluginBuilder finds the
 existing project (via this folder's `plugin.json`), configures, compiles on every source save and
-hot-reloads the DLL (rename-in-place, no unload gap). Requires `PLUGIN_BUILDER_DIR` to resolve to
-`../PluginBuilder_V2` (the CMakeLists default); rebuild after builder upgrades with
-`python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT` if you want a headless check.
-The generated/loader path, `plugin.json` manifest, `__Plugins__/FFT/` deploy folder and the CMake
-functions (`td_add_plugin`, `td_plugin_use_fftw3 ... DYNAMIC`, `td_plugin_optimize`) all come from the
-sibling [PluginBuilder_V2](../PluginBuilder_V2) repo; `CMakeLists.txt` resolves it as
-`../../../PluginBuilder_V2` (override with `-DPLUGIN_BUILDER_DIR=`). Headless cross-check from that
-repo: `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`.
+hot-reloads the DLL (rename-in-place, no unload gap). The loader path, `plugin.json` manifest,
+`__Plugins__/FFT/` deploy folder and the CMake functions (`td_add_plugin`, `td_plugin_use_fftw3 ... DYNAMIC`,
+`td_plugin_optimize`) all come from the sibling [PluginBuilder_V2](../PluginBuilder_V2) repo; `CMakeLists.txt`
+resolves it as `../../../PluginBuilder_V2` (override with `-DPLUGIN_BUILDER_DIR=`). Headless check after a
+builder upgrade: `python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT`.
 
 ### Standalone
 ```cmd
@@ -193,31 +178,29 @@ must be invoked with an absolute path from PowerShell. Delete `build/` when chan
 version: `td_plugin_use_fftw3` resolves the library from the version tag, and a stale `CMakeCache.txt`
 would keep pointing at the previous one.
 
-`fft_tests` prints a check count as well as a pass/fail. **748 checks, 0 failures** was the baseline at
-v2.12.0 (607 before the v2.10 pass), and the count is deliberately treated as a signal: a refactor that removes a check is as
-suspicious as one that fails one, so compare the number, not just the exit code. The oneMKL and
-from-wisdom test branches are genuinely machine-dependent - a different total on another machine is not
-a regression, but a different total on this one is.
+`fft_tests` prints a check count as well as a pass/fail; the baseline is **748 checks, 0 failures**. Treat the
+count as a signal: a refactor that removes a check is as suspicious as one that fails one, so compare the
+number, not just the exit code. The oneMKL and from-wisdom test branches are machine-dependent - a different
+total on another machine is not a regression, but a different total on this one is.
 
-`PLUGIN_BUILDER_DIR` defaults to the sibling `../../../PluginBuilder_V2`; pass `-DPLUGIN_BUILDER_DIR=` otherwise.
 A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
-The oneMKL DLLs are never deployed by the build: they are entirely optional and the user's to install (the plugin
-only *looks* for them, in its own directory). The deployment set is 14 `.3.dll` files, ~456 MiB: `mkl_rt`,
+The oneMKL DLLs are never deployed by the build: they are optional and the user's to install (the plugin only
+*looks* for them, in its own directory). The deployment set is 14 `.3.dll` files, ~456 MiB: `mkl_rt`,
 `mkl_core`, `mkl_sequential`, the kernel set `mkl_def` / `mkl_mc3` / `mkl_avx2` / `mkl_avx512` / `mkl_avx10` and the
 VML set `mkl_vml_def` / `mkl_vml_mc3` / `mkl_vml_avx2` / `mkl_vml_avx512` / `mkl_vml_avx10` / `mkl_vml_cmpt`, plus the
 `oneMKL-licenses/` folder. `mkl_intel_thread`, `mkl_tbb_thread` and `libimalloc.dll` are **not** needed: the plugin
 forces oneMKL's sequential threading layer at load. Only five of them load on a given CPU (on the i9-13900H:
 `mkl_rt`, `mkl_core`, `mkl_sequential`, `mkl_avx2`, `mkl_vml_avx2`, ~177 MiB); the other kernel variants are there
-for AVX-512 and older CPUs. On this machine they are installed in `__Plugins__/FFT/`, which `.gitignore` keeps out of
-the repository — so a fresh clone builds and runs on FFTW3 alone, and the `FFT Backend` toggle is the only thing
-that needs them. Details in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
+for AVX-512 and older CPUs. `.gitignore` keeps `__Plugins__/FFT/` out of the repository, so a fresh clone builds
+and runs on FFTW3 alone; only the `FFT Backend` toggle needs oneMKL. Details in
+[`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 
 Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.21, Ninja, a CPU with AVX2 + FMA.
 
 ## Parameters
 
-In dialog order (the order `setup()` in `source/Parameters.cpp` registers them). Greying out is live: since
-v2.10 the node tells TouchDesigner which parameters the current settings make inert (`setEnableStates()`).
+In dialog order (the order `setup()` in `source/Parameters.cpp` registers them). Greying out is live: the node
+tells TouchDesigner which parameters the current settings make inert (`setEnableStates()`).
 
 | Page | Parameter | Type | Default | Notes |
 |---|---|---|---|---|
@@ -230,18 +213,18 @@ v2.10 the node tells TouchDesigner which parameters the current settings make in
 | Spectrum | Output Bins | Int | 16384 | output samples per channel in Fixed (hard-clamped 8…262144; slider 256…65536). Greyed out in Auto and with Raw RFFT Bins |
 | Spectrum | Warp Blend | Float | 0.963 | 0 = linear grid, 1 = fully perceptual |
 | Spectrum | Warp Interpolation | Menu | Linear | Linear (2 taps) / Cubic Catmull-Rom (4 taps; a 16K FFT + cubic looks like 32K + linear at half the cost) |
-| Spectrum | Warp Aggregation | Menu | **Peak** | What an output bin reports when it covers several FFT bins (the coarse, usually high-frequency, part of a perceptual axis): Off = interpolate between two FFT bins (legacy; a narrow peak between the taps is skipped) · Peak = the largest FFT bin in the range (no peak is ever dropped) · RMS = the power mean of the range (energy-faithful). Only those bins are affected; Info CHOP `aggregated_bins` counts them |
+| Spectrum | Warp Aggregation | Menu | **Peak** | What an output bin reports when it covers several FFT bins (the coarse, usually high-frequency, part of a perceptual axis): Off = interpolate between two FFT bins (a narrow peak between the taps is skipped) · Peak = the largest FFT bin in the range (no peak is ever dropped) · RMS = the power mean of the range (energy-faithful). Only those bins are affected; Info CHOP `aggregated_bins` counts them |
 | Spectrum | Log Floor Hz | Float | 20 | lowest frequency of the Log / Melog grid |
-| Spectrum | Window Length Mode | Menu | Samples | Samples (legacy) or Milliseconds |
+| Spectrum | Window Length Mode | Menu | Samples | Samples or Milliseconds |
 | Spectrum | Window Sampling | Int | 3175 | analysis window in samples (= 72 ms @ 44.1 kHz; slider 1…32768, hard limit 65536) |
 | Spectrum | Window Length ms | Float | 72 | used when mode = Milliseconds (slider 1…1000, accepted 0.1…5000) |
 | Spectrum | Zero-Padding | Toggle | **On** | Off = the FFT runs on the window itself (N = window length rounded up to even, so the last bin is exactly Nyquist); Zero-Pad Len is greyed out. A power-of-two window is the fast case (the default 3175 → 3176 = 8·397 plans a slower FFT) |
 | Spectrum | Zero-Pad Len | Menu | 16384 | FFT size with Zero-Padding on (1K…64K; auto-grown to ≥ next pow2 of the window). Overridden by a Quality Preset |
-| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes 10–15 % faster than a MEASURE plan at 16K/32K (9.70 vs 10.97 µs at 16K, i9-13900H). The PATIENT search has no time limit (v2.12.1): about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread; the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
-| Spectrum | Input Ingest | Menu | Auto | Auto = only the samples that are new since the last cook, from the input's start index and cook count (an overlapping or re-delivered buffer is not appended twice) · Append All = the newest block, every cook (the pre-2.10 behaviour) |
+| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes faster than a MEASURE plan (9.70 against 11.55 µs at N = 16384, i9-13900H). The PATIENT search has no time limit: about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread (see *Threading*); the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
+| Spectrum | Input Ingest | Menu | Auto | Auto = only the samples that are new since the last cook, from the input's start index and cook count (an overlapping or re-delivered buffer is not appended twice) · Append All = the newest block, every cook |
 | EQ | EQ Enable | Toggle | **Off** | Off = no EQ code and no EQ parameter reads at all |
 | EQ | High Shelf / Low Shelf | Toggle | On / On | per-shelf bypass (only read when EQ Enable is on) |
-| EQ | High Boost dB, High Cutoff Hz, Low Boost dB, Low Cutoff Hz, EQ Q Factor, EQ Blend Amount | Float | 6 / 1000 / 0 / 200 / 0.707 / 1 | RBJ shelving EQ applied at ingest to new samples (stateful, 3.6 µs/channel on the i7-class desktop) |
+| EQ | High Boost dB, High Cutoff Hz, Low Boost dB, Low Cutoff Hz, EQ Q Factor, EQ Blend Amount | Float | 6 / 1000 / 0 / 200 / 0.707 / 1 | RBJ shelving EQ applied at ingest to new samples (stateful) |
 | Window & Weighting | Window Type | Menu | Kaiser | Kaiser / Hann / Hamming / Blackman / Blackman-Harris / Rectangular |
 | Window & Weighting | Kaiser Beta Mode | Menu | **Manual** | Manual = Kaiser Beta · Auto = the smallest β whose sidelobes sit below dB Range Floor (the sharpest main lobe the display can use; the presets use it). Kaiser window only; greyed out under a preset |
 | Window & Weighting | Kaiser Beta | Float | 15 | Manual mode only (slider 1…55, accepted 0…100). Info CHOP `kaiser_beta` shows the β actually in use |
@@ -255,22 +238,20 @@ v2.10 the node tells TouchDesigner which parameters the current settings make in
 | Loudness & Ballistics | Attack / Release Speed | Float | 0 / 0 | per-frame coefficients 0…0.99 |
 | Loudness & Ballistics | Attack / Release ms | Float | 50 / 200 | used when mode = Milliseconds |
 | Loudness & Ballistics | Reset | Pulse | | clears ballistics, AGC and EQ state |
-| Performance | Async Analysis (worker thread) | Toggle | **On** | FFT & post-processing on a worker thread; the cook only ingests and copies (≈ 11 µs at 16384 bins, 7 µs at 4096, measured on the i7-class desktop). Off = inline, and **one thread for the whole node**: no worker, and no background plan measurement either |
-| Performance | FFT Backend (off: FFTW3 / on: Intel oneMKL) | Toggle | **Off** | Off = the vendored FFTW3 3.3.11 AVX2 build. On = Intel oneMKL's FFTW3 interface (`mkl_rt.3.dll`), which runs the FFT 18–27 % faster on the i9-13900H (see *Which FFT library is faster*) but has to be installed by the user. Missing DLL = logs and falls back to FFTW3, never a planless node. A toggle rather than a menu because there are two libraries; the registry in `FftBackend.h` and the `static_assert`s in `Parameters.cpp` are what a third would extend |
+| Performance | Async Analysis (worker thread) | Toggle | **On** | FFT & post-processing on a worker thread; the cook only ingests and copies (its cost scales with the output bin count; measure with `fft_bench --cook`). Off = inline, and **one thread for the whole node**: no worker, and no background plan measurement either |
+| Performance | FFT Backend (off: FFTW3 / on: Intel oneMKL) | Toggle | **Off** | Off = the vendored FFTW3 3.3.11 AVX2 build. On = Intel oneMKL's FFTW3 interface (`mkl_rt.3.dll`), which runs the FFT 18–27 % faster on the i9-13900H (see *FFTW3 vs Intel oneMKL*) but has to be installed by the user. Missing DLL = logs and falls back to FFTW3, never a planless node. A toggle rather than a menu because there are two libraries; the registry in `FftBackend.h` and the `static_assert`s in `Parameters.cpp` are what a third would extend |
 | Performance | Worker Wake | Menu | Poll | Poll = the worker checks the job slot every 2 ms (no kernel call on the cook thread; pickup 0–2 ms) · Signal = the cook wakes it every cook (one `SetEvent`, ~5–25 µs on the cook thread; pickup ~0.02 ms). The worker goes dormant after 500 ms idle either way. Greyed out with Async off |
 | Performance | Worker Priority | Menu | Highest | Highest = `THREAD_PRIORITY_HIGHEST` · MMCSS Pro Audio = registered with the Multimedia Class Scheduler, which schedules it ahead of normal threads and exempts it from power throttling (for 120+ fps projects on a busy machine). Applied at thread start; greyed out with Async off |
-| Performance | Spectral Features (Info CHOP) | Toggle | Off | On = eight `feature_*` Info CHOP channels (centroid, rolloff, flatness, flux, RMS dB, bass / mid / high dB), computed on the worker from the linear magnitude. ~3.5 µs per analysis at 8193 bins since v2.12 (was ~16.5 µs) |
+| Performance | Spectral Features (Info CHOP) | Toggle | Off | On = eight `feature_*` Info CHOP channels (centroid, rolloff, flatness, flux, RMS dB, bass / mid / high dB), computed on the worker from the linear magnitude. ~3.5 µs per analysis at 8193 bins (i9-13900H) |
 
-Defaults (Coherent Gain, Frame Peak, Samples, Coefficient, Kaiser β 15 Manual; EQ and Ballistics **off**) reproduce the
-processing of the early builds, in which the EQ was inactive, with two deliberate differences since v2.10/v2.11:
-the output is N/2+1 of the padded FFT (8193 samples at the default pad, `Output Bins Mode = Auto`) rather than 16384,
-and output bins that cover several FFT bins report their peak (`Warp Aggregation = Peak`) instead of interpolating.
-Every optional section is bypassed entirely — code *and* parameter reads — when disabled: `eval()` reads **30**
-parameters per cook in the default configuration, against **43** with every optional section on (EQ with both
-shelves, a dB mode, ballistics; Kaiser Beta Mode = Manual). Those two numbers are counted from `eval()` at v2.12.0
-(they were 20 / 33 before the v2.10 parameters). The live count is not an estimate: `eval()` increments it and
-hands it back, and it is reported as the Info CHOP channel `param_reads`, so the numbers in this paragraph can be
-checked against a running node. Every parameter is read on every cook, so a change takes effect on the next frame.
+With the defaults (Coherent Gain, Frame Peak, Samples, Coefficient, Kaiser β 15 Manual; EQ and Ballistics
+**off**) the node outputs N/2+1 of the padded FFT (8193 samples at the default pad) and output bins that cover
+several FFT bins report their peak. Every optional section is bypassed entirely — code *and* parameter reads —
+when disabled: `eval()` reads **30** parameters per cook in the default configuration, against **43** with every
+optional section on (EQ with both shelves, a dB mode, ballistics; Kaiser Beta Mode = Manual). The live count is
+reported as the Info CHOP channel `param_reads`, so these numbers can be checked against a running node. Every
+parameter is read on every cook, so a change takes effect on the next frame. When PluginBuilder reloads the DLL,
+a node keeps the parameter values it already had; parameters it did not have yet arrive with their defaults.
 
 ## How the resampling works
 
@@ -289,37 +270,34 @@ resamples the linear grid onto a new frequency axis of `n_out` bins:
    grid: `frac = target_hz[i] / nyquist * (fft_size/2)`, then stores `i0 = floor(frac)` and `w = frac - i0` into two
    tables (8 bytes per output bin).
 3. **Interpolation.** `applyWarp` walks the output and reads `src[i0] + w * (src[i0+1] - src[i0])` — a 2-tap linear
-   interpolation, or a 4-tap Catmull-Rom cubic with `Warp Interpolation = Cubic`. Since v2.12, 8 output bins whose
-   taps all fall inside one 8-float window (the fine, upsampled part of the axis — ~83 % of the vectors at a
-   16384-bin Log axis) read each tap with one unaligned load plus one `vpermps`; the rest use an AVX2 `vgatherdps`.
-   Both paths are bit-identical.
+   interpolation, or a 4-tap Catmull-Rom cubic with `Warp Interpolation = Cubic`. When the taps of 8 output bins all
+   fall inside one 8-float window (the fine, upsampled part of the axis — ~83 % of the vectors at a 16384-bin Log
+   axis), each tap is read with one unaligned load plus one `vpermps`; the rest use an AVX2 `vgatherdps`. Both
+   paths are bit-identical.
 4. **Aggregation.** Where one output bin covers two or more FFT bins (the coarse end of a perceptual axis),
    `Warp Aggregation` replaces the interpolated value with the largest FFT bin in the range (Peak, the default) or
-   its power mean (RMS); Off keeps the interpolation. Since v2.12 the trailing run of aggregated bins is not
-   interpolated first, since aggregation overwrites it anyway.
+   its power mean (RMS); Off keeps the interpolation. The trailing run of aggregated bins is not interpolated
+   first, since aggregation overwrites it anyway.
 
 So going from 16384 bins to 16384 bins does **not** upsample anything: the same band is described by a different
 number of samples. Fewer bins means the axis is coarser (each output bin covers a wider slice of the linear grid,
 and `Warp Aggregation` decides what it reports); more bins than `fft_size/2+1` means bins are interpolated
 *between* real FFT bins — smooth, but with no information that was not already there. The one case with no loss is
 the identity grid, where `isIdentity()` is true and the warp is a `memcpy`: the output is the linear FFT grid
-itself, copied, with no interpolation step and no rounding, every bit the transform produced. There are two ways
-to get it:
+itself, copied, with no interpolation and no rounding. There are two ways to get it:
 
-- **`Raw RFFT Bins` on** (v2.11). The toggle forces it: N/2+1 samples, DC..Nyquist, whatever the axis parameters
-  say — and it greys those parameters out, so the two spellings cannot disagree. This is the one to use.
+- **`Raw RFFT Bins` on.** Forces it: N/2+1 samples, DC..Nyquist, whatever the axis parameters say — and it greys
+  those parameters out, so the two spellings cannot disagree. This is the one to use.
 - **The equivalent setting**: Scale = Linear, `blend = 0`, `Display Max >= Nyquist` and `n_out = fft_size/2+1`
-  (Output Bins Mode = Auto, or Fixed with that count). The warp detects it on its own. (v2.8 removed an older
-  `Raw Linear Bins` toggle because it was a second spelling of this setting that could disagree with it; the v2.11
-  toggle avoids that by greying the axis parameters out while it is on.)
+  (Output Bins Mode = Auto, or Fixed with that count). The warp detects it on its own.
 
 ### Output sample rate
 
 The CHOP reports **`output_sample_rate = output bins × me.time.rate`**: one output vector of `bins`
 samples is produced every `1/me.time.rate` seconds, so at the defaults (Output Bins Mode = Auto, Zero-Pad
-Len 16384 → 8193 bins, 60 fps) that is **491 580 samples/s** (983 040 with `Fixed` and 16384 bins). `me.time.rate` is the timeline rate *where the node lives*
-(`OP_TimeInfo::rate`), so inside a component with Component Time the component's rate is used, not
-the root's; it is read every cook, so an FPS change shows up on the next frame.
+Len 16384 → 8193 bins, 60 fps) that is **491 580 samples/s** (983 040 with `Fixed` and 16384 bins). `me.time.rate`
+is the timeline rate *where the node lives* (`OP_TimeInfo::rate`), so inside a component with Component Time the
+component's rate is used, not the root's; it is read every cook, so an FPS change shows up on the next frame.
 
 Read this as the rate of the frames **concatenated**: it says how fast spectrum data leaves the
 node, which is what you size a buffer, a ring, a GPU upload or a network send with. It is not a
@@ -357,115 +335,63 @@ it is (`hz_per_sample` does, since the same band is split into more or fewer ste
 | `linear_grid` | 1 when the built warp is the identity, i.e. the output grid *is* the linear FFT grid and the magnitude was copied rather than resampled. Read from the warp tables, not from a parameter, so it cannot disagree with what the DSP did |
 | `channel_fanout` | 1 when the last cook fanned its channel loop out over cores. 0 is the normal reading: `Mono Mix` (the default) has one channel and nothing to split, and several mono channels means several node instances |
 
-`getInfoPopupString` (middle-click the node) prints all of them, plus the cook delta the throughput
-was measured over.
+`getInfoPopupString` (middle-click the node) prints the rate, the axis and the measured throughput, plus the
+cook delta the throughput was measured over.
 
-## Performance (fft_bench, 1 channel, N = 32768, 16384 bins, Log)
+## Performance
 
-**Which machine a row came from matters more than the row does**, so each block names one. Absolute times on a
-laptop move with thermals and with the plan that is live; the direction of a comparison is the durable part.
+All figures below: **i9-13900H** (Raptor Lake, 6 P-cores + 8 E-cores / 20 threads, AVX2 + FMA, no AVX-512),
+`fft_bench`, 1 channel, medians in µs of runs interleaved in random order, pinned to one P-core at high priority
+on an idle CPU. FFTW3 backend with a measured plan unless the row says otherwise.
 
-**The current numbers are the v2.12.0 block** ([*Current numbers: v2.12.0*](#current-numbers-v2120-i9-13900h)) and
-the library A/B after it. The first two tables are kept as history: they were measured on earlier builds, before
-the v2.10–v2.12 real-time and SIMD passes, and the heading above describes their configuration, not the current
-defaults (which output 8193 bins from a 16384-point FFT).
+| Metric | µs (median) |
+|---|---|
+| pipeline, full chain (dB + ballistics + spectral features) | **22.20** |
+| pipeline, plugin defaults | **17.60** |
+| pipeline, Visual 60 preset | **8.90** |
+| cook thread, Async on (Worker Wake = Poll), plugin defaults | **0.60** |
+| cook, synchronous (Async off) | **25.20** |
+| stage: warp, Log linear, 16384 bins | 2.52 |
+| stage: warp, Log cubic, 16384 bins | 4.82 |
+| stage: dB normalised, 16384 bins | 3.58 |
+| stage: peak + index, 16384 bins | 0.94 |
+| spectral features, 8193 bins | ~3.5 |
 
-The table below is the historical record from the original development run ("i7-class desktop", earlier commits,
-plans as built then). It is kept because the *ratios* between configurations are what the parameters are tuned
-against, and because the history paragraph after it refers to it. It is **not** comparable to the i9 numbers
-that follow it.
+The FFT itself is most of the default cost — roughly two thirds, derived from two separate runs (11.55 µs FFTW3
+FFT at N = 16384, below, against the 17.60 µs default pipeline) — so the levers that matter are `Zero-Pad Len`
+and `FFT Backend`. With Async on (the default) none of this runs on the cook thread: the cook ingests, publishes
+the job and copies the last result — 0.60 µs at the defaults (8193 output bins), a cost that scales with
+the output bin count.
 
-| Configuration | FFT+mag | warp | EQ | dB | total / channel |
-|---|---|---|---|---|---|
-| **Default TD config** (Loudness/Weighting/EQ/Ballistics off), cold plan | 41–48 µs | 4.8 µs | – | – | **44–51 µs** |
-| Same after the background measured plan is in (or wisdom cached) | ~36 µs | 4.8 µs | – | – | **~42 µs** |
-| + EQ Enable (6 dB high shelf, applied at ingest) | | | 3.6 µs | | +4 µs |
-| Everything on (dB, A-weighting, ballistics, EQ) | 42–50 µs | 5 µs | 3.6 µs | 3.5 µs | **~60–70 µs** |
-| N = 16384 + **Warp Interpolation = Cubic** (visually equivalent to 32K linear) | 15–16 µs | 9 µs | – | – | **24–27 µs** |
-| N = 8192 | 6.4 µs | 4.7 µs | – | – | **~15 µs** |
-| **Async on** (default): cost on the cook thread, any N, measured with `fft_bench --cook` (caches evicted between cooks) | – | – | – | – | **≈ 11 µs mean / 17 µs p99** at 16384 bins, **≈ 7 µs** at 4096 bins (ingest 2 + snapshot 2 + result copy 2–7; DSP runs on the worker) |
+### FFTW3 vs Intel oneMKL
 
-Re-measured on the development machine — **i9-13900H** (Raptor Lake, 6 P-cores + 8 E-cores / 20 threads, AVX2 + FMA, no AVX-512),
-FFTW3 3.3.11 AVX2 with a `FFTW_MEASURE` plan from wisdom, same 300-iteration `fft_bench` invocation, on a build from
-before the v2.10–v2.12 passes (also history now; see the v2.12.0 block for current figures):
+FFT stage only, median of 3 pinned runs:
 
-| Configuration | FFT+mag | warp | dB | ballistics | total / channel |
-|---|---|---|---|---|---|
-| Default TD config, measured plan from wisdom | 22.45 µs | 4.66 µs | – | – | **28.96 µs** |
-| Everything on (dB + A-weighting + ballistics; EQ unchanged) | 23.57 µs | 4.74 µs | 3.53 µs | 1.29 µs | **39.45 µs** |
+| N | FFTW3 3.3.11 AVX2, `FFTW_MEASURE` | FFTW3, `FFTW_PATIENT` | Intel oneMKL 2026.1.0 | oneMKL faster than MEASURE by |
+|---|---|---|---|---|
+| 8192 | 4.71 µs | – | 3.87 µs | 18 % |
+| 16384 | 11.55 µs | 9.70 µs | 8.41 µs | 27 % |
+| 32768 | 23.65 µs | – | 17.73 µs | 25 % |
 
-Two honest notes on that block. First, `+ EQ Enable` re-measured at **0.01 µs**, i.e. it does not reproduce the
-historical "+4 µs EQ" row on this machine — treat the EQ as free at the default shelf settings until a run says
-otherwise. Second, the historical default row is 44–51 µs against this machine's 28.96 µs, but the two ran on
-different builds, plans and CPUs, so that is **not** a speed-up claim; the controlled comparisons are the
-library A/B below and the `--cook` Async numbers, which hold everything but the variable under test constant.
+A PATIENT plan narrows the gap without closing it (oneMKL still leads by ~13 % at 16K). FFTW3 stays the default
+because it is 3 MB, vendored and wisdom-cached; oneMKL loads 5 DLLs (~177 MiB on this CPU) and spends ~39 ms
+initialising once per process (on the worker thread when Async is on). Deployment notes, the OpenMP hazard it
+avoids and the DLL list are in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 
-### Current numbers: v2.12.0 (i9-13900H)
+### Measuring
 
-The v2.12 AVX2/FMA pass (load + permute warp, table-free `FastLog2Seg` dB, branch-free peak search, vectorised
-spectral features, in-place ballistics, four-accumulator reductions, weighting fused with the dB peak) was
-A/B-measured against the committed v2.11 `fft_bench`: interleaved in random order, pinned to one P-core at high
-priority, 3 rounds on an idle CPU, medians in µs. FFTW3 backend.
-
-| Metric (µs, median) | v2.11 | v2.12 | Speedup |
-|---|---|---|---|
-| pipeline, full chain (dB + ballistics + features) | 36.35 | **22.20** | **1.64×** |
-| pipeline, plugin defaults | 19.10 | **17.60** | 1.09× |
-| pipeline, Visual 60 preset | 9.90 | **8.90** | 1.11× |
-| cook, synchronous (Async off) | 28.15 | **25.20** | 1.12× |
-| stage: warp, Log linear, 16384 bins | 4.50 | **2.52** | **1.79×** |
-| stage: warp, Log cubic, 16384 bins | 8.08 | **4.82** | **1.68×** |
-| stage: dB normalised, 16384 bins | 4.22 | **3.58** | 1.18× |
-| stage: peak + index, 16384 bins | 1.26 | **0.94** | 1.34× |
-| spectral features, 8193 bins | ~16.5 | **~3.5** | ~4.7× |
-
-With the post-processing this lean, the FFT itself is now most of the default cost — roughly two thirds, derived
-from two separate runs (11.55 µs FFTW3 FFT at N = 16384, below, against the 17.60 µs default pipeline) — so the
-levers that matter are `Zero-Pad Len` and the `FFT Backend`. The full A/B, the second pass (reductions) and the
-optimisations that were measured and **not** kept (a fused dB + ballistics + peak kernel, hardware `sqrt`, polynomial
-`log2`, …) are in `CHANGELOG.md`, v2.12.0; the reproducible gate is `ctest -L perf` against
-`bench/perf_baseline.json`.
-
-### Which FFT library is faster: FFTW3 vs Intel oneMKL
-
-**Current measurement (2026-09-23, v2.12 build, i9-13900H, median of 3 pinned runs, FFT stage only):**
-
-| N | FFTW3 3.3.11 AVX2, `FFTW_MEASURE` plan | Intel oneMKL 2026.1.0 | oneMKL faster by |
-|---|---|---|---|
-| 8192 | 4.71 µs | 3.87 µs | 18 % |
-| 16384 | 11.55 µs | 8.41 µs | 27 % |
-| 32768 | 23.65 µs | 17.73 µs | 25 % |
-
-An `FFTW_PATIENT` plan narrows the gap without closing it: 9.70 µs at 16K, so oneMKL still leads by ~13 %. FFTW3
-stays the default because it is 3 MB, vendored and wisdom-cached; oneMKL loads 5 DLLs (~177 MiB on this CPU) and
-spends ~39 ms initialising once per process (on the worker thread when Async is on). The bench flag takes a
-**name**: `--backend fftw3` or `--backend mkl`. `--backend 1` is not an index — it is rejected and the run falls
-back to FFTW3, with a single "unknown --backend" line that is easy to miss; that is exactly how a first comparison
-in the v2.12 work came out backwards (both runs were FFTW3).
-
-The earlier paired runs (v2.9.0 build, same machine) — same binary, same bench invocation, only the library
-differing (`--backend fftw3` vs `--backend mkl`), N = 16384, 16384 bins:
-
-| library | fft+mag | total per cook |
-|---|---|---|
-| FFTW3 3.3.11 AVX2, `FFTW_MEASURE` plan from wisdom | 11.94 µs | 21.06 µs |
-| Intel oneMKL 2026.1.0 | 8.85 µs | 17.63 µs |
-
-Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** every time. That is the measured
-reason the `FFT Backend` toggle exists; a re-run after a clean rebuild reproduced it (mkl 9.66 µs vs fftw3
-14.77 µs on fft+mag, 4/4 pairs, −35 %). Those runs timed fft+mag rather than the FFT alone, with the older
-paired method; the pinned 2026-09-23 medians above (18–27 %) sit inside that range and are the figures to quote.
-
-**The A/B has to be interleaved, or it reports the opposite answer.** Each `fft_bench` process pays a cold
-first-plan and cold-cache cost on whatever library it loads, so a single fftw3 run followed by a single mkl run
-puts the *second* library ahead regardless of which is faster — measured here at 15.65 µs (fftw3, run second)
-against 16.82 µs (mkl, run first), inverting the table above. Alternate the two backends within one loop and
-re-run at least four pairs before believing any of it; the deployment notes, the OpenMP hazard it avoids and the list of DLLs
-it needs are in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
-
-In the historical i7-class table the FFT was 75–85 % of the default cost. History (same bench on every commit):
-the July builds measured 47 µs (measured plan, EQ dead), `d60b7e3` turned the EQ on (+16 µs), `2daf9f1` switched to
-ESTIMATE plans (+18 µs), `f1cb0d0`–`2daf9f1` had a scalar-log10 dB stage (+45 µs when dB was on).
+- **Per-stage timings**: `fft_bench --channels N` (see *Building > Standalone* for the full invocations);
+  `--cook N` simulates N cooks with Async on and off and reports the cook-thread cost and worker pickup;
+  `--info N` measures the info-callback access cost (about 0.6 µs per cook).
+- **Library A/B**: `--backend fftw3` or `--backend mkl`. The flag takes a **name**; a number such as
+  `--backend 1` is rejected and the run falls back to FFTW3 with a single "unknown --backend" line that is easy
+  to miss.
+- **Interleave every A/B.** Each `fft_bench` process pays a cold first-plan and cold-cache cost on the library it
+  loads, so one run of A followed by one run of B favours whichever ran second. Alternate the two within one loop,
+  pin to one core, and take several pairs before believing a difference.
+- **Perf gate**: `ctest -L perf` runs `fft_bench --gate bench/perf_baseline.json` and fails on a regression
+  against the baseline; `--gate ... --update 1` rewrites the baseline.
+- The per-kernel A/B history, and the optimisations that were measured and not kept, are in `CHANGELOG.md`.
 
 ### Threading
 
@@ -477,63 +403,47 @@ Two threads, both named for the debugger, **neither below normal priority**:
 | FFTW background planner (`FFT background planner`) | `THREAD_PRIORITY_ABOVE_NORMAL` | one `FFTW_MEASURE`/`FFTW_PATIENT` plan per FFT size, then exits |
 
 The worker sits one notch above the planner so a cook always wins the core back from it; the planner is above
-normal so a `FFTW_PATIENT` measurement is not starved under load. Since v2.12.1 PATIENT has **no time limit**
-(v2.10–v2.12 capped it at 1.5 s with `fftwf_set_timelimit`): it runs off the cook thread, so a slower machine may
-take as long as it needs to find the best plan (~2.7 s at N = 32768 on the i9-13900H), once per size per machine,
-then wisdom caches it. FFTW's planner is process-wide, so a re-plan requested meanwhile (a size change, another
-node) waits for the planner lock until the measurement ends: with Async on that waiter is the analysis worker and
-TouchDesigner keeps cooking; with Async off it is the cook thread. Deleting the node or quitting TouchDesigner
-mid-measurement waits for it too. A measurement that is no longer wanted is abandoned to a graveyard rather than
-blocking a cook.
+normal so a measurement is not starved under load. A `FFTW_PATIENT` measurement has **no time limit**: it runs off
+the cook thread, so a slower machine takes as long as it needs to find the best plan (~2.7 s at N = 32768 on the
+i9-13900H), once per size per machine, then wisdom caches it. FFTW's planner is process-wide, so a re-plan
+requested meanwhile (a size change, another node) waits for the planner lock until the measurement ends: with
+Async on that waiter is the analysis worker and TouchDesigner keeps cooking (the node holds its last spectrum);
+with Async off it is the cook thread. Deleting the node or quitting TouchDesigner mid-measurement waits for it
+too. A measurement that is no longer wanted (the size or backend changed) is handed to a graveyard and reaped
+when it finishes, rather than blocking a cook.
 
-**FFTW's own threading does not help this node.** `fftwf_init_threads` / `fftwf_plan_with_nthreads` were exported by
-the unversioned `libfftw3f-3.dll` the project used before (the current 3.3.11 build is configured without threads and
-exports neither, which costs nothing — the plugin never called them), but FFTW parallelizes the `howmany` loop and
-multi-dimensional transforms, *not* the inside of a single 1-D transform — and `Mono Mix` (the default) issues exactly
-one transform per cook. Measured with `fft_threads_probe.exe` on the i7-class desktop, against that older DLL:
-nthreads 1 / 2 / 4 / 6 → 68.8 / 85.3 / 81.7 / 102.5 µs, i.e. **slower** under both
-`FFTW_ESTIMATE` and `FFTW_MEASURE` (−13 to −51 %). A `howmany = 4` plan does drop to 29.9 µs per transform, but that
-is FFTW splitting the *batch*; the plugin gets the same effect without the plane of global FFTW state by running its
-channel loop under `std::execution::par` (see below). Run the probe on your own machine before trusting the numbers.
+**FFTW's planner is serialised, on purpose.** The FFTW manual states that `fftwf_execute` (and the new-array
+variants) are the *only* thread-safe routines; planner calls share wisdom and trigonometric tables and "should only
+be called from one thread at a time". So the engine holds one process-wide mutex around every planner call,
+`destroy_plan` and wisdom import/export, on every thread. That is FFTW's own recommended pattern, and it is what
+makes the Async worker and the background planner legal. `fftwf_make_planner_thread_safe` is deliberately not
+used: the manual calls it "the worst of all worlds", and the mutex already does its job with our own priority
+ordering.
 
-**Where the threading actually is: not in this node.** This node is one mono channel per instance. Several
-channels means several node instances, each with its own `FFT Custom CHOP analysis` worker — that is what spreads
-across cores, and it needs no parameter. None of the five `Performance` controls sets a thread count: `Async`
-(worker or inline), `FFT Backend` (which library), `Worker Wake` and `Worker Priority` (how the one worker is woken
-and scheduled), and `Spectral Features`.
+**`Async` off means one thread for the whole node.** No worker is started, and no background plan measurement
+either: `prepare()` leaves the node on `FFTW_ESTIMATE`, says so in the plan line ("measured upgrade deferred:
+Async is off"), and remembers that it is owed one, so turning `Async` back on starts the measurement then. A
+measurement already running when Async is switched off finishes first. `fft_tests` asserts both halves.
 
-**`Async` off really does mean one thread for the whole node.** No worker is started, and the background plan
-measurement — the only other thing that would run off the cook thread — is not started either: `prepare()` leaves
-the node on `FFTW_ESTIMATE`, says so in the plan line ("measured upgrade deferred: Async is off") instead of
-promising an upgrade, and remembers that it is owed one, so turning `Async` back on starts the measurement then
-rather than leaving the node on ESTIMATE forever. `fft_tests` asserts both halves (no background thread over 20
-cooks with Async off, and the upgrade arriving after it is turned back on).
+**FFTW's own threading does not help this node.** FFTW parallelises the `howmany` loop and multi-dimensional
+transforms, not the inside of a single 1-D transform, and `Mono Mix` (the default) issues exactly one transform per
+cook. The vendored 3.3.11 build is configured without threads, which costs nothing (the plugin never calls them).
+`fft_threads_probe` (`bench/fftw_threads_probe.cpp`) measures it on a DLL that has the threads API and reports
+"absent" on one that does not.
 
-**FFTW's planner is serialised, on purpose.** The manual is explicit that `fftwf_execute` (and the new-array
-variants) are the *only* thread-safe routines and that everything else — the planner — "should only be called from
-one thread at a time", because planner calls share wisdom and trigonometric tables. So the engine holds one
-process-wide mutex around every planner call, on both threads: the cook thread's `prepare()` and the background
-measurement take the same lock, as do every `destroy_plan` and the wisdom import/export. That is FFTW's own
-recommended pattern (a semaphore around planner calls) and it is what makes the Async worker and the background
-planner legal at all. `fftwf_make_planner_thread_safe` is deliberately not used: the manual calls it "the worst of
-all worlds" and our mutex already does its job with our own priority ordering.
+**Where the parallelism is.** This node is one mono channel per instance; several channels means several node
+instances, each with its own worker, and that is what spreads across cores. None of the five `Performance`
+controls sets a thread count. Inside one node, the channel loop runs under `std::execution::par` when a job has
+more than one channel (`Channels = All Channels`), with no knob: each channel owns its `DspState` and the only
+shared state is read-only. With `Mono Mix` the branch is a single integer compare and the serial path is taken.
+`fft_bench --channels 2|4|8` measures the fan-out; the output is identical to the serial path bin for bin.
 
-The internal channel loop does run under `std::execution::par` when a job has more than one channel, with no knob
-either way: each channel owns its `DspState` (padded frame, magnitude, scratch, ballistics history) and the only
-shared state is read-only. It applies to `Channels = All Channels` only — `Mono Mix` produces one transform per
-cook, so the branch is a single integer compare and the serial path is taken. `fft_bench` measures it at 2 / 4 / 8
-channels: **38 % / 65 % / 76 % faster** than serial, outputs identical bin for bin.
+## The middle-click info popup and the diagnostics
 
-## The middle-click info popup: why it goes blank, and how to fix it
+### The popup is a snapshot of the last cook, not a query
 
-This was the most expensive bug in the project's history, it was misdiagnosed three times, and it is written down
-here so the next person spends ten minutes on it instead of a day. **Read the mechanism first: almost every wrong
-guess comes from assuming the popup asks the plugin for its text.**
-
-### The mechanism: the popup is a *snapshot of the last cook*, not a query
-
-TouchDesigner's middle-click does **not** call the plugin. It renders whatever the *last cook* left behind. Every
-information callback runs inside a cook, in this order, documented at the top of `CHOP_CPlusPlusBase.h`:
+TouchDesigner's middle-click does **not** call the plugin; it renders the text the *last cook* left behind. Every
+information callback runs inside a cook, in this order (documented at the top of `CHOP_CPlusPlusBase.h`):
 
 ```
 getGeneralInfo -> getOutputInfo -> getChannelName xN -> execute()
@@ -542,175 +452,81 @@ getGeneralInfo -> getOutputInfo -> getChannelName xN -> execute()
   -> getInfoPopupString -> getWarningString -> getErrorString
 ```
 
-Two consequences follow, and they are the whole of this section:
+Two consequences:
 
-1. **A node that is not cooking has no information surface at all.** No popup, no Info CHOP, no Info DAT, no
-   warning, and - the one that actually hurts - **no `getErrorString`**, so a hard failure (a plan that will not
-   build, an input with no usable sample rate) reports itself as silence instead of an error badge.
-2. **There is no plugin-side change that can force a render.** If the chain is not entered, nothing written in
-   `getInfoPopupString` is ever read. Any fix attempted there is a fix aimed at the wrong component.
+1. **A node that is not cooking has no information surface at all**: no popup, no Info CHOP, no Info DAT, no
+   warning and no `getErrorString`, so a hard failure (a plan that will not build, an input with no usable
+   sample rate) shows as silence instead of an error badge.
+2. **No plugin-side change can force a render.** If the chain is not entered, nothing in `getInfoPopupString`
+   is read.
 
-### The two failure modes, and the one thing that tells them apart
+### What the popup contains
 
-A blank popup is one of exactly two things, and they need opposite fixes:
+`renderInfoCache()` formats the Info DAT rows and the popup text at most every 250 ms, or when the status or the
+plan log changes; `getInfoPopupString` hands the text over with one `setString`. The text starts with an identity
+block — `Node:` (the node path), `Plugin:` (the version) and `Binary:` (the DLL that answered,
+`OP_NodeInfo::pluginPath`) — so it is never textually empty. Then come the engine, FFT size, axis, rate, output,
+cook and DSP times, SIMD, and the last three plan-log lines, each clipped to 72 characters (`kMaxTailLineChars`).
+The whole string is bounded at **1200 characters** (`kMaxPopupChars`): every line after the identity block goes
+through one `add` path that refuses a line that would not fit. A given node therefore hands over the same length
+every cook; the length changes only when an input changes (node path, install path, a plan line). The Info DAT
+`plan_log_*` rows and the textport carry the plan lines unclipped.
+
+**Rule: never put a diagnostic in the popup string.** A popup that grew to ~1760 characters rendered empty, and
+shrinking it brought it back. The SDK documents no length limit for `OP_String::setString`, so the mechanism is
+not established; the bound and this rule are the safeguard. Diagnostic values go in the Info DAT row
+`info_callback_calls`, which TouchDesigner reads as a value, not as the popup.
+
+### Diagnosing a blank popup
+
+Read Info DAT row 19, `info_callback_calls`:
+`popup N (M chars), Info CHOP N, Info DAT N | largest cook gap X ms` (refreshed with the rest of the cache).
 
 | | Chain **not** entered | Chain entered, text **not** rendered |
 |---|---|---|
-| `info_callback_calls` Info DAT row | counters **frozen** (they stop advancing while the node cooks) | counters **climb** — popup count tracks `cookCount` 1:1 |
-| The popup's own character count (same row) | stale, alongside a frozen call count | steady and ordinary; **a constant now** (v2.9.1 clipped and bounded the tail, so the same node hands over the same number every cook; it was ~800-1300 before, and ~1660 in v2.8) |
-| Meaning | the node stopped cooking → fix the cook, not the popup | the string is fine and TouchDesigner did not draw it → **not a plugin problem** |
-| Fix | see *"Making sure the node is cooking"* below | report to Derivative with that evidence |
+| The call counters | **frozen** (they stop advancing) | **climb** — the popup count tracks the cook count |
+| The popup's character count | stale, alongside the frozen counters | steady and ordinary (a constant for a given node) |
+| Meaning | the node is not cooking → fix the cook, not the popup | the string was handed over and TouchDesigner did not draw it → **not a plugin problem** |
+| Fix | the checklist below | report to Derivative with that row as evidence |
 
-Both columns are read from the **same Info DAT row**, which is the point: the popup is the symptom, and the row is
-the measurement. Nothing is printed to the textport for this any more — a periodic announcement line used to be
-emitted from `getInfoPopupString`, and it was removed in v2.9.0 (see *"The cost of the info chain"* below for why a
-print on that path is the wrong instrument).
+Nothing about this is printed to the textport: a print on the info path costs cook time and shares a code path
+with the thing it would be monitoring.
 
-**The popup string is never textually empty** - its first line is always `Node: <path>`, built before anything that
-can throw. So a blank popup is never "the string came out empty"; it is always "the callback did not run, or ran
-and was not drawn". That invariant is deliberate and should be preserved.
+**Making sure the node is cooking**, most frequent cause first:
 
-### The cost of the info chain: why the popup could take a frame or two to appear
-
-This is the one part of the popup problem that was **measured and then fixed**, as opposed to correlated and left
-alone. It answers the report that the info "sometimes takes time to show up, or takes multiple attempts at the
-middle-click to trigger it" — with the DLL loaded and the FFT visibly running.
-
-The callbacks are called **inside a cook**, so every microsecond they spend is added to the node's cook time on the
-thread that just ran the analysis. TouchDesigner drives them one item at a time, and the counts are not small:
-
-| Callback | Calls per cook | What each call asked for, before v2.9.0 |
-|---|---|---|
-| `getInfoCHOPChan` | **21** | take `myStatusMutex`, copy a `Status` (two `std::string` members → two heap allocations) |
-| `getInfoDATSize` | 1 | take the log mutex, **copy all 256 log strings** to declare the row count |
-| `getInfoDATEntries` | **276** | take `myStatusMutex`, copy a `Status` again — *per row* |
-| `getInfoPopupString` | 1 | take `myStatusMutex` + copy a `Status`, then **copy all 256 log strings again** for a 3-line tail |
-
-That is **~300 mutex acquisitions, ~850 heap allocations and ~512 string copies per cook**, on the real-time thread —
-and on the *same* mutexes the audio worker takes when it logs a plan event, which is why it was worse around a
-rebuild than in the steady state. It also flatly contradicted the "no allocation on the cook thread after warm-up"
-invariant the rest of the plugin is built around.
-
-Fixed by making the access pattern pay once per cook instead of once per call:
-
-- **`statusSnapshot()` is memoized behind a version stamp.** The published copy only moves when the worker rebuilds
-  a plan or the tables, so the reader compares an atomic counter and reuses the previous copy. (The write side was
-  already gated this way; only the read side was re-copying.)
-- **`PlanLog::version()` + `PlanLog::snapshotTail(n, out)`.** The DAT row view is re-taken only when the log actually
-  changed, and the popup copies the three entries it renders into a reused scratch vector instead of the whole
-  history.
-
-Measured with `fft_bench --info 2000`, which drives the same access pattern against the real `PlanLog`:
-
-```
-info-callback access cost (298 status reads + the 276-row log view, per cook, 2000 cooks):
-  re-lock + re-copy every call       54.6 us/cook
-  memoized + version-stamped          0.6 us/cook   -99%
-  saved                              54.0 us/cook   (0.32% of a 16.7 ms frame at 60 fps)
-```
-
-For scale, the analysis itself is ~88 µs/cook for one channel at these settings — so the *bookkeeping for reading
-the node's own status* was costing about as much as the DSP it was reporting on. `fft_bench --info N` is kept so the
-number can be re-taken rather than re-argued.
-
-Note what this does and does not claim. It removes a large, real, measured cost from the path a middle-click query
-walks, and it removes the ~850 allocations and the mutex traffic that could block the cook thread behind the audio
-worker. It does **not** prove TouchDesigner's renderer was timing out; nothing on this machine can measure that.
-
-### Rule: never put a diagnostic in the popup string
-
-This is not a style preference; it is what broke the popup, twice in each direction, and it is the one change that
-was measured. The string that renders is a fixed identity block plus a telemetry body - a set of numbers whose
-length is dominated by the two paths - and then up to **three** plan-log lines, each clipped to **72 characters**.
-**The whole thing is hard-bounded at 1200 characters** (`kMaxPopupChars` in `FFT.cpp`), with every append past the
-identity block going through one `add` lambda that refuses a line which would not fit. That last part is a
-correction, not a detail: the bound used to guard **only the tail loop**, so the ~780-character body plus one
-240-character plan line could be handed over before anything was checked - the failure the bound existed to prevent,
-inside the bound's own implementation. Adding two diagnostic lines - `Info callbacks entered: ...` and
-`Cook stall: ...` -
-took the string to roughly 1760 and the popup rendered **empty**; removing them brought it back. No size limit is
-documented anywhere in the SDK (`OP_String::setString` is a bare `virtual void setString(const char* val)`, no cap
-stated), so what TouchDesigner does above some undisclosed length is **not** established - but the correlation was
-reproduced in both directions, and it is enough to state the rule:
-
-> **No diagnostic may ever be added to the popup string.** Diagnostic values go in the `info_callback_calls` Info DAT
-> row (row 19), which TouchDesigner reads as *a value*, not as the popup. A diagnostic that is rendered by the thing
-> it is measuring can change what it measures - and here it appears to have done exactly that.
-
-The same rule is why the popup carries a **character count** into that Info DAT row instead of printing it.
-
-### Rule: the popup's length is a constant
-
-A corollary of the above, and the other half of making the length signal worth reading. In v2.9.0 the popup's length
-swung by hundreds of characters between cooks: the body is fixed, but each rendered plan-log line runs to ~240
-characters because the engine's backend description embeds the absolute path of the FFT library, so a blank popup
-beside a length of 900 or 1300 meant the same thing - nothing. v2.9.1 clips each rendered line
-(`kMaxTailLineChars`, via `FFTDSP::clipLine`) and bounds the total, so the same node hands over the same number on
-every cook. That is what makes the row readable: a different number now means one of the *inputs* changed (the node
-path, the install path, or a plan line), never that the string outgrew something between one cook and the next.
-Clipping is for the popup only - the Info DAT's `plan_log_*` rows and the textport carry the line whole, because
-neither is a fixed-size surface and a clipped log line read as the log would be worse than a long popup.
-
-### Making sure the node is cooking (branch 1)
-
-In order of how often each is actually the cause:
-
-1. **Is the DLL loaded in the node the one you just built?** TouchDesigner does **not** reload a DLL when the file
-   on disk changes. It is easy to spend a day alternating between two different builds and calling the result
-   "intermittent". Pulse **`Reloadplugin`** on the PluginBuilder COMP (the `Reloadplugin` handler in `PluginBuilderExt.py`, which calls
-   `_do_copy_plugin(force=True)`), or turn the
-   loader's `unloadplugin` off/on. To confirm which DLL answered, middle-click and read the `Binary:` line - it
-   prints `OP_NodeInfo::pluginPath`.
-2. **There are two installs, and only one of them auto-updates.** `<project>/__Plugins__/FFT/FFT.dll` is copied by
+1. **Is the loaded DLL the one you just built?** TouchDesigner does **not** reload a DLL when the file on disk
+   changes. Pulse **`Reloadplugin`** on the PluginBuilder COMP (it calls `_do_copy_plugin(force=True)` in
+   `PluginBuilderExt.py`), or turn the loader's `unloadplugin` off and on. While the loader is unloaded the popup
+   is blank, even though the spectrum on screen can still look fine. To confirm which DLL answered, middle-click
+   and read the `Binary:` line.
+2. **There are two installs, and only one auto-updates.** `<project>/__Plugins__/FFT/FFT.dll` is copied by
    PluginBuilder on every build. `~/Documents/Derivative/Plugins/FFT/FFT.dll` (the registered Custom Operator) is
-   updated **only** by the **Install Plugin** pulse and drifts stale - it was three builds behind during the session
-   that produced this note. Each instance also resolves FFTW3/oneMKL from *its own* directory, so a measurement on
-   one says nothing about the other.
-3. **Is the timeline advancing?** `cookEveryFrame = true` makes the node cook on every frame, not on every
-   wall-clock tick. A paused timeline stops cooking, the spectrum holds its last frame and *looks* fine, and the
-   popup goes blank. This is the single best explanation for "it worked a minute ago".
-4. **Is an error or warning showing on the node?** TouchDesigner reports an error state **in place of** the
-   operator information. Until v2.9.0 both `myErrorText` and the pipeline error string could latch forever
-   (`getErrorString` was driven off a lifetime counter that is never cleared, and `myErrorText` cleared only on a
-   `Reset` pulse), so one transient exception during a hot-swap left a perfectly healthy node flagged as broken
-   permanently. Both now clear on the condition they describe - see `CHANGELOG.md`, v2.9.0.
+   updated **only** by the **Install Plugin** pulse and drifts stale. Each install also resolves FFTW3/oneMKL from
+   *its own* directory, so a measurement on one says nothing about the other.
+3. **Is the timeline advancing?** The node sets `cookEveryFrame = true`, so it cooks on every *timeline* frame. A
+   paused timeline stops cooking, the spectrum holds its last frame and *looks* fine, and the popup goes blank.
+   This is the best explanation for "it worked a minute ago".
+4. **Is an error or warning showing on the node?** TouchDesigner shows an error state **in place of** the operator
+   information. An exception error clears on the next cook that completes, so a persistent error is a current
+   fault.
 5. **The viewer flag on the loader.** For a `.dll` hosted in the built-in CPlusPlus CHOP, the SDK's
    `OP_CustomOPInfo::cookOnStart` does not apply (it is Custom-Operator only), so an active **viewer** flag is the
-   only kick-start available. PluginBuilder sets it (`_ensure_loader_live()`); note that `PluginBuilderExt.py` is
-   loaded when the COMP is created, so a change there is inert until the extension is re-inited or the `.toe` is
-   reopened.
+   only kick-start. PluginBuilder sets it (`_ensure_loader_live()`). `PluginBuilderExt.py` is loaded when the COMP
+   is created, so a change there is inert until the extension is re-initialised or the `.toe` is reopened.
 
-### What is *not* established
+Not established, and not observable from inside a plugin: why a longer string renders blank, and whether
+TouchDesigner's own popup query re-queries, caches or times out. Establish which column of the table applies
+before changing code.
 
-Recorded honestly, because the confident version of this section was wrong three times:
+### The cost of the info chain
 
-- **Why the extra two lines blanked the popup.** The correlation is solid and reproduced in both directions; the
-  mechanism is not. No SDK cap is documented, and no test on the development machine can measure TouchDesigner's
-  renderer.
-- **Whether the popup is stable indefinitely.** The longest confirmed run was ~4800 popup entries (80 s at 60 fps)
-  at a stable 1660-1662 characters - and that same build later reported blank with no code change in between, which
-  is why the cook-driven mechanism above is the one to reach for first.
-- **That any given blank popup is this node's fault.** Establish which branch it is from the table above before
-  changing a line of code.
-- **That the info-chain cost was the *whole* cause of the slow popup.** What is measured is that the access pattern
-  cost 54.6-60.7 µs/cook and now costs 0.4-0.6 µs/cook (two runs of `fft_bench --info`, both in `CHANGELOG.md`, v2.9.0). Whether TouchDesigner's own query was slow enough to be affected by
-  that - or whether it re-queries, caches, or times out at all - is not observable from inside a plugin.
-- **That the v2.9.1 length change fixed anything.** It removes a mechanism, it does not prove a cause. The popup
-  came back on a build compiled *before* those changes, which is the same "no code change in between" behaviour
-  recorded above - so what the change buys is a clean signal for the next report, not a demonstrated repair.
-
-### What was tried, and what each attempt actually taught
-
-| Change | Result |
-|---|---|
-| `cookEveryFrame = true` (`b388b5a`) | **A real bug, still needed** - `cookEveryFrameIfAsked` is the *weaker* flag ("only if someone asks"), so an idle node genuinely had no information surface. But it was **not** established as *the* popup cause: the popup emptied again afterwards with the flag unchanged. |
-| One `setString` at the end, not two (`6309258`) | Kept. Two calls (short block, then full text) is not the shape observed rendering, and one call is strictly simpler. The safety the two-call order wanted is kept by appending in the `catch` blocks instead of replacing. |
-| Removing the latched error states (`6309258`) | **Kept, independent real defect.** A node can no longer claim a fault it no longer has. |
-| Two diagnostic lines **in the popup string** | **Removed, and the rule above exists because of it.** This is the change that separated working from blank. |
-| Log line once per load, instead of every 300 cooks (`7b419b5`) | **Now removed entirely (v2.9.0).** It went one-shot, then went away: the call count and the character count it carried both live in the `info_callback_calls` Info DAT row, so the line was pure textport noise on the real-time path. |
-| Memoizing `statusSnapshot()` + `snapshotTail()` (v2.9.0) | **Kept, and measured.** 60.7 → 0.4 µs/cook in one `fft_bench --info` run, 54.6 → 0.6 in the run quoted above. This is the only change in this table that was made against a number rather than against a correlation. |
-| Bounding the popup **whole** rather than only its tail, and clipping each rendered plan line (v2.9.1) | **Kept.** Fixes a real bug - `kMaxPopupChars` was documented as a bound on the string and implemented as a bound on the tail loop, so the body plus one long plan line could exceed it. The clip also makes the length a constant, which is what makes the character count in row 19 comparable between cooks. **Not** shown to fix a blank popup: the popup returned on a build compiled before this change. Enforces the rule above instead of explaining the failure. |
-| Removing the `getInfoPopupString() called (...)` textport line (v2.9.1) | **Kept, at the user's request.** Its two facts live in row 19. Worth recording what it cost: printed from *inside* the callback, its absence and the popup's absence looked like a single symptom when they are opposite branches of the table above. A diagnostic that shares a code path with the thing it monitors will eventually be read as a cause. |
+The callbacks run inside the cook, on the thread that just ran the analysis, and TouchDesigner drives them one
+item at a time (36 `getInfoCHOPChan` calls, one `getInfoDATEntries` call per row). So they only hand over cached
+strings: the status snapshot is memoized behind a version stamp, the plan log exposes `version()` and
+`snapshotTail(n, out)` so the popup copies only the three lines it renders into a reused vector, and the
+formatting in `renderInfoCache()` reuses each string's capacity. In the steady state the chain takes no lock and
+(almost) no allocation. `fft_bench --info 2000` drives the same access pattern against the real `PlanLog`:
+about **0.6 µs per cook** on the i9-13900H. Re-take that number after touching any info callback.
 
 ## License / third party
 
@@ -720,9 +536,12 @@ source URL, the MD5 of the tarball, the SHA-256 of the built DLL, and the one up
 build still stamps 3.3.10). If GPL is a problem for a project, the FFT backend is a swap: the `IFFTEngine`
 interface and the registry in `FftBackend.h` exist for that.
 
-**Intel oneMKL is not distributed with this project.** It is under the Intel Simplified Software License —
-redistribution allowed, no royalty, but the DLLs may not be modified or renamed and the license notices have to
-ship with them, which is the user's call and not a build script's. The `FFT Backend` toggle loads it from wherever
-the user installs it; if it is not there the node logs which file it looked for and uses FFTW3. This is also why
-neither library is *linked*: both export the same `fftwf_*` symbols, so a link would freeze the choice at build
-time and make the toggle impossible.
+**Intel oneMKL is optional and not distributed with this project** (14 DLLs, ~456 MiB; see *Building >
+Standalone*). It is under the Intel Simplified Software License — redistribution allowed, no royalty, but the
+DLLs may not be modified or renamed and the license notices have to ship with them, which is the user's call and
+not a build script's. The `FFT Backend` toggle loads it from wherever the user installs it; if it is not there
+the node logs which file it looked for and uses FFTW3. This is also why neither library is *linked*: both export
+the same `fftwf_*` symbols, so a link would freeze the choice at build time and make the toggle impossible.
+
+**The repository has no `LICENSE` file yet.** What it needs before the plugin is distributed is listed in
+[INSTALLER_PLAN.md](INSTALLER_PLAN.md), §6.

@@ -1,6 +1,6 @@
 # Plugin_FFT — Windows installer plan
 
-**Date:** 2026-09-23. **Plugin version:** 2.12.0.
+**Current as of:** Plugin_FFT v2.12.1.
 
 **Goal:** one `.exe` that installs everything the FFT CHOP needs on another Windows machine into
 `C:\Users\<user>\Documents\Derivative\Plugins\FFT`, with no admin rights and no manual file copying.
@@ -31,8 +31,8 @@ Measured on this machine with `dumpbin /dependents` and a live module list of `f
 Measured on the i9-13900H with oneMKL active: exactly `mkl_rt`, `mkl_core`, `mkl_sequential`, `mkl_avx2` and
 `mkl_vml_avx2` load (~177 MB). The other CPU variants are there for other machines.
 
-**Not shipped:** `mkl_intel_thread`, `mkl_tbb_thread` and `libimalloc.dll`. These were removed from the
-deployment on 2026-09-23. The plugin calls `MKL_Set_Threading_Layer(SEQUENTIAL)` at load, so the two
+**Not shipped:** `mkl_intel_thread`, `mkl_tbb_thread` and `libimalloc.dll` (in the Intel redist package, never
+loaded by the plugin). The plugin calls `MKL_Set_Threading_Layer(SEQUENTIAL)` at load, so the two
 threading layers can never be used, and `libimalloc` never loads on the FFT path. The details are in
 `PluginProjects/FFT/3rdParty/fftw3/README.md`, "Using Intel oneMKL".
 
@@ -188,8 +188,8 @@ Type: files; Name: "{app}\*.dll.old.*"
 Type: files; Name: "{userdocs}\Derivative\Plugins\FFT.dll"   ; a loose copy from manual installs
 ```
 
-The `{app}\*.dll` wipe also covers the files dropped on 2026-09-23 (`libfftw3f-3.dll`, `libimalloc.dll`,
-`mkl_intel_thread.3.dll`, `mkl_tbb_thread.3.dll`).
+The `{app}\*.dll` wipe also removes any stray file of the list above that an older manual copy left behind
+(`libfftw3f-3.dll`, `libimalloc.dll`, `mkl_intel_thread.3.dll`, `mkl_tbb_thread.3.dll`).
 
 ---
 
@@ -305,6 +305,6 @@ Tooling:
 | `oneMKL-licenses/license.txt`, `third-party-programs.txt` | same package | onemkl |
 
 Related notes:
-- `ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md` (what else to take from EssentiaTD);
+- `ESSENTIATD_LESSONS.md` (what else to take from EssentiaTD);
 - `PluginProjects/FFT/3rdParty/fftw3/README.md` ("Using Intel oneMKL", now updated to the 14-file set);
-- `AUDIT_AND_PLAN_2026-09-23.md`.
+- `AUDIT_AND_PLAN.md`.

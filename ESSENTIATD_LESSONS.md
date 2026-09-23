@@ -1,6 +1,6 @@
 # EssentiaTD → Plugin_FFT: what is worth porting
 
-**Date:** 2026-09-23. **Plugin_FFT version:** 2.12.0.
+**Current as of:** Plugin_FFT v2.12.1.
 
 **EssentiaTD reviewed:** v2.0.3 (HEAD `c050b40`), Darien Brito, AGPL-3.0-or-later.
 
@@ -14,10 +14,7 @@ The ~420 vendored Essentia headers and the 107 MB static lib were inventoried, n
 
 **Lens:** Plugin_FFT is an FFT-only CHOP. Tonal key detection, beat tracking and BPM do not apply. What
 counts is anything that touches the spectrum, the cook model, TouchDesigner integration, robustness, testing
-and distribution. The installer is covered separately in `INSTALLER_PLAN_2026-09-23.md`.
-
-This note **supersedes the parts of** `../FFT_IMPLEMENTATION_COMPARISON_EssentiaTD_vs_PluginFFT.md`
-(2026-08-21) that §7 lists as wrong or stale.
+and distribution. The installer is covered separately in `INSTALLER_PLAN.md`.
 
 ---
 
@@ -363,27 +360,29 @@ following, all computed from the linear magnitude:
   - GitHub Release on `v*` tags with unversioned asset names.
   - No code signing anywhere; macOS ad-hoc only.
   - Plugin_FFT has **no CI yet**. §5 of the installer plan sketches a workflow.
-- **Installer:** see `INSTALLER_PLAN_2026-09-23.md`, which adapts their `.iss` line by line.
+- **Installer:** see `INSTALLER_PLAN.md`, which adapts their `.iss` line by line.
 
 ---
 
-## 7. Corrections to `FFT_IMPLEMENTATION_COMPARISON_EssentiaTD_vs_PluginFFT.md` (2026-08-21)
+## 7. Reference designs for other open ideas
 
-| Old claim | Status |
-|---|---|
-| Essentia's FFT is FFTW3 r2c | **Wrong.** The build excludes `fftw*.cpp` (`ci/essentia-CMakeLists.txt:55-58`) and registers **FFTK = KissFFT 1.3.0** under the name "FFT" (`ci/essentia_algorithms_reg.cpp:203`), scalar float, no `USE_SIMD`. `fftw.h` is in the vendor tree only because all headers are installed. The "same primitive" framing and the performance comparison don't hold. |
-| Plugin_FFT's defaults: window 3175, **pad 32768**, 16385 bins | **Stale.** Pad default is 16384. Output Bins Mode = Auto gives N/2+1 = 8193, or Fixed = exactly Output Bins. Raw RFFT Bins and Zero-Padding toggles (v2.11). |
-| Plugin_FFT always emits a frame; the FIFO zero-fills | True, and §2.1 above shows the flip side: it also emits on *stale* cooks. |
-| "Plugin_FFT magnitudes are ~half of Essentia's; add ×2" (§6.4, §9.4) | **Covered by `Magnitude Normalization = Full Scale`**, which uses the same "sine reads its amplitude" convention as Essentia's `normalized=true`, DC/Nyquist handled. The doc's own reasoning had visible self-corrections and was never measured; pin it with a test. |
-| Rec §9.2: clarify "Bins" versus the FFT bin count | **Done** in v2.11 (Output Bins Mode, `resolution` Info row with FFT size and padding). |
-| Rec §9.3: Essentia-style pad factor | Superseded by the Zero-Padding toggle + Zero-Pad Len menu. |
-| Rec §9.1: optional phase output | Still open (AUDIT §4.4). Low priority for an FFT-magnitude display node; needed only for complex-domain novelty or resynthesis. |
-| Rec §9.7: batch mode | Still open. EssentiaTD's `UnifiedCHOPBase` + `AsyncBatchRunner` + audio fingerprint + a `tie()`-based parameter staleness check is a clean reference design if we ever want "analyse a whole file into N spectra". |
-| Line references into `FFT.cpp` / `DSPModules.h` | **Stale** (pre-v2.4). Don't use them. |
+- **Magnitude convention.** Essentia's `Windowing(normalized=true)` makes a sine of amplitude A read ≈A.
+  Plugin_FFT's `Magnitude Normalization = Full Scale` uses the same convention (DC/Nyquist handled).
+  Worth pinning with a test: a sine of amplitude A reads A in Full Scale, against an independent DFT.
+- **Batch mode** ("analyse a whole file into N spectra"): EssentiaTD's design is a clean reference.
+  - `UnifiedCHOPBase` switches between realtime and batch.
+  - `AsyncBatchRunner` runs the batch on a worker, with cancel and progress.
+  - A 16-probe audio fingerprint triggers Autocompute.
+  - A `std::tie`-based parameter snapshot warns when the cached result is stale.
+- **Phase output:** EssentiaTD exposes phase (`CartesianToPolar`). It is only needed for complex-domain
+  novelty or resynthesis; low priority for a magnitude display node.
 
 ---
 
-## 8. Suggested roadmap (adds to `AUDIT_AND_PLAN_2026-09-23.md`)
+## 8. Suggested order
+
+The canonical, prioritised plan with acceptance criteria is `AUDIT_AND_PLAN.md`; this is the
+EssentiaTD-derived subset in the order it makes sense to do it.
 
 | Order | Item | Section | Effort |
 |---|---|---|---|
