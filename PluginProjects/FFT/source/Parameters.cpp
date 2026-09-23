@@ -252,7 +252,7 @@ const char* kWinmodeNames[]    = { "Samples", "Milliseconds" };
 const char* kWinmodeLabels[]   = { "Samples (Window Sampling)", "Milliseconds (Window Length ms)" };
 const char* kPlannerNames[]    = { "Auto", "Fast", "Measured", "Patient" };
 const char* kPlannerLabels[]   = { "Auto (instant plan, measured plan upgraded in background)", "Fast (Estimate only, never stalls)", "Measured (blocking measure once per size, wisdom cached)",
-                                   "Patient (instant plan, FFTW_PATIENT measured in background, capped at 1.5 s once per size, wisdom cached)" };
+                                   "Patient (instant plan, FFTW_PATIENT measured in background once per size, no time limit, wisdom cached)" };
 const char* kMagnormNames[]    = { "Coherentgain", "Fullscale" };
 const char* kMagnormLabels[]   = { "Coherent Gain (mean(window) = 1)", "Full Scale (sine amplitude 1 -> 1.0)" };
 const char* kDbrefNames[]      = { "Framepeak", "Dbfs", "Agc" };

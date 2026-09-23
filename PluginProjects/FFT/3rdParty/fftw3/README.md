@@ -320,7 +320,6 @@ on the oneMKL path:
 | `fftwf_plan_dft_r2c_1d`, `fftwf_execute_dft_r2c`, `fftwf_destroy_plan` | **required** | plan, run, destroy. Together with the allocator pair these are the five `FftApi::complete()` demands, and a library missing any of them is rejected |
 | `fftwf_import_wisdom_from_filename`, `fftwf_export_wisdom_to_filename` | optional | required *together* to count as a working wisdom cache |
 | `fftwf_sprint_plan` | optional | the only runtime way to see which SIMD kernels the library chose |
-| `fftwf_set_timelimit` | optional | caps the background `FFTW_PATIENT` measurement at 1.5 s (v2.10). Process-global planner state, so it is set and reset inside one planner-mutex section; without it PATIENT simply runs unbounded |
 | `fftwf_init_threads`, `fftwf_plan_with_nthreads` | optional | resolved for their **existence only**, never called. Their presence is reported as "threads API present (unused)" |
 | `fftwf_version`, `fftwf_cc` | optional | **data** symbols, read as C strings |
 | `MKL_Set_Threading_Layer` | optional | oneMKL only, and only when the descriptor asks for it. Not an `fftwf_` symbol at all |
@@ -446,7 +445,8 @@ The FFTW3 plan itself was checked the same day, and the current setup is already
 execute: an out-of-place plan that preserves its input (the r2c default). `FFTW_DESTROY_INPUT` plus
 re-zeroing the pad every frame is 1–5 % slower, and in-place plus re-zeroing is 10–20 % slower.
 `FFTW_PATIENT` executes 10–15 % faster than `FFTW_MEASURE` at 16K/32K; that is what **FFT Planner =
-Patient** buys, at a one-time ~1.5 s background plan per size that is then cached in wisdom.
+Patient** buys, at a one-time background plan per size (~2.7 s at N = 32768 on the i9-13900H, no time limit
+since v2.12.1, so slower machines simply take longer) that is then cached in wisdom.
 
 ### Why the oneMKL backend reports "FFTW 3.3.4", and why that is not out of date
 
@@ -473,12 +473,11 @@ exports **78**, but oneMKL lacks every post-3.3.4 addition — `fftwf_copy_plan`
 oneMKL 2026.0's release notes list DFT optimizations for power-of-two 1-D complex transforms, which
 is exactly this node's workload.
 
-**Nothing the plugin uses is missing.** The plugin resolves **thirteen** `fftwf_` symbols at run
-time, plus one non-FFTW symbol on the oneMKL path (`MKL_Set_Threading_Layer`). The original twelve
-are exported by `mkl_rt.3.dll`; the thirteenth, `fftwf_set_timelimit` (added in v2.10), is listed in
-the vendored `.def` and its name is present in `mkl_rt.3.dll` too (a string search, not a `dumpbin`
-check — and it is optional, and only ever called on the FFTW3 path, since oneMKL never runs a PATIENT
-measurement). Eleven of the thirteen are exported by the vendored `libfftw3f-3.3.11-avx2.dll`; the
+**Nothing the plugin uses is missing.** The plugin resolves **twelve** `fftwf_` symbols at run
+time, plus one non-FFTW symbol on the oneMKL path (`MKL_Set_Threading_Layer`). All twelve are
+exported by `mkl_rt.3.dll`. (v2.10–v2.12 also resolved a thirteenth, `fftwf_set_timelimit`, to cap
+the background PATIENT measurement at 1.5 s; v2.12.1 removed the cap and the symbol with it.) Ten of
+the twelve are exported by the vendored `libfftw3f-3.3.11-avx2.dll`; the
 two exceptions are `fftwf_init_threads` and `fftwf_plan_with_nthreads`, which that build does not
 export because it was configured `-DENABLE_THREADS=OFF`. Both are **optional** — they are resolved
 for their existence only and never called — so their absence costs nothing and cannot produce a null

@@ -2862,15 +2862,17 @@ public:
                    instantly; otherwise use an ESTIMATE plan right away and measure a better one on a background
                    thread, swap it in on the next cook (pollBackgroundPlan) and save it to wisdom. Real-time is never
                    interrupted and the second run of any size is already optimal.
-        Patient  : same scheme with FFTW_PATIENT (measured: -12 % execute time at N = 32768 for 2.7 s of planning,
-                   once per size per machine). The cook thread is never blocked in the steady state - planning
-                   happens on the background thread, after the node already has an ESTIMATE plan in hand.
+        Patient  : same scheme with FFTW_PATIENT, no time limit (measured: 10-15 % faster execute than MEASURE at
+                   16K/32K; ~2.7 s of planning at N = 32768 on an i9-13900H, longer on slower machines, once per
+                   size per machine). The cook thread is never blocked in the steady state - planning happens on
+                   the background thread, after the node already has an ESTIMATE plan in hand.
                    Patient wisdom also satisfies Auto's lookup, so once a size has been planned patiently every
                    policy but Fast benefits.
                    Caveat: FFTW's planner is process-wide and single-threaded, so a plan request (a size
                    change, another instance) that arrives while a patient measurement is running waits on
-                   the planner lock for the rest of that ~2.7 s. What waits is whoever asked next - the
-                   patient node itself already has its ESTIMATE plan and keeps cooking through it.
+                   the planner lock until that measurement ends. What waits is whoever asked next - the
+                   patient node itself already has its ESTIMATE plan and keeps cooking through it; with Async
+                   on the waiter is a worker thread, not TouchDesigner's cook.
     */
     void prepare(size_t fft_size, PlannerPolicy policy, PlanLog* log,
                  const FftBackendInfo* backend = nullptr) override {
@@ -3114,11 +3116,17 @@ private:
         double ms{ 0.0 };
     };
 
-    // Upper bound on a FFTW_PATIENT measurement. FFTW's planner is process-wide and serialised by
-    // plannerMutex(), so every other node that needs a plan waits for as long as a measurement holds the
-    // lock; unbounded PATIENT was ~2.7 s at N = 32768. fftwf_set_timelimit keeps the best plan found in
-    // the budget (FFTW returns the best plan measured so far when the limit expires).
-    static constexpr double kPatientTimeLimitS = 1.5;
+    // No time limit on a FFTW_PATIENT measurement (v2.12.1; v2.10-v2.12 capped it at 1.5 s with
+    // fftwf_set_timelimit). The measurement runs on this background thread and never on the cook
+    // thread, so a slower machine may take as long as it needs to find the best plan: ~2.7 s at
+    // N = 32768 on the i9-13900H, longer elsewhere, once per size per machine (wisdom caches it).
+    // What an unbounded measurement can still make WAIT, because FFTW's planner is process-wide and
+    // serialised by plannerMutex():
+    //   * a re-plan of this or another node (prepare() takes the lock blocking). With Async on that is
+    //     the analysis worker, so TouchDesigner keeps cooking and the node holds its last spectrum;
+    //     with Async off it is the cook thread (no new measurement starts while Async is off, but one
+    //     already running when it was switched off finishes first);
+    //   * teardown (~FFTWEngine joins the planner thread before the library can go away).
 
     // rigor: FFTW_MEASURE or FFTW_PATIENT. Runs at ABOVE_NORMAL: it must never be starved below the
     // normal-priority threads it is racing, so that a plan upgrade finishes in its budget instead of
@@ -3146,11 +3154,8 @@ private:
             fftwf_plan p = nullptr;
             {
                 std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
-                const bool limit = (t->rigor == FFTW_PATIENT) && t->api.setTimelimit;
-                if (limit) t->api.setTimelimit(kPatientTimeLimitS);
                 Buffers b(t->api, t->size);
                 if (b.ok()) p = t->api.planR2C(static_cast<int>(t->size), b.in, b.out, t->rigor);
-                if (limit) t->api.setTimelimit(-1.0);                  // FFTW_NO_TIMELIMIT: the setting is process-global
                 if (p && !wisdom.empty()) t->api.exportWisdom(wisdom.c_str());
             }
             t->ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -3174,8 +3179,9 @@ public:
             m_bg.reset();
             return false;
         }
-        // try_lock, not lock: another node's measurement may hold the process-wide planner lock for up
-        // to kPatientTimeLimitS. The ready plan waits for the next job instead of stalling this thread.
+        // try_lock, not lock: another node's measurement may hold the process-wide planner lock for as
+        // long as it takes (PATIENT has no time limit). The ready plan waits for the next job instead of
+        // stalling this thread.
         std::unique_lock<std::mutex> lock(plannerMutex(), std::try_to_lock);
         if (!lock.owns_lock()) { m_bg->plan.store(ready); return false; }
         if (m_bg->size != m_fft_size || m_bg->api.destroyPlan != m_backend.api.destroyPlan) {   // size/library changed: discard

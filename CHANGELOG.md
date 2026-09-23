@@ -48,6 +48,21 @@ below still name as history, were retired 2026-09-23; see git history.)
 
 ---
 
+## [v2.12.1] - 2026-09-23 — FFT Planner = Patient has no time limit
+
+### Changed
+- **The background `FFTW_PATIENT` measurement is no longer capped.** v2.10–v2.12 bounded it at 1.5 s with
+  `fftwf_set_timelimit`. The measurement runs on its own thread, never on the cook thread, so a slower machine
+  may now take as long as it needs to find the best plan: ~2.7 s at N = 32768 on the i9-13900H, once per size
+  per machine, then cached in wisdom. The `fftwf_set_timelimit` hookup is removed from `FftBackend.h`; the
+  plugin resolves twelve `fftwf_` symbols again.
+- The FFT Planner menu label says "no time limit".
+- **What can still wait on an unfinished measurement**, because FFTW's planner is process-wide:
+  - a re-plan (a size change, another node). With Async on that is the analysis worker, so TouchDesigner
+    keeps cooking. With Async off it is the cook thread: no measurement starts while Async is off, but one
+    already running when it was switched off finishes first;
+  - deleting the node or quitting TouchDesigner while a measurement runs.
+
 ## [v2.12.0] - 2026-09-23 — AVX2/FMA pass: load+permute warp, branch-free peak, table-free dB log, vector features
 
 Every kernel change was A/B-measured before it was kept: the committed v2.11 `fft_bench` against this

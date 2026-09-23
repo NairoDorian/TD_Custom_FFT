@@ -237,7 +237,7 @@ v2.10 the node tells TouchDesigner which parameters the current settings make in
 | Spectrum | Window Length ms | Float | 72 | used when mode = Milliseconds (slider 1…1000, accepted 0.1…5000) |
 | Spectrum | Zero-Padding | Toggle | **On** | Off = the FFT runs on the window itself (N = window length rounded up to even, so the last bin is exactly Nyquist); Zero-Pad Len is greyed out. A power-of-two window is the fast case (the default 3175 → 3176 = 8·397 plans a slower FFT) |
 | Spectrum | Zero-Pad Len | Menu | 16384 | FFT size with Zero-Padding on (1K…64K; auto-grown to ≥ next pow2 of the window). Overridden by a Quality Preset |
-| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes 10–15 % faster than a MEASURE plan at 16K/32K (9.70 vs 10.97 µs at 16K, i9-13900H). The PATIENT search is capped at 1.5 s (`fftwf_set_timelimit`) of above-normal-priority planning once per size per machine, never on a TouchDesigner thread; the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
+| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes 10–15 % faster than a MEASURE plan at 16K/32K (9.70 vs 10.97 µs at 16K, i9-13900H). The PATIENT search has no time limit (v2.12.1): about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread; the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
 | Spectrum | Input Ingest | Menu | Auto | Auto = only the samples that are new since the last cook, from the input's start index and cook count (an overlapping or re-delivered buffer is not appended twice) · Append All = the newest block, every cook (the pre-2.10 behaviour) |
 | EQ | EQ Enable | Toggle | **Off** | Off = no EQ code and no EQ parameter reads at all |
 | EQ | High Shelf / Low Shelf | Toggle | On / On | per-shelf bypass (only read when EQ Enable is on) |
@@ -477,10 +477,14 @@ Two threads, both named for the debugger, **neither below normal priority**:
 | FFTW background planner (`FFT background planner`) | `THREAD_PRIORITY_ABOVE_NORMAL` | one `FFTW_MEASURE`/`FFTW_PATIENT` plan per FFT size, then exits |
 
 The worker sits one notch above the planner so a cook always wins the core back from it; the planner is above
-normal so a `FFTW_PATIENT` measurement finishes in its budget under load instead of stretching out. That budget is
-explicit since v2.10: `fftwf_set_timelimit` caps PATIENT at 1.5 s (`kPatientTimeLimitS`; unbounded it was ~2.7 s
-at N = 32768), because FFTW's planner is process-wide and every other node waits for the planner lock meanwhile.
-A measurement that is no longer wanted is abandoned to a graveyard rather than blocking a cook.
+normal so a `FFTW_PATIENT` measurement is not starved under load. Since v2.12.1 PATIENT has **no time limit**
+(v2.10–v2.12 capped it at 1.5 s with `fftwf_set_timelimit`): it runs off the cook thread, so a slower machine may
+take as long as it needs to find the best plan (~2.7 s at N = 32768 on the i9-13900H), once per size per machine,
+then wisdom caches it. FFTW's planner is process-wide, so a re-plan requested meanwhile (a size change, another
+node) waits for the planner lock until the measurement ends: with Async on that waiter is the analysis worker and
+TouchDesigner keeps cooking; with Async off it is the cook thread. Deleting the node or quitting TouchDesigner
+mid-measurement waits for it too. A measurement that is no longer wanted is abandoned to a graveyard rather than
+blocking a cook.
 
 **FFTW's own threading does not help this node.** `fftwf_init_threads` / `fftwf_plan_with_nthreads` were exported by
 the unversioned `libfftw3f-3.dll` the project used before (the current 3.3.11 build is configured without threads and
