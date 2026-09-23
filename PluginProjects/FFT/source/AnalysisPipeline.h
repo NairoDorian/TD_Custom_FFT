@@ -75,6 +75,7 @@ struct AnalysisJob {
     Parameters::Values p;                         // full parameter snapshot: the pipeline sees no live UI state
     std::vector<FFTDSP::AlignedVector> windows;   // per channel: linearized FIFO (winSamples floats)
     std::vector<uint8_t> silent;                  // per channel: whole window is digital silence
+    int64_t publishedNs{ 0 };                     // steady_clock ns at publish; the worker turns it into pickup latency
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -90,7 +91,9 @@ struct AnalysisResult {
     uint64_t seq{ 0 };                            // job this result belongs to (0 = none yet)
     float peakHz{ 0.0f };                         // channel 0 spectral peak (computed by the pipeline owner)
     float peakMag{ 0.0f };
-    std::vector<FFTDSP::AlignedVector> spectra;   // per channel: p.bins floats
+    std::vector<FFTDSP::AlignedVector> spectra;   // per channel: outputBinCountFrom(p, sampleRate) floats
+    FFTDSP::SpectralFeatures features;            // channel 0, when p.features is on (see DSPModules.h 6d)
+    bool hasFeatures{ false };
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -137,6 +140,10 @@ public:
         int outputBins{ 0 };
         bool linearGrid{ false };            // the warp came out as the identity: output == linear FFT bins
         bool planUpgrading{ false };         // a background measurement is running (see FFTWEngine)
+        double kaiserBeta{ 0.0 };            // the beta the window was built with (Auto or Manual), 0 for other windows
+        int aggregation{ 0 };                // 0 off, 1 peak, 2 rms (Warp Aggregation)
+        size_t aggregatedBins{ 0 };          // output bins that aggregate >= 2 FFT bins
+        size_t abandonedMeasurements{ 0 };   // background plans abandoned by a size/backend change, still running
     };
     Status status() const;
     uint64_t statusVersion() const noexcept { return myStatusVersion; }
@@ -161,7 +168,8 @@ public:
     // A pointer to one of the two static descriptors in FftBackend.h, so reading it from another
     // thread is safe even while the owner thread switches backends: the pointee never moves.
     const FFTDSP::FftBackendInfo& backendInfo() const noexcept {
-        return myBackend ? *myBackend : FFTDSP::defaultBackend();
+        const FFTDSP::FftBackendInfo* b = myBackend.load(std::memory_order_acquire);
+        return b ? *b : FFTDSP::defaultBackend();
     }
 
 private:
@@ -172,6 +180,7 @@ private:
     // only shows up as wrong numbers on multichannel input.
     struct DspState {
         FFTDSP::AlignedVector padded_frame, rfft_magnitude, prev_spectrum;
+        FFTDSP::AlignedVector prev_linear;    // previous frame's linear magnitude (spectral flux; features only)
         FFTDSP::AlignedComplexVector scratch_complex;
         int prev_loudness_mode{ -1 };         // which dB mode produced the values in prev_spectrum;
                                               // a change of mode invalidates that history (-1 = none yet)
@@ -197,8 +206,8 @@ private:
     // AnalysisPipeline::updateWarp). Drop interp from the key and changing the interpolation mode
     // alone would skip the block and never reach the warp at all: the parameter would silently do
     // nothing until some other warp setting was touched.
-    struct WarpKey   { int scale{ -1 }; double fmax{ -1.0 }; int bins{ -1 }; double warp{ -1.0 }; double floor{ -1.0 }; size_t nlin{ 0 }; double nyquist{ -1.0 }; int interp{ -1 };
-                       bool operator==(const WarpKey& o) const { return scale == o.scale && fmax == o.fmax && bins == o.bins && warp == o.warp && floor == o.floor && nlin == o.nlin && nyquist == o.nyquist && interp == o.interp; } };
+    struct WarpKey   { int scale{ -1 }; double fmax{ -1.0 }; int bins{ -1 }; double warp{ -1.0 }; double floor{ -1.0 }; size_t nlin{ 0 }; double nyquist{ -1.0 }; int interp{ -1 }; int agg{ -1 };
+                       bool operator==(const WarpKey& o) const { return scale == o.scale && fmax == o.fmax && bins == o.bins && warp == o.warp && floor == o.floor && nlin == o.nlin && nyquist == o.nyquist && interp == o.interp && agg == o.agg; } };
     // The weighting curve is a function of the frequency axis (the warp tables) and the curve type,
     // so its key is exactly that: the curve code plus the version counter of the warp tables it was
     // built from. That is why a warp rebuild automatically invalidates the curve without anyone
@@ -237,7 +246,9 @@ private:
     size_t myPadStart{ 0 };                 // where the padded signal starts inside the FFT input buffer
     int myPadChoice{ -1 };                  // the pad setting the above were computed from
     FFTDSP::PlannerPolicy myPlanner{ FFTDSP::PlannerPolicy::Auto };
-    const FFTDSP::FftBackendInfo* myBackend{ nullptr };  // null until the first rebuild; see rebuild()
+    // Written by the owner in rebuild(), read by the Info callbacks from TouchDesigner's thread, hence
+    // atomic (it was a plain pointer: benign on x64, a data race by the letter of the memory model).
+    std::atomic<const FFTDSP::FftBackendInfo*> myBackend{ nullptr };  // null until the first rebuild
     WindowKey myWindowKey;
     WarpKey myWarpKey;
     WeightKey myWeightKey;
@@ -249,6 +260,8 @@ private:
     double myOutputSampleRate{ 0.0 };       // 2 x top of axis; see outputSampleRate() in FFT.cpp
     double myLastUs{ 0.0 };                 // how long the last process() took, in microseconds
     std::atomic<bool> myParallelActive{ false };   // last process() fanned out over channels (see above)
+    std::vector<int> myChannelIndex;        // 0..n-1 for the parallel fan-out; grown once, never per job
+    double myKaiserBeta{ 0.0 };             // beta the current window was generated with (status)
 };
 
 #endif // ANALYSIS_PIPELINE_H

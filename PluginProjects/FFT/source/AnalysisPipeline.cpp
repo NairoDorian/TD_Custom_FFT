@@ -38,6 +38,7 @@
  */
 
 #include "AnalysisPipeline.h"
+#include "RateModel.h"
 
 #include <algorithm>
 #include <cassert>
@@ -58,9 +59,21 @@ inline double usSince(clk::time_point t0) { return std::chrono::duration<double,
 // The TD-free sample-rate / bin / axis model (windowSamplesFrom, fftSizeFrom,
 // outputBinCountFrom, axisRate, sampleRateToTouchDesigner, hzPerBin, throughput) lives in
 // RateModel.h so it is shared by the CHOP and the pipeline and is unit-testable headlessly.
-#include "RateModel.h"
+// (RateModel.h is included at global scope below / via FFT.h: its functions are all inline.)
 
 } // namespace
+
+// The Planner menu is cast straight onto FFTDSP::PlannerPolicy in rebuild(); pin the index alignment
+// that cast depends on (it used to be "nothing asserts it").
+static_assert(static_cast<int>(Parameters::Planner::Auto) == static_cast<int>(FFTDSP::PlannerPolicy::Auto) &&
+              static_cast<int>(Parameters::Planner::Fast) == static_cast<int>(FFTDSP::PlannerPolicy::Fast) &&
+              static_cast<int>(Parameters::Planner::Measured) == static_cast<int>(FFTDSP::PlannerPolicy::Measured) &&
+              static_cast<int>(Parameters::Planner::Patient) == static_cast<int>(FFTDSP::PlannerPolicy::Patient) &&
+              static_cast<int>(Parameters::Planner::COUNT) == 4,
+              "Parameters::Planner and FFTDSP::PlannerPolicy must keep the same numbering");
+static_assert(static_cast<int>(Parameters::WarpAggregate::Off) == 0 && static_cast<int>(Parameters::WarpAggregate::Peak) == 1 &&
+              static_cast<int>(Parameters::WarpAggregate::Rms) == 2,
+              "WarpAggregate values are PerceptualWarping::setAggregation codes");
 
 // =============================================================================================
 // AnalysisPipeline
@@ -106,6 +119,10 @@ AnalysisPipeline::status() const
 	s.outputBins = static_cast<int>(myWarping.outputBins());
 	s.linearGrid = myLinearGrid;
 	s.planUpgrading = myEngine ? myEngine->upgradeInProgress() : false;
+	s.kaiserBeta = myKaiserBeta;
+	s.aggregation = myWarping.aggregation();
+	s.aggregatedBins = myWarping.aggregatedBins();
+	s.abandonedMeasurements = myEngine ? myEngine->abandonedMeasurements() : 0;
 	return s;
 }
 
@@ -133,13 +150,13 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 {
 	mySampleRate = job.sampleRate;
 	myCapacity = std::max<size_t>(1, static_cast<size_t>(job.winSamples));   // never 0: the window math below divides by nothing, but the FFT of a 0-length frame would be meaningless
-	myPadChoice = job.p.padSize;
+	myPadChoice = job.p.zeroPad ? job.p.padSize : 0;   // 0 = Zero-Padding off (the transform is the window)
 	myPlanner = static_cast<FFTDSP::PlannerPolicy>(job.p.planner);
 	// Parameters::Backend and FFTDSP::backendById() are the same numbering by construction (pinned by
 	// the static_asserts after the menu tables in Parameters.cpp, which compare the enum against
 	// FFTDSP::backendCount() and against the per-backend entries themselves); the cast keeps the
 	// dependency one-way, pipeline -> DSP.
-	myBackend = &FFTDSP::backendById(static_cast<int>(job.p.backend));
+	myBackend.store(&FFTDSP::backendById(static_cast<int>(job.p.backend)), std::memory_order_release);
 
 	// FFT size >= zero-pad length and >= next power of two of the window (window never overflows the frame)
 	myFFTSize = fftSizeFrom(job.p, static_cast<int>(myCapacity));
@@ -159,7 +176,7 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 	myWarpKey = WarpKey{};
 
 	if (!myEngine) myEngine = std::make_unique<FFTDSP::FFTWEngine>();
-	myEngine->prepare(myFFTSize, myPlanner, myLog, myBackend);
+	myEngine->prepare(myFFTSize, myPlanner, myLog, myBackend.load(std::memory_order_relaxed));
 
 	// linearBinCount() is the FFT's own bin count (N/2+1), not the output bin count: these buffers
 	// hold the raw linear spectrum, before the warp reshapes it onto the output axis.
@@ -168,6 +185,7 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 		ch.rfft_magnitude.assign(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize), 0.0f);
 		ch.scratch_complex.resize(FFTDSP::PerceptualWarping::linearBinCount(myFFTSize));
 		ch.prev_spectrum.clear();
+		ch.prev_linear.clear();
 		ch.agc_peak = 0.0f;
 	}
 	// The Info DAT shows a plan description and an FFT size; both may have just changed, so the
@@ -183,13 +201,18 @@ AnalysisPipeline::rebuild(const AnalysisJob& job)
 void
 AnalysisPipeline::updateWindow(const Parameters::Values& p)
 {
-	WindowKey key{ static_cast<int>(p.window), p.kaiserBeta, myCapacity, static_cast<int>(p.magNorm) };
+	// The beta that is actually used: Kaiser Beta Mode = Auto derives it from the dB range (RateModel.h),
+	// so the key holds the effective value and a dB-range change regenerates the window by itself.
+	const double beta = effectiveKaiserBeta(p);
+	WindowKey key{ static_cast<int>(p.window), beta, myCapacity, static_cast<int>(p.magNorm) };
 	if (key == myWindowKey && myWindowBuffer.size() == myCapacity) return;
+	myKaiserBeta = (p.window == Parameters::WindowType::Kaiser) ? beta : 0.0;
+	++myStatusVersion;
 	// The normalization mode is translated from the parameter enum to the DSP enum here, which is
 	// the only place the two meet: CoherentGain keeps the historical N_win/2 reading that existing
 	// projects' dB offsets were tuned against; FullScale makes a full-scale sine read its own
 	// amplitude. See WindowGenerator in DSPModules.h for what each one does to the numbers.
-	FFTDSP::WindowGenerator::generateWindow(static_cast<int>(p.window), p.kaiserBeta, myCapacity, myWindowBuffer,
+	FFTDSP::WindowGenerator::generateWindow(static_cast<int>(p.window), beta, myCapacity, myWindowBuffer,
 	                                        p.magNorm == Parameters::MagNorm::FullScale ? FFTDSP::WindowNorm::FullScale
 	                                                                                    : FFTDSP::WindowNorm::CoherentGain);
 	myWindowKey = key;
@@ -256,19 +279,27 @@ AnalysisPipeline::updateWarp(const Parameters::Values& p)
 {
 	const size_t n_linear_bins = FFTDSP::PerceptualWarping::linearBinCount(myFFTSize);
 	const double nyquist = mySampleRate / 2.0;
+	// Raw RFFT Bins: a Linear DC..Nyquist grid with exactly one output bin per rfft bin - the identity,
+	// which buildWarpTables detects and applyWarp runs as a memcpy (the rfft magnitude, untouched).
+	const bool   raw = p.rawBins;
 	// Display Max is clamped to Nyquist: above it there are no bins to show, and a larger axis would
 	// just leave the top of the output empty and the bin spacing wrong.
-	const double fmax = std::min(p.displayMax, nyquist);
-	const int    scale = static_cast<int>(p.scale);
-	const double blend = p.warp;
-	const size_t n_out = static_cast<size_t>(outputBinCountFrom(p));
-	const int    interp = static_cast<int>(p.warpInterp);
+	const double fmax = raw ? nyquist : std::min(p.displayMax, nyquist);
+	const int    scale = raw ? static_cast<int>(Parameters::Scale::Linear) : static_cast<int>(p.scale);
+	const double blend = raw ? 0.0 : p.warp;
+	// Auto / Raw: the transform's own N/2+1, read off the FFT that was built (not recomputed), so the
+	// count can never disagree with the magnitude buffer it is copied from.
+	const size_t n_out = (raw || p.binsMode == Parameters::BinsMode::Auto) ? n_linear_bins
+	                                                                        : static_cast<size_t>(outputBinCountFrom(p, mySampleRate));
+	const int    interp = raw ? 0 : static_cast<int>(p.warpInterp);
+	const int    agg = raw ? 0 : static_cast<int>(p.warpAggregate);
 
-	WarpKey key{ scale, fmax, static_cast<int>(n_out), blend, p.logFloor, n_linear_bins, nyquist, interp };
+	WarpKey key{ scale, fmax, static_cast<int>(n_out), blend, p.logFloor, n_linear_bins, nyquist, interp, agg };
 	if (key == myWarpKey) return;
 	// See the note on WarpKey in AnalysisPipeline.h: this is the only call site of
-	// setInterpolation, so the interpolation mode has to be part of the key above.
+	// setInterpolation / setAggregation, so both modes have to be part of the key above.
 	myWarping.setInterpolation(interp);
+	myWarping.setAggregation(agg);
 	myWarping.buildWarpTables(scale, fmax, n_out, nyquist, blend, p.logFloor, n_linear_bins);
 	// How much of the linear spectrum is worth computing. The warp only ever reads up to
 	// maxLinearIndex(), so bins above it would be transform and magnitude work whose result is
@@ -482,12 +513,12 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 	const bool rebuild_needed = !myEngine
 	                         || std::abs(job.sampleRate - mySampleRate) > 1e-3
 	                         || static_cast<size_t>(job.winSamples) != myCapacity
-	                         || p.padSize != myPadChoice
+	                         || (p.zeroPad ? p.padSize : 0) != myPadChoice
 	                         || static_cast<FFTDSP::PlannerPolicy>(p.planner) != myPlanner
 	                         // A backend switch must rebuild: the plan object belongs to the library
 	                         // that made it, so the old plan has to be destroyed by its own
 	                         // fftwf_destroy_plan before the new one replaces it. prepare() does that.
-	                         || &FFTDSP::backendById(static_cast<int>(p.backend)) != myBackend;
+	                         || &FFTDSP::backendById(static_cast<int>(p.backend)) != myBackend.load(std::memory_order_relaxed);
 	if (rebuild_needed) rebuild(job);
 	// The Async toggle, handed to the engine every cook before it is polled. Async off must mean one
 	// thread for the whole node - the cook thread - and the FFTW planner's deferred MEASURE/PATIENT
@@ -519,7 +550,7 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 	// history and the AGC follower so the display restarts clean instead of decaying from a value
 	// that belongs to the previous session.
 	if (job.reset) {
-		for (auto& ch : myChannels) { ch.prev_spectrum.clear(); ch.agc_peak = 0.0f; }
+		for (auto& ch : myChannels) { ch.prev_spectrum.clear(); ch.prev_linear.clear(); ch.agc_peak = 0.0f; }
 	}
 
 	// The three cached tables, in dependency order: the warp tables define the axis, and the
@@ -577,9 +608,14 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 		// built here rather than kept as a member because it is small and this path is not hot (the
 		// hot path is numChannels == 1, which skips all of this). A future optimization could hoist
 		// it into a member that is grown and never shrunk - it changes no results.
-		std::vector<int> idx(static_cast<size_t>(job.numChannels));
-		std::iota(idx.begin(), idx.end(), 0);
-		std::for_each(std::execution::par, idx.begin(), idx.end(), [&](int ch) {
+		// The index list is a member grown to the channel count once, not a vector per job: the
+		// steady-state "no allocation" invariant covers All Channels too (pinned by the allocation gate
+		// in tests/dsp_tests.cpp).
+		if (myChannelIndex.size() != static_cast<size_t>(job.numChannels)) {
+			myChannelIndex.resize(static_cast<size_t>(job.numChannels));
+			std::iota(myChannelIndex.begin(), myChannelIndex.end(), 0);
+		}
+		std::for_each(std::execution::par, myChannelIndex.begin(), myChannelIndex.end(), [&](int ch) {
 			// A channel may be missing its silent flag (silent.size() is allowed to be shorter than
 			// the channel count); the bounds check treats that as "not silent", which is the safe
 			// default - the full chain runs and produces a real spectrum.
@@ -600,6 +636,25 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
 	// Peak telemetry (channel 0) belongs here, not on the cook thread: the owner has the Hz table.
 	// Only channel 0 is measured - the Info CHOP reports one peak, and doing this per channel would
 	// add a pass over every spectrum for a number nobody reads.
+	// Spectral features (channel 0, optional): from the LINEAR magnitude, so they do not depend on the
+	// display axis. A silent channel short-circuits runChannel and leaves its magnitude stale, so it
+	// reports the silence values instead of reading it.
+	res.hasFeatures = p.features && job.numChannels > 0 && !myChannels.empty();
+	if (res.hasFeatures) {
+		const bool silent0 = !job.silent.empty() && job.silent[0] != 0;
+		DspState& c0 = myChannels[0];
+		const size_t n = std::min(myMagnitudeBins, c0.rfft_magnitude.size());
+		if (silent0 || n == 0) {
+			res.features = FFTDSP::SpectralFeatures{};
+			c0.prev_linear.clear();
+		} else {
+			const double binHz = myFFTSize ? mySampleRate / static_cast<double>(myFFTSize) : 0.0;
+			const FFTDSP::AlignedVector& w0 = job.windows[0];
+			FFTDSP::computeSpectralFeatures(c0.rfft_magnitude.data(), n, binHz, w0.data(),
+			                                std::min(w0.size(), myCapacity), c0.prev_linear, res.features);
+		}
+	}
+
 	res.peakMag = 0.0f;
 	res.peakHz = 0.0f;
 	if (!out.empty() && !out[0].empty()) {

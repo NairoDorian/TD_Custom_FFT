@@ -175,7 +175,7 @@ enum class WinMode : int { Samples = 0, Milliseconds, COUNT };
 //   different policy than the menu says. The FFTW3 backend checks honoursPolicy
 //   (see the static_assert in Parameters.cpp): the menu is meaningless for a
 //   backend that ignores it.
-enum class Planner : int { Auto = 0, Fast, Measured, Patient, COUNT };   // == FFTDSP::PlannerPolicy
+enum class Planner : int { Auto = 0, Fast, Measured, Patient, COUNT };   // == FFTDSP::PlannerPolicy (static_assert in AnalysisPipeline.cpp)
 
 // The scale a bin's magnitude is normalized to, which is what sets the absolute
 // level of every reading downstream. CoherentGain = mean(window) == 1 (legacy:
@@ -249,6 +249,43 @@ enum class WarpInterp : int { Linear = 0, Cubic, COUNT };
 // you if you missed the count. See FftBackend.h's HOW TO CHANGE for the rest (the dlls[] list and
 // the descriptor).
 enum class Backend : int { Fftw3 = 0, OneMkl = 1, COUNT = 2 };
+
+// ---- v2.10 real-time controls ------------------------------------------------------------------
+// Quality presets: a preset overrides Zero-Pad Len, Warp Interpolation, Kaiser Beta Mode and Warp
+// Aggregation together (applyPreset in RateModel.h); Custom leaves every individual parameter in charge.
+// A preset NEVER changes the output sample count: Output Bins (and Output Bins Mode) stay the user's.
+enum class Preset : int { Custom = 0, Visual60, Visual120, Analysis, COUNT };
+
+// Output Bins Mode. Auto (default) = the rfft's own bin count, N/2+1 of the transform actually run (the
+// Zero-Pad Len frame, or the window with Zero-Padding off); Output Bins has no effect. The bins are laid
+// out on the chosen Scale / Display Max - for the untouched rfft bins use Raw RFFT Bins as well.
+// Fixed = exactly `Output Bins` output samples, any count (more than N/2+1 included: interpolated).
+enum class BinsMode : int { Fixed = 0, Auto, COUNT };
+
+// What an output bin reports when it covers more than one FFT bin (the coarse, usually high-frequency,
+// part of a perceptual axis). Off = interpolate between two FFT bins (legacy: narrow peaks between the
+// taps are skipped). Peak = the largest FFT bin in the range (display: no peak is ever dropped).
+// Rms = the power mean of the range (analysis: energy-faithful). PerceptualWarping::applyWarp.
+enum class WarpAggregate : int { Off = 0, Peak, Rms, COUNT };
+
+// Kaiser Beta Mode. Manual = `Kaiser Beta`. Auto = the smallest beta whose sidelobes sit below
+// `dB Range Floor` (Kaiser's design relation), i.e. the sharpest main lobe the display can use.
+enum class BetaMode : int { Manual = 0, Auto, COUNT };
+
+// How each cook's input block becomes new samples. Auto = only samples that are new since the last
+// cook, from the input's start index and cook count (so an overlapping or re-delivered buffer is not
+// appended twice). AppendAll = the pre-2.10 behaviour: append the newest block every cook.
+enum class IngestMode : int { Auto = 0, AppendAll, COUNT };
+
+// How the async worker learns about a new job. Poll = it checks the job slot every 2 ms (no kernel
+// call on the cook thread; pickup 0-2 ms). Signal = the cook wakes it every cook (one SetEvent,
+// ~5-25 us on the cook thread; pickup ~0.02 ms). The worker also goes dormant after 500 ms idle.
+enum class WorkerWake : int { Poll = 0, Signal, COUNT };
+
+// Worker thread scheduling. Highest = THREAD_PRIORITY_HIGHEST. Mmcss = registered with the Multimedia
+// Class Scheduler ("Pro Audio"), which Windows schedules ahead of normal threads and exempts from
+// power throttling - the setting for 120+ fps projects on a busy machine.
+enum class WorkerPriority : int { Highest = 0, Mmcss, COUNT };
 
 // Zero-padded FFT transform lengths, indexed by the "Pad" menu (menu order in Parameters.cpp)
 //
@@ -380,6 +417,19 @@ constexpr char ResetName[]        = "Reset";        constexpr char ResetLabel[] 
 constexpr char AsyncName[]        = "Async";        constexpr char AsyncLabel[]        = "Async Analysis (worker thread)";
 constexpr char FftbackendName[]   = "Fftbackend";   constexpr char FftbackendLabel[]   = "FFT Backend (off: FFTW3 / on: Intel oneMKL)";
 
+// v2.10 additions (names are new, so existing .toe files simply get the new defaults)
+constexpr char PresetName[]       = "Preset";       constexpr char PresetLabel[]       = "Quality Preset";
+constexpr char BinsmodeName[]     = "Binsmode";     constexpr char BinsmodeLabel[]     = "Output Bins Mode";
+constexpr char WarpaggName[]      = "Warpagg";      constexpr char WarpaggLabel[]      = "Warp Aggregation";
+constexpr char IngestName[]       = "Ingest";       constexpr char IngestLabel[]       = "Input Ingest";
+constexpr char KaisermodeName[]   = "Kaisermode";   constexpr char KaisermodeLabel[]   = "Kaiser Beta Mode";
+constexpr char FeaturesName[]     = "Features";     constexpr char FeaturesLabel[]     = "Spectral Features (Info CHOP)";
+constexpr char WorkerwakeName[]   = "Workerwake";   constexpr char WorkerwakeLabel[]   = "Worker Wake";
+constexpr char WorkerprioName[]   = "Workerprio";   constexpr char WorkerprioLabel[]   = "Worker Priority";
+// v2.11
+constexpr char RawbinsName[]      = "Rawbins";      constexpr char RawbinsLabel[]      = "Raw RFFT Bins (no interpolation)";
+constexpr char ZeropadName[]      = "Zeropad";      constexpr char ZeropadLabel[]      = "Zero-Padding";
+
 // ---------------------------------------------------------------------------
 // Snapshot of every parameter for one cook
 // ---------------------------------------------------------------------------
@@ -459,6 +509,24 @@ struct Values {
     // Not sound, but scheduling: which thread analyses and which library transforms.
     bool       async        = true;       // analysis on a worker thread; the cook only ingests + copies
     Backend    backend      = Backend::Fftw3;  // FFTW3 by default: it is the library this build vendors. Both libraries are loaded at run time and a missing one falls back to FFTW3, so this cannot silence the node
+    // v2.10 controls (see the enums above). Output Bins Mode defaults to Auto: the output is the zero-
+    // padded rfft's N/2+1 bins (Zero-Pad Len 16384 -> 8193 samples); Fixed makes Output Bins the count.
+    // The window is the pre-2.10 Kaiser beta 15; Auto beta is opt-in. Peak aggregation only acts where an
+    // output bin covers several FFT bins, so it never changes the count.
+    Preset         preset        = Preset::Custom;
+    BinsMode       binsMode      = BinsMode::Auto;            // Auto: N/2+1 of the (zero-padded) FFT
+    WarpAggregate  warpAggregate = WarpAggregate::Peak;
+    BetaMode       betaMode      = BetaMode::Manual;          // Kaiser Beta (15) unless Auto is chosen
+    IngestMode     ingestMode    = IngestMode::Auto;
+    bool           features      = false;                     // spectral features on the Info CHOP (worker cost ~2-4 us)
+    // v2.11. rawBins: output the rfft magnitude bins untouched - N/2+1 samples, DC..Nyquist, linear, no
+    // Scale / Display Max / Output Bins / interpolation (the warp is the identity and runs as a memcpy).
+    // zeroPad off: the transform runs on the window itself (N = window length, rounded up to even so the
+    // last bin is exactly Nyquist) instead of on the Zero-Pad Len frame.
+    bool           rawBins       = false;
+    bool           zeroPad       = true;
+    WorkerWake     workerWake    = WorkerWake::Poll;
+    WorkerPriority workerPriority = WorkerPriority::Highest;
 };
 
 // ---------------------------------------------------------------------------
@@ -502,6 +570,13 @@ Values eval(const TD::OP_Inputs* inputs, int* reads = nullptr);
 // what everything else resolves against. Add a parameter here AND as a Values field AND to eval()'s
 // reads - those three are three separate edits and nothing checks that all three were made.
 void setup(TD::OP_ParameterManager* manager);
+
+// Greys out the parameters that the current settings make inert (EQ sub-parameters with EQ off, the dB
+// group with Loudness = Off, the ballistics pair in the unused unit, Kaiser Beta for other windows or in
+// Auto, everything a Quality Preset overrides). Called by TouchDesigner through
+// FFT::setParameterEnableStates (C++ API Common 3), which may happen outside a cook - it reads
+// parameters only through `inputs` and touches no node state, so it costs the cook nothing.
+void setEnableStates(const TD::OP_Inputs* inputs, TD::OP_ParEnableState* state);
 
 } // namespace Parameters
 

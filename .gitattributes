@@ -1,0 +1,8 @@
+* text=auto
+# Binary artefacts: never line-ending-normalised or diffed as text
+*.toe binary
+*.tox binary
+*.lib binary
+*.dll binary
+*.pdb binary
+*.exe binary

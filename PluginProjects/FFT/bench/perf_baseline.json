@@ -1,0 +1,9 @@
+{
+  "_note": "fft_bench --gate baseline; regenerate with --gate <this file> --update 1 on the gating machine",
+  "pipeline_default_p50_us": 24.900,
+  "pipeline_rawbins_p50_us": 19.200,
+  "pipeline_visual60_p50_us": 13.700,
+  "pipeline_fullchain_p50_us": 56.300,
+  "cook_async_poll_p50_us": 9.600,
+  "cook_sync_p50_us": 43.000
+}

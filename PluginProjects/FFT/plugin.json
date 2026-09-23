@@ -5,6 +5,6 @@
   "template": "BasicCHOP",
   "features": [],
   "deps": ["fftw3"],
-  "api_versions": { "CHOP": 10, "Common": 2 },
-  "version": "2.9.0"
+  "api_versions": { "CHOP": 10, "Common": 3 },
+  "version": "2.11.0"
 }

@@ -16,6 +16,7 @@
 > | `CHANGELOG.md` | The version history, newest first, one entry per release |
 > | **This file** | The performance analysis: a commit-by-commit sweep, the state at its end, and the optimization plan derived from it |
 > | [`FFT_REALTIME_PERFORMANCE_ROADMAP.md`](FFT_REALTIME_PERFORMANCE_ROADMAP.md) | Forward-looking ideas that are **not** implemented |
+> | [`../PluginBuilder_V2`](../PluginBuilder_V2) | The builder/toolchain this plugin runs on (CMake, headers, hot reload) — cross-repo check `python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT` |
 >
 > **Measurements vs. plans.** Sections 1 and 2 are *analysis of a specific revision* — they describe
 > what was measured and when. Section 3 onward is a *plan*: proposals, each with an estimated saving.

@@ -16,6 +16,7 @@
 > | `CHANGELOG.md` | The version history, newest first, one entry per release — this is where each item below is recorded as done or removed |
 > | [`FFT_REALTIME_OPTIMIZATION_ANALYSIS.md`](FFT_REALTIME_OPTIMIZATION_ANALYSIS.md) | The *backward-looking* sibling: a commit-by-commit analysis of the optimization work up to `e9985c0`, and the priorities that came out of it |
 > | **This file** | The plan: where the time goes, what to change, and what each change turned out to be worth |
+> | [`../PluginBuilder_V2`](../PluginBuilder_V2) | The builder/toolchain this plugin is compiled and hot-reloaded through (CMake module, SDK headers, `plugin.json`, `PluginBuilder.tox`) — any idea below that touches CMake flags, link mode or deployment must respect that contract; smoke test `python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT` |
 >
 > **Measured, estimated, or idea — read this before trusting a number.** Every row in §0 and every
 > figure marked *measured* comes from `bench/bench.cpp` (`fft_bench`, interleaved runs, minimum per

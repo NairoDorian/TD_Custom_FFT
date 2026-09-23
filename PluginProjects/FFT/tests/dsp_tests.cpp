@@ -80,13 +80,55 @@
 #include "DSPModules.h"
 #include "RateModel.h"
 #include "AnalysisPipeline.h"
+#include "AsyncAnalysis.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+// ------------------------------------------------------------------------------------------
+// Allocation counter (the "no allocation on the steady-state path" gate, v2.10)
+// ------------------------------------------------------------------------------------------
+// Global operator new/delete replaced for this test executable only. Counting is off except inside an
+// AllocWindow, and then it counts every allocation in the process - the worker thread and the parallel
+// thread pool included - which is exactly what a real-time invariant has to hold against.
+static std::atomic<long long> g_allocCount{ 0 };
+static std::atomic<bool> g_allocCounting{ false };
+static void* countedAlloc(size_t n, size_t align)
+{
+    if (g_allocCounting.load(std::memory_order_relaxed)) g_allocCount.fetch_add(1, std::memory_order_relaxed);
+    void* p = align > alignof(std::max_align_t) ? _aligned_malloc(n ? n : 1, align) : std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new(size_t n) { return countedAlloc(n, 0); }
+void* operator new[](size_t n) { return countedAlloc(n, 0); }
+void* operator new(size_t n, const std::nothrow_t&) noexcept { try { return countedAlloc(n, 0); } catch (...) { return nullptr; } }
+void* operator new[](size_t n, const std::nothrow_t&) noexcept { try { return countedAlloc(n, 0); } catch (...) { return nullptr; } }
+void* operator new(size_t n, std::align_val_t a) { return countedAlloc(n, static_cast<size_t>(a)); }
+void* operator new[](size_t n, std::align_val_t a) { return countedAlloc(n, static_cast<size_t>(a)); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { _aligned_free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { _aligned_free(p); }
+void operator delete(void* p, size_t, std::align_val_t) noexcept { _aligned_free(p); }
+void operator delete[](void* p, size_t, std::align_val_t) noexcept { _aligned_free(p); }
+struct AllocWindow {
+    long long start;
+    AllocWindow() : start(g_allocCount.load()) { g_allocCounting.store(true); }
+    long long count() const { return g_allocCount.load() - start; }
+    ~AllocWindow() { g_allocCounting.store(false); }
+};
 
 #ifdef _WIN32
 #include <tlhelp32.h>   // which libraries are actually loaded in this process (the OpenMP check below)
@@ -1076,7 +1118,7 @@ static void test_triple_buffer_and_signal()
     CHECK(acquired > 0);                        // the loop actually ran: guards the two checks below from being vacuous
     CHECK(torn == 0);
     CHECK(non_monotonic == 0);
-    CHECK(tb2.acquire() || true);                   // drain
+    tb2.acquire();                                  // drain (not a check: either outcome is fine)
     CHECK(tb2.front().a == produced.load());        // the very last publish is visible after the producer stopped
 
     // WorkerSignal: a signal issued before wait() is not lost; wait() consumes it; cross-thread wake works
@@ -1094,17 +1136,24 @@ static void test_triple_buffer_and_signal()
     CHECK(woke.load() == 1);
     // waitFor: times out close to the requested 2 ms even when the system clock ticks at 15.6 ms
     // (high-resolution waitable timer), and returns true immediately when a signal is pending
-    double worst_ms = 0.0;
-    for (int i = 0; i < 20; ++i) {                  // 20 calls: enough chances to catch a bad tick phase
+    // 200 waits, judged on the 95th percentile: a single scheduling hiccup (measured: an occasional
+    // ~19 ms outlier on a loaded machine) is not what this checks, and a max-of-20 bound made the suite
+    // fail 2 runs in 5. A coarse 15.6 ms clock would put the p95 at ~15.6 ms, so 6 ms still separates a
+    // working high-resolution timer from a broken one.
+    std::vector<double> waits;
+    int timeouts = 0;
+    for (int i = 0; i < 200; ++i) {
         auto s = std::chrono::steady_clock::now();
-        CHECK(!sig.waitFor(2));                     // 2 ms request; nothing signals it, so every call must time out
-        worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count());
+        if (!sig.waitFor(2)) ++timeouts;            // 2 ms request; nothing signals it, so every call must time out
+        waits.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s).count());
     }
-    std::printf("  waitFor(2 ms): worst %.2f ms over 20 calls (high-res timer: %s)\n", worst_ms, sig.highResolutionTimer() ? "yes" : "no");
-    CHECK(worst_ms >= 1.0);                         // it did wait, and did not return early
-    // 6.0 ms: the 15.6 ms system tick would be the floor WITHOUT a high-res timer, so this is the
-    // only check here that can tell a working timer from a coarse clock - hence the guard.
-    if (sig.highResolutionTimer()) CHECK(worst_ms < 6.0);
+    std::sort(waits.begin(), waits.end());
+    const double p95_ms = waits[waits.size() * 95 / 100], min_ms = waits.front(), worst_ms = waits.back();
+    std::printf("  waitFor(2 ms): min %.2f / p95 %.2f / worst %.2f ms over 200 calls (high-res timer: %s)\n",
+                min_ms, p95_ms, worst_ms, sig.highResolutionTimer() ? "yes" : "no");
+    CHECK(timeouts == 200);
+    CHECK(min_ms >= 1.0);                           // it did wait, and did not return early
+    if (sig.highResolutionTimer()) CHECK(p95_ms < 6.0);
     sig.signal();
     CHECK(sig.waitFor(1000));                       // a pending signal returns true instead of timing out
 }
@@ -1118,14 +1167,14 @@ static void test_triple_buffer_and_signal()
 // WHY:   this is the closest this suite gets to an end-to-end check: it is the test that would catch
 //        a window, a pad offset or an FFT factor being wrong by something other than a rounding
 //        error. The two peak-height checks are the two documented normalizations' definitions.
-// HOW TO CHANGE: win and N are the pair the plugin uses at its defaults (3175 = 72 ms at 44.1 kHz;
-//        32768 = the default pad). If you change one, check the two expected magnitudes below -
+// HOW TO CHANGE: win = 3175 is the default window (72 ms at 44.1 kHz); N = 32768 is the "Analysis"
+//        preset's pad (the default pad is 16384). If you change one, check the two expected magnitudes below -
 //        0.5 and 0.5 * win / 2 both depend on win, and the second is the legacy scale's whole point.
 static void test_pipeline_sine()
 {
     section("FFTWEngine pipeline (1 kHz sine @ 44.1 kHz)");
     const double sr = 44100.0, f0 = 1000.0;         // a plain tone, one bin's worth of ambiguity at most
-    const size_t win = 3175, N = 32768;             // the default window length and the default FFT size
+    const size_t win = 3175, N = 32768;             // the default window length and the Analysis preset's FFT size
     PlanLog log;
     FFTWEngine engine;
     engine.prepare(N, PlannerPolicy::Fast, &log);   // Fast: this test measures the numbers, not the planner
@@ -1193,13 +1242,14 @@ static void test_pipeline_process()
 {
     const double sr = 44100.0, f0 = 1000.0;
     const int win_samples = 3175;                       // 72 ms at 44.1 kHz, the default window
-    const int N = 32768;                                // the default pad size
+    const int N = 32768;                                // the Analysis preset's pad (default is 16384)
     const int bins = N / 2 + 1;                         // 16385 → identity warp
 
     Parameters::Values p;
     p.scale     = Parameters::Scale::Linear;
     p.warp      = 0.0;                                  // blend 0 + Linear + bins == nlin: the linear grid
     p.bins      = bins;
+    p.binsMode  = Parameters::BinsMode::Fixed;          // exactly `bins` (Auto would size from the window)
     p.padSize   = N;
     p.winMode   = Parameters::WinMode::Samples;
     p.winSamples = win_samples;
@@ -1430,14 +1480,16 @@ static void test_rate_model()
                                      // (3175 samples = 72 ms), pad=16384 (index 4 of kPadValues)
     const double sr = 48000.0;       // deliberately not 44100, so a hard-coded rate would show up here
 
-    // outputBinCountFrom is the single source of truth for the output width.
-    CHECK(outputBinCountFrom(p) == p.bins);
+    // outputBinCountFrom is the single source of truth for the output width. Fixed: exactly Output Bins
+    // (Auto is covered by test_v210_rate_helpers).
+    p.binsMode = Parameters::BinsMode::Fixed;
+    CHECK(outputBinCountFrom(p, sr) == p.bins);
 
     // Reported sample rate is bins * cook_rate — and crucially must NOT depend on the input sample
     // rate (that was the v2.5.0/2.6.0 mistake). Same params + rate, different input → same number.
     p.bins = 16384;
-    const double td_rate_low  = sampleRateToTouchDesigner(p, 60.0);   // 60 fps cook
-    const double td_rate_high = sampleRateToTouchDesigner(p, 30.0);   // 30 fps cook
+    const double td_rate_low  = sampleRateToTouchDesigner(p, sr, 60.0);   // 60 fps cook
+    const double td_rate_high = sampleRateToTouchDesigner(p, sr, 30.0);   // 30 fps cook
     CHECK(td_rate_low  == 16384.0 * 60.0);                            // exact equality: it is a product, not a measurement
     CHECK(td_rate_high == 16384.0 * 30.0);
 
@@ -1461,8 +1513,8 @@ static void test_rate_model()
 
     // Throughput = bins * 1000 / dt_ms (measured, not nominal-rate).
     p.bins = 16384;
-    CHECK_NEAR(throughput(p, 16.6667), 16384.0 * 1000.0 / 16.6667, 1e-6);   // 16.6667 ms = one 60 fps frame
-    CHECK(throughput(p, 0.0) == 0.0);              // a zero frame time has no rate: report 0, not infinity
+    CHECK_NEAR(throughput(p, sr, 16.6667), 16384.0 * 1000.0 / 16.6667, 1e-6);   // 16.6667 ms = one 60 fps frame
+    CHECK(throughput(p, sr, 0.0) == 0.0);              // a zero frame time has no rate: report 0, not infinity
 
     // fftSizeFrom: next power of two >= winSamples, and >= padSize.
     Parameters::Values q;
@@ -1532,6 +1584,373 @@ static void test_equal_loudness()
     CHECK(g[7] > g[8]);   // past the peak: 6300 Hz > 10000 Hz
 }
 
+
+// ------------------------------------------------------------------------------------------
+// ===================== v2.10 tests =====================
+// ------------------------------------------------------------------------------------------
+
+// Auto Kaiser beta, main-lobe width, Auto bins, presets, and targetHzAt == the built grid.
+static void test_v210_rate_helpers()
+{
+    section("v2.10 rate helpers: Auto beta, Auto bins, presets, targetHzAt");
+    // Kaiser's relation: 80 dB -> 10.7 (Values default dB range), 114 dB <-> the old beta 15.
+    CHECK_NEAR(kaiserBetaForSidelobeDb(80.0), 0.12438 * 86.3, 1e-9);
+    CHECK_NEAR(kaiserBetaForSidelobeDb(114.3), 15.0, 0.01);
+    CHECK(kaiserBetaForSidelobeDb(10.0) == 0.0);              // below 13.26 dB: rectangular is enough
+    Parameters::Values p;
+    CHECK(p.betaMode == Parameters::BetaMode::Manual);        // the default keeps the pre-2.10 window
+    CHECK(effectiveKaiserBeta(p) == p.kaiserBeta);
+    p.betaMode = Parameters::BetaMode::Auto;
+    CHECK_NEAR(effectiveKaiserBeta(p), kaiserBetaForSidelobeDb(p.dbRange), 1e-12);
+    p.betaMode = Parameters::BetaMode::Manual;
+    CHECK_NEAR(mainLobeHalfWidthBins(p), std::sqrt(1.0 + (15.0 / PI_D) * (15.0 / PI_D)), 1e-12);
+    p.window = Parameters::WindowType::Hann;
+    CHECK(mainLobeHalfWidthBins(p) == 2.0);
+
+    // The DEFAULT is Auto with Zero-Padding on: N/2+1 of the padded FFT (pad 16384 -> 8193), whatever
+    // Output Bins or the window say.
+    {
+        Parameters::Values a0;
+        CHECK(a0.binsMode == Parameters::BinsMode::Auto && a0.zeroPad && !a0.rawBins);
+        CHECK(outputBinCountFrom(a0, 44100.0) == 8193);
+        a0.winSamples = 4096; CHECK(outputBinCountFrom(a0, 44100.0) == 8193);   // the reported 3081 case
+        a0.bins = 777;        CHECK(outputBinCountFrom(a0, 44100.0) == 8193);
+    }
+    // Fixed: Output Bins is the output sample count, whatever the window or the pad - including far more
+    // bins than the zero-padded FFT's N/2+1.
+    {
+        Parameters::Values f0; f0.binsMode = Parameters::BinsMode::Fixed;
+        CHECK(outputBinCountFrom(f0, 44100.0) == f0.bins);
+        f0.bins = 65536; f0.padSize = 8192;                    // 8x more bins than the 4097 FFT bins
+        CHECK(outputBinCountFrom(f0, 44100.0) == 65536);
+        f0.winSamples = 512;                                   // the window never changes a Fixed count
+        CHECK(outputBinCountFrom(f0, 44100.0) == 65536);
+        Parameters::Values pr = f0; pr.preset = Parameters::Preset::Visual120; applyPreset(pr);
+        CHECK(pr.bins == 65536 && pr.binsMode == Parameters::BinsMode::Fixed);   // presets never touch the count
+    }
+    // Auto = the rfft's own N/2+1 of the (zero-padded) transform; Output Bins and the window's
+    // resolution play no part. Raw RFFT Bins has the same count. Zero-Padding off = the window itself.
+    {
+        Parameters::Values d;
+        d.binsMode = Parameters::BinsMode::Auto;
+        CHECK(outputBinCountFrom(d, 44100.0) == 16384 / 2 + 1);          // default pad 16384
+        d.padSize = 65536; CHECK(outputBinCountFrom(d, 44100.0) == 32769);
+        d.bins = 300;      CHECK(outputBinCountFrom(d, 44100.0) == 32769);   // Output Bins ignored
+        d.padSize = 1024;  CHECK(outputBinCountFrom(d, 44100.0) == 4096 / 2 + 1);   // window 3175 > pad -> 4096
+        d.zeroPad = false; CHECK(fftSizeFrom(d, 3175) == 3176);              // odd window: one zero sample
+        CHECK(outputBinCountFrom(d, 44100.0) == 3176 / 2 + 1);
+        d.winSamples = 2048; CHECK(outputBinCountFrom(d, 44100.0) == 1025);
+        d.winMode = Parameters::WinMode::Milliseconds; d.winMs = 100.0;   // 4800 samples at 48 kHz
+        CHECK(outputBinCountFrom(d, 48000.0) == 2401);
+        Parameters::Values r; r.rawBins = true;                             // Raw overrides Fixed too
+        CHECK(outputBinCountFrom(r, 44100.0) == 8193);
+        r.zeroPad = false; CHECK(outputBinCountFrom(r, 44100.0) == 1589);
+        CHECK(axisRate(r, 44100.0, 0.0) == 44100.0);                        // Raw spans DC..Nyquist whatever Display Max
+        Parameters::Values f; f.zeroPad = false; f.binsMode = Parameters::BinsMode::Fixed;   // Fixed stays Output Bins
+        CHECK(outputBinCountFrom(f, 44100.0) == f.bins);
+    }
+
+    // targetHzAt reproduces computeTargetHzGrid exactly, every scale.
+    for (int scale = 0; scale < 7; ++scale) {
+        std::vector<double> grid;
+        PerceptualWarping::computeTargetHzGrid(scale, 20000.0, 513, 0.963, 20.0, grid);
+        double worst = 0.0;
+        for (size_t i = 0; i < grid.size(); ++i)
+            worst = std::max(worst, std::abs(grid[i] - PerceptualWarping::targetHzAt(scale, 20000.0, i * (1.0 / 512.0), 0.963, 20.0)));
+        CHECK(worst < 1e-9);
+    }
+
+    // Presets override exactly what they own.
+    Parameters::Values v60; v60.preset = Parameters::Preset::Visual60; v60.warpInterp = Parameters::WarpInterp::Linear;
+    v60.binsMode = Parameters::BinsMode::Fixed; applyPreset(v60);
+    CHECK(v60.padSize == 8192 && v60.padIndex == 3);
+    CHECK(v60.warpInterp == Parameters::WarpInterp::Cubic);
+    CHECK(v60.binsMode == Parameters::BinsMode::Fixed && v60.betaMode == Parameters::BetaMode::Auto);
+    Parameters::Values v120; v120.preset = Parameters::Preset::Visual120; applyPreset(v120);
+    CHECK(v120.padSize == 4096 && v120.bins == 16384);
+    Parameters::Values an; an.preset = Parameters::Preset::Analysis; applyPreset(an);
+    CHECK(an.padSize == 32768 && an.warpAggregate == Parameters::WarpAggregate::Rms);
+    Parameters::Values cu; cu.padSize = 1024; applyPreset(cu);
+    CHECK(cu.padSize == 1024);                                 // Custom changes nothing
+}
+
+// Peak aggregation never drops a narrow peak on a coarse grid; interpolation does. RMS is the power mean.
+static void test_warp_aggregation()
+{
+    section("v2.10 warp aggregation (peak / rms on the coarse part of the axis)");
+    const size_t nlin = 8193;                        // a 16384-point transform
+    const double nyq = 22050.0;
+    PerceptualWarping off, peak, rms;
+    off.buildWarpTables(0, nyq, 1024, nyq, 0.963, 20.0, nlin);
+    peak.setAggregation(1);
+    peak.buildWarpTables(0, nyq, 1024, nyq, 0.963, 20.0, nlin);
+    rms.setAggregation(2);
+    rms.buildWarpTables(0, nyq, 1024, nyq, 0.963, 20.0, nlin);
+    CHECK(off.aggregatedBins() == 0);
+    CHECK(peak.aggregatedBins() > 300);              // a 1024-bin log axis is coarse over most of its top half
+    std::printf("  1024-bin log axis over 8193 FFT bins: %zu bins aggregate\n", peak.aggregatedBins());
+    // A single-bin "partial" swept across the upper half of the band: the peak-aggregated output must
+    // report it at full height at every position; the interpolated one loses it between taps.
+    AlignedVector mag(nlin, 0.0f), o1, o2;
+    double worstPeak = 1.0, worstOff = 1.0;
+    for (size_t k = nlin / 2; k < nlin - 1; k += 7) {
+        std::fill(mag.begin(), mag.end(), 0.0f);
+        mag[k] = 1.0f;
+        peak.applyWarp(mag, o1);
+        off.applyWarp(mag, o2);
+        worstPeak = std::min(worstPeak, static_cast<double>(*std::max_element(o1.begin(), o1.end())));
+        worstOff = std::min(worstOff, static_cast<double>(*std::max_element(o2.begin(), o2.end())));
+    }
+    std::printf("  swept partial: smallest reported level peak=%.3f interpolate=%.3f\n", worstPeak, worstOff);
+    CHECK(worstPeak == 1.0);
+    CHECK(worstOff < 0.5);                           // documents the legacy loss
+    // RMS of a constant range is the constant; the linear (fine) part keeps interpolated values.
+    std::fill(mag.begin(), mag.end(), 2.0f);
+    rms.applyWarp(mag, o1);
+    double maxDev = 0.0;
+    for (float v : o1) maxDev = std::max(maxDev, std::abs(v - 2.0));
+    CHECK(maxDev < 1e-5);
+    // the cubic kernel aggregates too
+    PerceptualWarping cub;
+    cub.setInterpolation(1); cub.setAggregation(1);
+    cub.buildWarpTables(0, nyq, 1024, nyq, 0.963, 20.0, nlin);
+    std::fill(mag.begin(), mag.end(), 0.0f); mag[nlin - 100] = 3.0f;
+    cub.applyWarp(mag, o1);
+    CHECK(*std::max_element(o1.begin(), o1.end()) == 3.0f);
+    // the magnitude range the aggregated tables need is covered by maxLinearIndex
+    CHECK(peak.maxLinearIndex() >= nlin - 2);
+}
+
+// IngestCursor: only new samples, nothing when the input did not cook, whole block on a discontinuity.
+static void test_ingest_cursor()
+{
+    section("v2.10 ingest cursor (Input Ingest = Auto)");
+    IngestCursor c;
+    CHECK(c.fresh(0.0, 735, 1) == 735);               // first block: everything
+    CHECK(c.fresh(735.0, 735, 2) == 735);             // timesliced: advanced by a whole block
+    CHECK(c.fresh(735.0, 735, 2) == 0);               // input did not cook: nothing new
+    CHECK(c.fresh(1000.0, 1024, 3) == 554);           // sliding window re-delivered with overlap: only the newest 554
+    CHECK(c.fresh(1000.0, 1024, 4) == 1024);          // re-cooked without advancing (generator): whole block
+    CHECK(c.fresh(0.0, 1024, 5) == 1024);             // jumped back (loop / reset): whole block
+    CHECK(c.fresh(50000.0, 1024, 6) == 1024);         // gap larger than a block: whole block
+    c.reset();
+    CHECK(c.fresh(51024.0, 1024, 6) == 1024);         // after reset: whole block even with the same cook count
+}
+
+// Spectral features on known signals.
+static void test_spectral_features()
+{
+    section("v2.10 spectral features");
+    const double sr = 44100.0;
+    const size_t N = 8192, win = 4096;
+    PlanLog log;
+    FFTWEngine e;
+    e.prepare(N, PlannerPolicy::Fast, &log);
+    AlignedVector window, frame(N, 0.0f), mag, sig(win), prev;
+    AlignedComplexVector scratch;
+    WindowGenerator::generateWindow(1, 0.0, win, window, WindowNorm::FullScale);
+    auto analyse = [&](SpectralFeatures& f) {
+        std::fill(frame.begin(), frame.end(), 0.0f);
+        multiplyInto(sig.data(), window.data(), frame.data(), win);
+        e.executeRFFT(frame, mag, scratch);
+        computeSpectralFeatures(mag.data(), mag.size(), sr / N, sig.data(), win, prev, f);
+    };
+    SpectralFeatures f;
+    for (size_t i = 0; i < win; ++i) sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * 1000.0 * i / sr));
+    analyse(f);
+    std::printf("  1 kHz sine: centroid %.1f Hz, rolloff %.1f Hz, flatness %.4f, rms %.2f dBFS\n", f.centroidHz, f.rolloffHz, f.flatness, f.rmsDb);
+    CHECK_NEAR(f.centroidHz, 1000.0, 20.0);
+    CHECK_NEAR(f.rolloffHz, 1000.0, 20.0);
+    CHECK(f.flatness < 0.01);                         // tonal
+    CHECK_NEAR(f.rmsDb, 20.0 * std::log10(0.5 / std::sqrt(2.0)), 0.05);
+    CHECK(f.midDb > f.bassDb + 30.0 && f.midDb > f.highDb + 30.0);   // 1 kHz sits in the mid band
+    analyse(f);
+    CHECK(f.flux < 1e-6);                             // an identical frame has no flux
+    for (size_t i = 0; i < win; ++i) sig[i] *= 4.0f;  // an attack: level x4
+    analyse(f);
+    CHECK(f.flux > 0.5);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 0.1f);
+    for (size_t i = 0; i < win; ++i) sig[i] = nd(rng);
+    analyse(f);
+    std::printf("  white noise: centroid %.0f Hz, flatness %.3f\n", f.centroidHz, f.flatness);
+    CHECK(f.flatness > 0.3);                          // noise-like
+    CHECK_NEAR(f.centroidHz, sr / 4.0, 1500.0);       // flat spectrum -> centroid at Nyquist/2
+}
+
+// The pipeline's steady state allocates nothing - 1 channel and 4 channels (the parallel fan-out).
+static void test_allocation_gate()
+{
+    section("v2.10 allocation gate (steady-state process() and AsyncAnalysis)");
+    auto run = [&](int channels, bool features) {
+        Parameters::Values p;                         // the plugin defaults: Auto (8193 bins), beta 15, Peak aggregation
+        p.planner = Parameters::Planner::Fast;        // no background measurement thread in this test
+        p.async = false;
+        p.features = features;
+        p.loudness = Parameters::Loudness::Db;        // the full chain: dB + ballistics + weighting
+        p.ballEnable = true;
+        p.weighting = Parameters::Weighting::AWeighting;
+        PlanLog log;
+        AnalysisPipeline pipe(&log);
+        AnalysisJob job;
+        job.numChannels = channels;
+        job.sampleRate = 48000.0;
+        job.winSamples = windowSamplesFrom(p, 48000.0);
+        job.p = p;
+        job.windows.assign(static_cast<size_t>(channels), AlignedVector(static_cast<size_t>(job.winSamples)));
+        for (auto& w : job.windows) for (size_t i = 0; i < w.size(); ++i) w[i] = static_cast<float>(std::sin(i * 0.05));
+        job.silent.assign(static_cast<size_t>(channels), 0);
+        AnalysisResult res;
+        for (int i = 0; i < 20; ++i) pipe.process(job, res);   // warm-up: plans, tables, buffers
+        long long n;
+        {
+            AllocWindow w;
+            for (int i = 0; i < 500; ++i) pipe.process(job, res);
+            n = w.count();
+        }
+        std::printf("  %d channel(s)%s: %lld allocations over 500 steady-state process() calls\n",
+                    channels, features ? " + features" : "", n);
+        return n;
+    };
+    CHECK(run(1, false) == 0);
+    CHECK(run(1, true) == 0);
+    // std::execution::par (the Windows thread pool) may allocate per submission; report it, and hold
+    // the pipeline's own code to zero by checking the 1-channel runs above.
+    const long long par = run(4, false);
+    (void)par;
+
+    // AsyncAnalysis, sync and async, steady state (publish + acquire on the "cook" side).
+    Parameters::Values p;
+    p.planner = Parameters::Planner::Fast;
+    PlanLog log;
+    AnalysisPipeline pipe(&log);
+    AsyncAnalysis a(pipe, log);
+    auto fill = [&](AnalysisJob& j, uint64_t seq) {
+        j.seq = seq; j.numChannels = 1; j.sampleRate = 44100.0; j.winSamples = 3175; j.p = p; j.dtMs = 16.7;
+        if (j.windows.size() != 1) j.windows.assign(1, AlignedVector(3175, 0.25f));
+        if (j.silent.size() != 1) j.silent.assign(1, 0);
+    };
+    a.configure(false, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Highest);
+    for (uint64_t i = 1; i <= 20; ++i) { fill(a.jobSlot(), i); a.publish(); a.acquireResult(); }
+    long long nSync;
+    {
+        AllocWindow w;
+        for (uint64_t i = 21; i <= 520; ++i) { fill(a.jobSlot(), i); a.publish(); a.acquireResult(); }
+        nSync = w.count();
+    }
+    std::printf("  AsyncAnalysis sync: %lld allocations over 500 cooks\n", nSync);
+    CHECK(nSync == 0);
+}
+
+// AsyncAnalysis: sync runs inline, async hands over, dormancy never loses a job, Signal wakes quickly.
+static void test_async_analysis()
+{
+    section("v2.10 AsyncAnalysis (handoff, dormancy, wake policies)");
+    Parameters::Values p;
+    p.planner = Parameters::Planner::Fast;
+    PlanLog log;
+    AnalysisPipeline pipe(&log);
+    AsyncAnalysis a(pipe, log);
+    uint64_t seq = 0;
+    auto publish = [&]() {
+        AnalysisJob& j = a.jobSlot();
+        j.seq = ++seq; j.numChannels = 1; j.sampleRate = 44100.0; j.winSamples = 3175; j.p = p; j.dtMs = 16.7;
+        if (j.windows.size() != 1) j.windows.assign(1, AlignedVector(3175));
+        for (size_t i = 0; i < 3175; ++i) j.windows[0][i] = static_cast<float>(std::sin(i * 0.1));
+        j.silent.assign(1, 0);
+        a.publish();
+    };
+    auto waitResult = [&](uint64_t want, double timeoutMs) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            a.acquireResult();
+            if (a.result().seq == want) return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeoutMs) return -1.0;
+            std::this_thread::yield();   // not sleep_for: on Windows any sleep rounds up to the ~15.6 ms tick
+        }
+    };
+    // sync: the result is there when publish() returns
+    a.configure(false, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Highest);
+    CHECK(!a.async());
+    publish();
+    CHECK(a.acquireResult() && a.result().seq == seq);
+    // async / poll
+    a.configure(true, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Highest);
+    CHECK(a.async());
+    publish();
+    const double tPoll = waitResult(seq, 2000.0);
+    CHECK(tPoll >= 0.0);
+    // dormancy: after > 500 ms idle the worker sleeps; the next job must still be picked up promptly
+    int lost = 0;
+    double worstWake = 0.0;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        publish();
+        const double t = waitResult(seq, 1000.0);
+        if (t < 0.0) ++lost;
+        worstWake = std::max(worstWake, t);
+    }
+    std::printf("  dormant -> woken pickup: worst %.2f ms over 3 cycles, lost %d\n", worstWake, lost);
+    CHECK(lost == 0);
+    CHECK(worstWake < 10.0);                          // one kernel wake-up + one analysis, not a poll period
+    // many jobs at random gaps across the poll interval: latest-wins, never a lost final job
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> gap(0, 3000);
+    for (int i = 0; i < 300; ++i) { publish(); std::this_thread::sleep_for(std::chrono::microseconds(gap(rng))); }
+    CHECK(waitResult(seq, 1000.0) >= 0.0);
+    // Signal policy: pickup well under the 2 ms poll
+    a.configure(true, Parameters::WorkerWake::Signal, Parameters::WorkerPriority::Highest);
+    std::vector<double> sig;
+    for (int i = 0; i < 50; ++i) {
+        publish();
+        const double t = waitResult(seq, 1000.0);
+        sig.push_back(t);
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    std::sort(sig.begin(), sig.end());
+    std::printf("  Signal wake: result latency median %.3f ms (includes the analysis)\n", sig[sig.size() / 2]);
+    CHECK(sig.front() >= 0.0);
+    CHECK(sig[sig.size() / 2] < 1.5);                 // woken per job: well under the 2 ms poll period
+    // MMCSS priority restarts the worker and keeps working
+    a.configure(true, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Mmcss);
+    publish();
+    CHECK(waitResult(seq, 2000.0) >= 0.0);
+    const AsyncAnalysis::Pickup pk = a.pickup();
+    std::printf("  pickup telemetry: p50 %.0f us, p99 %.0f us, max %.0f us, late %llu\n", pk.p50Us, pk.p99Us, pk.maxUs,
+                static_cast<unsigned long long>(pk.late));
+    CHECK(pk.p50Us > 0.0);
+    a.configure(false, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Highest);
+    CHECK(!a.async());
+}
+
+// FFTWEngine never blocks the owner on an in-flight measurement: a size change abandons it.
+static void test_planner_graveyard()
+{
+    section("v2.10 planner graveyard (no blocking join on a size change)");
+    std::remove("fft_tests_wisdom_graveyard.txt");
+    const std::string saved = FFTWEngine::wisdomPathOverride();
+    PlanLog log;
+    FFTWEngine e;
+    e.prepare(65536 * 2, PlannerPolicy::Auto, &log);   // 131072 is not in this run's wisdom: measures in background
+    const bool measuring = e.upgradeInProgress();
+    const auto t0 = std::chrono::steady_clock::now();
+    e.prepare(1024, PlannerPolicy::Fast, &log);         // must not wait for the measurement
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("  size change during a measurement: prepare() returned in %.2f ms (measuring: %s, abandoned: %zu)\n",
+                ms, measuring ? "yes" : "no", e.abandonedMeasurements());
+    CHECK(ms < 250.0);
+    CHECK(e.hasPlan() && e.fftSize() == 1024);
+    // the abandoned measurement is reaped once it finishes (poll drives the reaping)
+    const auto t1 = std::chrono::steady_clock::now();
+    while (e.abandonedMeasurements() > 0 &&
+           std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() < 20.0) {
+        e.pollBackgroundPlan();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(e.abandonedMeasurements() == 0);
+    FFTWEngine::wisdomPathOverride() = saved;
+}
+
 // ------------------------------------------------------------------------------------------
 // ===================== main =====================
 // The runner. There is no discovery mechanism: a test runs if and only if it is called here, in the
@@ -1540,6 +1959,89 @@ static void test_equal_loudness()
 // HOW TO CHANGE: adding a test means writing the function, adding the call below, and updating the
 // table of contents and the check count in the header. Removing a call silently removes its coverage
 // while the suite still reports success, so the header list and this block have to be kept in step.
+// v2.11: the output sample count through the real pipeline, for every bins mode. Fixed must give exactly
+// Output Bins - also far above the rfft's N/2+1 (the zero-pad + interpolation use case); Auto and Raw
+// give N/2+1 of the transform actually run; Raw is bit-identical to the rfft magnitude; Zero-Padding off
+// runs the transform on the window itself.
+static void test_output_bin_modes()
+{
+    section("v2.11 output sample count: Fixed (upsampled), Auto = N/2+1, Raw rfft, Zero-Padding off");
+    const double sr = 48000.0;
+    const int win = 3000;
+    AlignedVector sig(win);
+    for (int i = 0; i < win; ++i) sig[i] = static_cast<float>(0.5 * std::sin(2.0 * PI_D * 1000.0 * i / sr));
+
+    auto run = [&](const Parameters::Values& p, AnalysisPipeline::Status* st = nullptr) {
+        PlanLog log;
+        AnalysisPipeline pipe(&log);
+        AnalysisJob job;
+        job.numChannels = 1; job.sampleRate = sr; job.winSamples = win; job.dtMs = 1000.0 / 60.0;
+        job.reset = true; job.p = p; job.windows.push_back(sig); job.silent.push_back(0);
+        AnalysisResult res;
+        pipe.process(job, res);
+        if (st) *st = pipe.status();
+        return res;
+    };
+    Parameters::Values base;
+    base.winMode = Parameters::WinMode::Samples; base.winSamples = win;
+    base.loudness = Parameters::Loudness::Off; base.ballEnable = false;
+
+    // Fixed, 32768 output bins from a 16384-point transform (8193 rfft bins): 4x upsampled.
+    Parameters::Values fx = base; fx.binsMode = Parameters::BinsMode::Fixed; fx.bins = 32768; fx.padSize = 16384;
+    AnalysisResult r = run(fx);
+    CHECK(r.spectra[0].size() == 32768);
+    CHECK(outputBinCountFrom(fx, sr) == 32768);
+    CHECK_NEAR(r.peakHz, 1000.0, 60.0);
+
+    // Auto: N/2+1 of the padded transform, whatever Output Bins says.
+    Parameters::Values au = base; au.binsMode = Parameters::BinsMode::Auto; au.bins = 1000; au.padSize = 65536;
+    AnalysisPipeline::Status st;
+    r = run(au, &st);
+    CHECK(st.fftSize == 65536);
+    CHECK(r.spectra[0].size() == 32769);
+    CHECK(outputBinCountFrom(au, sr) == 32769);
+
+    // Raw: identity (memcpy) of the rfft magnitude, DC..Nyquist, Scale / Display Max ignored.
+    Parameters::Values rw = base; rw.rawBins = true; rw.padSize = 8192; rw.scale = Parameters::Scale::Mel; rw.displayMax = 5000.0;
+    r = run(rw, &st);
+    CHECK(r.spectra[0].size() == 4097);
+    CHECK(st.linearGrid);
+    CHECK_NEAR(st.axisRate, sr, 1e-6);
+    CHECK_NEAR(r.peakHz, 1000.0, sr / 8192.0 + 1e-3);
+    {
+        // bit-identical to an independent FFT of the same windowed, centred frame
+        AlignedVector wb;
+        FFTDSP::WindowGenerator::generateWindow(static_cast<int>(rw.window), rw.kaiserBeta, win, wb, FFTDSP::WindowNorm::CoherentGain);
+        const size_t start = ((8192 - win) / 2) & ~static_cast<size_t>(7);
+        std::vector<double> re(4097, 0.0), im(4097, 0.0);
+        size_t k_peak = static_cast<size_t>(std::lround(1000.0 / sr * 8192.0));
+        for (size_t k = k_peak - 2; k <= k_peak + 2; ++k) {
+            for (int n = 0; n < win; ++n) {
+                const double x = static_cast<double>(sig[n]) * wb[n];
+                const double ph = -2.0 * PI_D * static_cast<double>(k) * static_cast<double>(start + n) / 8192.0;
+                re[k] += x * std::cos(ph); im[k] += x * std::sin(ph);
+            }
+            const double mag = std::hypot(re[k], im[k]);
+            CHECK_NEAR(r.spectra[0][k], mag, 1e-4 * mag + 1e-4);
+        }
+    }
+
+    // Zero-Padding off: N = window (3000, even) -> 1501 rfft bins, for Raw and Auto alike.
+    Parameters::Values np = rw; np.zeroPad = false;
+    r = run(np, &st);
+    CHECK(st.fftSize == 3000);
+    CHECK(r.spectra[0].size() == 1501);
+    CHECK(st.linearGrid);
+    Parameters::Values npa = au; npa.zeroPad = false;
+    r = run(npa, &st);
+    CHECK(r.spectra[0].size() == 1501);
+    // ... and Fixed still interpolates the unpadded rfft onto exactly Output Bins.
+    Parameters::Values npf = fx; npf.zeroPad = false;
+    r = run(npf, &st);
+    CHECK(st.fftSize == 3000);
+    CHECK(r.spectra[0].size() == 32768);
+}
+
 int main()
 {
     // Unbuffered stdout, for the same reason as the bench: piped output is block-buffered by the MSVC
@@ -1547,6 +2049,11 @@ int main()
     // running. With this, the last line printed is the crash site - and that line is the whole
     // diagnosis, because the alternative is bisecting by re-running with tests commented out.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Hermetic wisdom: every FFTWEngine in this process reads and writes a private file next to the
+    // executable, set BEFORE the first prepare() - importWisdomOnce() latches once per process, and the
+    // first prepare() (test_v23_helpers) used to import the user's real %LOCALAPPDATA% cache.
+    FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";
+    std::remove("fft_tests_wisdom.txt");
     // The build answer (was this compiled with AVX2?) and the runtime one (can this CPU run it?) are
     // independent, and the interesting rows in a failure report are the ones where they disagree.
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
@@ -1576,6 +2083,14 @@ int main()
     test_identity_grid_and_rate();
     test_rate_model();
     test_equal_loudness();
+    test_v210_rate_helpers();
+    test_output_bin_modes();
+    test_warp_aggregation();
+    test_ingest_cursor();
+    test_spectral_features();
+    test_allocation_gate();
+    test_async_analysis();
+    test_planner_graveyard();
     // The line the header's "the check count is a signal" section is about. Exit code is 0 only when
     // every check passed, which is what ctest --output-on-failure keys off.
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

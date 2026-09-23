@@ -52,6 +52,10 @@
  *     - both handoffs are wait-free triple buffers (one atomic exchange each side),
  *       "latest wins", never torn;
  *     - if no new result is ready the previous spectrum is re-output (hold).
+ *     MEASURED COST of that cook path: ~11 us mean / 17 us p99 per cook at 16384 bins
+ *     (v2.4.0, fft_bench --cook) - about 0.07 % of a 60 fps frame, which is what makes
+ *     "always cook" (see getGeneralInfo in FFT.cpp) affordable. The steady-state invariant
+ *     to preserve when editing: no allocation, no lock and no print on this path, ever.
  *   The AnalysisPipeline (FFT engine, tables, per-channel DSP state) is entered by ONE
  *   thread at a time: the worker when Async is on, the cook thread when it is off. That is
  *   ownership, not single-threadedness — inside one process() the channel loop fans out over
@@ -116,6 +120,8 @@ struct IngestState {
 // header so it is unit-testable without TouchDesigner or a worker thread. See AnalysisPipeline.h.
 // ---------------------------------------------------------------------------------------------
 #include "AnalysisPipeline.h"
+#include "RateModel.h"       // IngestCursor + the TD-free rate model (all inline)
+#include "AsyncAnalysis.h"   // the cook <-> worker handoff (TD-free, shared with the tests and the bench)
 
 // ---------------------------------------------------------------------------------------------
 // The six steps of one cook, and which file implements each
@@ -202,6 +208,9 @@ public:
 	// thread. HOW TO CHANGE: keep it to setting a flag - doing real work here would be work done on
 	// TouchDesigner's thread at an arbitrary moment.
 	virtual void		pulsePressed(const char* name, void* reserved1) override;
+	// setParameterEnableStates (C++ API Common 3, TouchDesigner 2025.33230+): greys out the parameters
+	// the current settings make inert. May be called outside a cook; it only reads `inputs`.
+	virtual void		setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* state, void* reserved1) override;
 
 private:
 	// --- cook-thread helpers (steps 1, 2 and 5 of one cook; all implemented in FFT.cpp) ---
@@ -224,19 +233,11 @@ private:
 	// fillJob: builds the AnalysisJob for this cook - per channel, the window of samples, plus the
 	// rates and parameters the pipeline needs. Note it reads from the FIFOs that ingest() just wrote.
 	void fillJob(AnalysisJob& job, int numChannels, int winSamples, double dtMs);
-	// runJob: step 4's outer wrapper - runs the pipeline for one job and turns its outcome into
-	// records (published result, failure flags, status snapshot). Called on the pipeline owner
-	// thread: the worker when Async is on, the cook thread when it is off.
-	void runJob(const AnalysisJob& job);          // pipeline owner thread (worker, or cook when Async is off)
-	// startWorker/stopWorker: create and join the one background thread. called from executeImpl when
-	// the Async parameter differs from myWorkerRunning, so the thread's whole lifetime is decided
-	// there. stopWorker blocks until the thread has left runJob, which is why toggling Async is the
-	// one parameter change that can cost a frame.
-	void startWorker();
-	void stopWorker();
-	// workerLoop: the thread body - poll the job slot while hot, sleep when dormant. Never returns
-	// until myWorkerStop is set.
-	void workerLoop();
+	// The analysis job handoff, the worker thread and its telemetry live in AsyncAnalysis (myAsync).
+	// renderInfoCache: formats the fixed Info DAT rows and the popup text into member strings, at most
+	// every kInfoRenderMs or when the status/log/params change - the info callbacks then only hand the
+	// cached strings over (no per-row std::to_string / concatenation on every cook).
+	void renderInfoCache(bool force);
 	// copyResultsToOutput: step 5 - copy the newest spectrum into the CHOP, or hold the previous one.
 	// It also records the peak and the hold-frame count that the Info CHOP reports.
 	void copyResultsToOutput(CHOP_Output* output, int numChannels);
@@ -348,74 +349,26 @@ private:
 
 	// --- pipeline + worker ---
 	// myLog: the log every part of the plugin writes to. In deferred mode the worker only queues a
-	// string (no Python, no Textport call from a background thread); the cook flushes it. PlanLog and
-	// the reason for deferred mode are documented in DSPModules.h.
+	// string (no Python, no Textport call from a background thread); the cook flushes it.
 	FFTDSP::PlanLog		myLog;
-	// myPipeline: the DSP engine. Owned by the node, but only ONE thread at a time may be inside it -
-	// the worker when Async is on, the cook thread when it is off. That is ownership, not
-	// single-threadedness; see the file header.
+	// myPipeline: the DSP engine. Only ONE thread at a time is inside it - the worker when Async is on,
+	// the cook thread when it is off (AsyncAnalysis enforces that).
 	std::unique_ptr<AnalysisPipeline> myPipeline;
-	// myWorker: the one background thread this node owns. Its lifetime is decided entirely by the
-	// Async parameter, toggled in executeImpl - see startWorker/stopWorker.
-	std::thread			myWorker;
-	// myWorkerStop: the worker's exit request. Set by stopWorker, read at the top of workerLoop.
-	std::atomic<bool>	myWorkerStop{ false };
-	// myWorkerDormant: the worker has stopped polling and is asleep until the cook signals. The cook
-	// must call myWake.signal() when this is true, or the job it just published is never picked up -
-	// that handshake is the most delicate part of the node, and it is documented in workerLoop().
-	std::atomic<bool>	myWorkerDormant{ false };     // worker sleeps indefinitely; the cook must signal()
-	// myWorkerRunning: true while a thread exists. Cook thread only - it is what executeImpl compares
-	// the Async parameter against to decide whether to start or stop the worker. Deliberately NOT
-	// atomic: it is never read from the worker.
-	bool				myWorkerRunning{ false };
-	// myWake: the wait/wake primitive the worker sleeps on. A plain condition variable would be a
-	// forbidden kernel call on the hot path, which is why this type exists (see DSPModules.h).
-	FFTDSP::WorkerSignal myWake;
-	// The two timings of the worker's sleep policy: poll every kWorkerPollMs while jobs are flowing
-	// (cheap, no kernel call), and go dormant only after kWorkerDormantAfterMs with nothing to do.
-	// Increasing the poll interval adds latency to every spectrum update; decreasing it burns CPU on a
-	// node that is otherwise idle. Changing the dormancy threshold trades the one-off wake-up cost
-	// against the cost of polling forever.
-	static constexpr uint32_t kWorkerPollMs = 2;      // job pickup latency while hot (<< one frame)
-	static constexpr double   kWorkerDormantAfterMs = 500.0;
-	// The two lock-free handoffs. Each is "latest wins": a new job overwrites an unread one rather
-	// than queueing, which is correct here because only the newest audio window is worth analysing.
-	// HOW TO CHANGE: the types are templated on the payload; if either payload gains a member that is
-	// not trivially copyable, the handoff stops being valid - see TripleBuffer in DSPModules.h.
-	FFTDSP::TripleBuffer<AnalysisJob>    myJobs;      // cook -> pipeline owner
-	FFTDSP::TripleBuffer<AnalysisResult> myResults;   // pipeline owner -> cook
-	// myJobsDropped: how many times a job was published before the worker had taken the previous one.
-	// Reported as async_jobs. It is a health number - steady non-zero means the analysis cannot keep
-	// up with the cook rate, which is worth seeing rather than hiding.
-	std::atomic<uint64_t> myJobsDropped{ 0 };
+	// myAsync: job/result triple buffers, the worker thread (wake policy, priority, dormancy) and the
+	// cross-thread telemetry. Declared AFTER myPipeline so it is destroyed first (its worker calls into
+	// the pipeline); ~FFT also resets it explicitly.
+	std::unique_ptr<AsyncAnalysis> myAsync;
 
-	// --- engine/pipeline failure escalation (lock-free; details go to the deferred textport log) ---
-	// Two different questions are answered here, and they are deliberately separate fields:
-	//   myPlanFailed / myPipelineErrors  - "has anything gone wrong?" (a fact about the past), and
-	//   myPipelineFailing               - "is it going wrong NOW?" (a fact about the present).
-	// The error string is driven by the second one only, because a lifetime tally can never come back
-	// down and would leave a healthy node flagged as broken forever. Everything here is atomic and
-	// written by the pipeline owner thread, read by the cook and the Info callbacks.
-	//
-	// myPlanFailed: the engine has no usable plan for the CURRENT window size - usually a plan that
-	// could not be created, or one being rebuilt. Resets by itself when a plan exists again (runJob
-	// rewrites it from the pipeline after every analysis), so unlike the others it can go back to
-	// false without any exception having to be recovered from.
-	std::atomic<bool>		myPlanFailed{ false };      // prepare() failed to produce a plan for the current size
-	// myPipelineErrors: the LIFETIME count of exceptions thrown by runJob(). Telemetry only - it is
-	// reported in the Info DAT and is never used to decide anything. Do not make the error string
-	// depend on it; that is what myPipelineFailing is for.
-	std::atomic<uint64_t>	myPipelineErrors{ 0 };      // lifetime count of runJob() exceptions, telemetry only
-	// Whether the MOST RECENT analysis threw. The lifetime counter above is not a statement about the
-	// present, so it must not drive the error string on its own: latched on the counter alone, a single
-	// transient exception during a reload left the node flagged as broken forever while it was cooking
-	// correctly, and TouchDesigner reports a node in an error state instead of its operator information -
-	// which is one of the few things that can empty a middle-click popup with nothing else visibly wrong.
-	// Set on a throw, cleared when an analysis completes and publishes.
-	std::atomic<bool>		myPipelineFailing{ false };
-	// HOW TO CHANGE: the pattern to preserve is "set on failure, cleared by the next success". Adding a
-	// new way to fail means setting these two in the same place runJob() does, not inventing a third
-	// latch - the whole value of myPipelineFailing is that exactly one thing clears it.
+	// --- ingest position (IngestMode::Auto) ---
+	// The end (startIndex + numSamples) and cook count of the input at the previous ingest. Only the
+	// samples past myLastInputEnd are new; an input that did not cook since (same totalCooks) delivers
+	// nothing new at all. myHaveInputPos is false until the first ingest and after a reset.
+	IngestCursor		myIngestCursor;
+	// The input rate as reported, before the clamp in executeImpl - so "no usable sample rate" can be
+	// reported (the clamped mySampleRate is never <= 0, which made that error unreachable).
+	double				myRawInputRate{ 44100.0 };
+	// The output width declared by the last getOutputInfo (Auto / Raw = the rfft N/2+1, which depends on the input rate in ms window mode).
+	int					myOutputBins{ 0 };
 
 	// --- telemetry ---
 	// Every number the UI reports about the node's own performance. The pattern throughout this block
@@ -424,25 +377,7 @@ private:
 	// is why most of these are atomics and why the one piece of shared structured data (the status)
 	// has its own memo on the read side - see statusSnapshot() and myStatusRead below.
 	//
-	// myDspUs: how long the last analysis took, in microseconds. Written by runJob after every
-	// analysis, read by the DSP-time Info channel.
-	std::atomic<double>	myDspUs{ 0.0 };
-	// myOutputSampleRate: the exact spectrum rate read off the pipeline owner's own tables (not
-	// recomputed from the parameters), so the reported number always describes the bins that were
-	// actually produced. Written by runJob.
-	std::atomic<double>	myOutputSampleRate{ 0.0 };    // exact spectrum rate read off the pipeline owner's tables
-	// myStatusMutex: guards myStatusCopy only. Taken by the pipeline owner when it publishes a new
-	// status, and by whichever thread is refreshing its memo in statusSnapshot(). It is deliberately
-	// NOT taken by the cook in async mode, so a slow Info query can never delay a frame. If you add a
-	// field under this mutex, add it to myStatusCopy's refresh in runJob() too.
-	std::mutex			myStatusMutex;                // Info callbacks <-> pipeline owner; never taken by the cook in async mode
-	// myStatusCopy: the pipeline's status struct as last published. Guarded by myStatusMutex. It moves
-	// only on a plan rebuild, which is what makes the reader-side memo below effective.
-	AnalysisPipeline::Status myStatusCopy;        // guarded by myStatusMutex; moves only on a plan rebuild
-	// myStatusVersionSeen: the pipeline's status version at the last publish. Pipeline owner thread
-	// only - it is what tells runJob() that the strings actually changed and are worth rebuilding.
-	uint64_t			myStatusVersionSeen{ 0 };     // pipeline owner only
-	// Reader-side memo of the above. TouchDesigner calls the info-chain callbacks one channel / one row at
+	// Reader-side memo of the pipeline status (published by AsyncAnalysis). TouchDesigner calls the info-chain callbacks one channel / one row at
 	// a time - 21 Info CHOP channels plus 276 Info DAT rows plus the popup, per cook - and every one of
 	// them asks for this struct. Taking the lock and copying two std::strings each time was ~850 heap
 	// allocations per frame on the cook thread, which is both a real-time-path violation and the reason a
@@ -452,10 +387,6 @@ private:
 	//
 	// myStatusRead / myStatusReadVersion are written only by the thread that calls statusSnapshot(), which
 	// is TouchDesigner's info thread - the info chain for a node is called serially within a cook.
-	// myStatusPubVersion: bumped under myStatusMutex by the pipeline owner every time it writes
-	// myStatusCopy. It is the whole signal the reader side gets - one atomic counter, no lock on the
-	// reading thread's fast path.
-	std::atomic<uint64_t> myStatusPubVersion{ 0 };  // bumped under myStatusMutex when myStatusCopy is written
 	// myStatusRead: the read side's own copy, returned by reference by statusSnapshot(). TouchDesigner
 	// asks for the status once per channel and once per row (~300 times a cook), so this exists purely
 	// so those ~300 calls share one copy. Written only by whichever thread calls statusSnapshot().
@@ -558,6 +489,28 @@ private:
 	// CHANGE: nothing reads this as state - if you ever treat its contents as meaningful before
 	// snapshotTail() has refilled it, you will be reading the previous cook's log.
 	std::vector<std::string> myPopupTail;
+
+	// --- cached Info rendering (renderInfoCache) ---
+	// The fixed Info DAT rows (name, value) and the popup text, formatted at most every kInfoRenderMs or
+	// when their inputs change. The info callbacks run inside every cook, so formatting ~20 rows and the
+	// popup on each one was steady-state allocation on the cook thread; now the steady state is a
+	// timestamp compare and setString() of strings that already exist.
+	static constexpr int	kInfoFixedRows = 23;
+	static constexpr double	kInfoRenderMs = 250.0;
+	std::string			myDatName[kInfoFixedRows];
+	std::string			myDatValue[kInfoFixedRows];
+	std::string			myPopupText;
+	std::chrono::steady_clock::time_point myInfoRenderedAt{};
+	uint64_t			myInfoRenderedStatus{ ~0ull };
+	uint64_t			myInfoRenderedLog{ ~0ull };
+	// The wisdom file path shown in the fft_backend row, per backend (it used to be recomputed - with an
+	// env lookup and a CreateDirectoryA - on every cook).
+	std::string			myWisdomPathShown;
+	const FFTDSP::FftBackendInfo* myWisdomPathFor{ nullptr };
+
+	// --- spectral features (channel 0), copied from the newest result on the cook thread ---
+	FFTDSP::SpectralFeatures myFeatures;
+	bool				myHaveFeatures{ false };
 };
 
 #endif // FFT_H

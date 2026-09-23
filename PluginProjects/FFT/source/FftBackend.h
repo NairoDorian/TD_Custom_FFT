@@ -138,6 +138,10 @@ struct FftApi {
     // sprintPlan: renders a plan to a heap string, which is the only runtime way to see which SIMD
     // kernels the library picked. Optional, and used only for reporting - section 4.
     char* (*sprintPlan)(const fftwf_plan)              = nullptr;  // fftwf_sprint_plan
+    // Optional: bounds how long the planner may measure (seconds; negative = FFTW_NO_TIMELIMIT). The
+    // setting is PROCESS-GLOBAL planner state, so it is only ever set and reset inside one plannerMutex()
+    // critical section (FFTWEngine's background PATIENT measurement).
+    void  (*setTimelimit)(double)                      = nullptr;  // fftwf_set_timelimit
 
     // ---- optional; the plugin does not plan in parallel, but the version report states whether
     // the API exists, because it changes what the library can do ----
@@ -565,6 +569,7 @@ inline bool loadBackendFrom(const FftBackendInfo& info, const std::string& dir,
     api.importWisdom = reinterpret_cast<decltype(api.importWisdom)>(sym("fftwf_import_wisdom_from_filename"));
     api.exportWisdom = reinterpret_cast<decltype(api.exportWisdom)>(sym("fftwf_export_wisdom_to_filename"));
     api.sprintPlan   = reinterpret_cast<decltype(api.sprintPlan)>(sym("fftwf_sprint_plan"));
+    api.setTimelimit = reinterpret_cast<decltype(api.setTimelimit)>(sym("fftwf_set_timelimit"));
     api.initThreads  = reinterpret_cast<decltype(api.initThreads)>(sym("fftwf_init_threads"));
     api.planWithNthreads = reinterpret_cast<decltype(api.planWithNthreads)>(sym("fftwf_plan_with_nthreads"));
     api.version      = reinterpret_cast<const char*>(sym("fftwf_version"));

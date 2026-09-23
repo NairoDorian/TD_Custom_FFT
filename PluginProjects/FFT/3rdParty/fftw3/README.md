@@ -1,5 +1,14 @@
 # FFTW3 for Windows 64-bit (single precision) — vendored 3.3.11, AVX2 + FMA
 
+> **Build-system note:** this vendored tree is consumed through the sibling
+> [`PluginBuilder_V2`](../../../../../PluginBuilder_V2) CMake module — specifically
+> `td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)` in
+> [`PluginProjects/FFT/CMakeLists.txt`](../../CMakeLists.txt). `DYNAMIC` means no import library
+> is linked into `FFT.dll`; the DLL is staged next to the plugin and resolved at run time (see
+> `source/FftBackend.h`). If you change the build tag, file names, or link mode, update both this
+> README and `PluginBuilder_V2/cmake/TDPlugin.cmake`'s `td_plugin_use_fftw3` contract, and rebuild
+> via `PluginBuilder.tox` or `python PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT`.
+
 Only the single-precision runtime (`fftwf_` / `libfftw3f`) is vendored. The full record of what
 this build is — version, source, hashes, build recipe, the one upstream patch — is in `VERSION`
 next to this file; this README is the short version and the install instructions.

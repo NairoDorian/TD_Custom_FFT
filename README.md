@@ -9,6 +9,14 @@ in the cook loop.
 Built with [PluginBuilder_V2](../PluginBuilder_V2) (hot reload from TouchDesigner) but also builds
 standalone with CMake + Ninja and ships headless tests and a per-stage benchmark.
 
+> **Relation to PluginBuilder_V2:** this project is the *consumer*; `../PluginBuilder_V2` is the
+> *toolchain*. Shared contract: `cmake/TDPlugin.cmake` (`td_add_plugin`, `td_plugin_use_fftw3`,
+> `td_plugin_optimize`), `plugin.json` manifest (family CHOP, optype `Fftcustom`), vendored API-10
+> headers in `../PluginBuilder_V2/include/`, rename-in-place deploy into `__Plugins__/FFT/`, and the
+> `PluginBuilder.tox` hot-reload loop. Cross-repo CI from the builder folder:
+> `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`. Builder-side history lives in
+> `../PluginBuilder_V2/CHANGELOG.md` and `../PluginBuilder_V2/AUDIT.md` (§6).
+
 ---
 
 ## How to use this documentation
@@ -133,7 +141,15 @@ with an undefined symbol at link time, not at compile time.
 
 ### From TouchDesigner (PluginBuilder_V2)
 Drop `PluginBuilder.tox` into `Plugin_FFT.toe`, type `FFT` as the plugin name — PluginBuilder finds the
-existing project, configures, compiles on every source save and hot-reloads the DLL (rename-in-place, no unload gap).
+existing project (via this folder's `plugin.json`), configures, compiles on every source save and
+hot-reloads the DLL (rename-in-place, no unload gap). Requires `PLUGIN_BUILDER_DIR` to resolve to
+`../PluginBuilder_V2` (the CMakeLists default); rebuild after builder upgrades with
+`python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT` if you want a headless check.
+The generated/loader path, `plugin.json` manifest, `__Plugins__/FFT/` deploy folder and the CMake
+functions (`td_add_plugin`, `td_plugin_use_fftw3 ... DYNAMIC`, `td_plugin_optimize`) all come from the
+sibling [PluginBuilder_V2](../PluginBuilder_V2) repo; `CMakeLists.txt` resolves it as
+`../../../PluginBuilder_V2` (override with `-DPLUGIN_BUILDER_DIR=`). Headless cross-check from that
+repo: `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`.
 
 ### Standalone
 ```cmd
@@ -175,16 +191,19 @@ Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.
 | Page | Parameter | Type | Default | Notes |
 |---|---|---|---|---|
 | Spectrum | Channels | Menu | **Mono Mix** | Mono Mix (average all inputs → 1 analysis channel) / First Channel / All Channels (one FFT per channel) |
+| Spectrum | Raw RFFT Bins (no interpolation) | Toggle | Off | On = the rfft magnitude untouched: N/2+1 samples, DC..Nyquist, bin k = k·sr/N Hz (identity memcpy). Scale, Display Max, Warp, Output Bins and its mode are bypassed and greyed out |
 | Spectrum | Scale | Menu | Log | Log / Mel / ERB / Bark / Chroma / Linear / Melog |
 | Spectrum | Warp Interpolation | Menu | Linear | Linear (2 taps) / Cubic Catmull-Rom (4 taps; a 16K FFT + cubic looks like 32K + linear at half the cost) |
 | Spectrum | Display Max Hz | Float | 24000 | clamped to Nyquist; slider max 192000 so the full band is reachable at any input rate |
-| Spectrum | Output Bins | Int | 16384 | size of the warped output (hard-clamped 8…262144; slider max 65536, so `fft_size/2+1` is reachable at every pad size) |
+| Spectrum | Output Bins Mode | Menu | **Auto** | Auto = N/2+1 of the transform actually run (Zero-Pad Len 16384 → 8193 samples; the window with Zero-Padding off), Output Bins has no effect · Fixed = Output Bins is the output sample count (any count, more than N/2+1 included: interpolated) |
+| Spectrum | Output Bins | Int | 16384 | output samples per channel in Fixed (hard-clamped 8…262144; slider max 65536). Greyed out in Auto / Raw |
 | Spectrum | Warp Blend | Float | 0.963 | 0 = linear grid, 1 = fully perceptual |
 | Spectrum | Log Floor Hz | Float | 20 | lowest frequency of the Log / Melog grid |
 | Spectrum | Window Length Mode | Menu | Samples | Samples (legacy) or Milliseconds |
 | Spectrum | Window Sampling | Int | 3175 | analysis window in samples (= 72 ms @ 44.1 kHz) |
 | Spectrum | Window Length ms | Float | 72 | used when mode = Milliseconds |
-| Spectrum | Zero-Pad Len | Menu | 32768 | FFT size (auto-grown to ≥ next pow2 of the window) |
+| Spectrum | Zero-Padding | Toggle | On | Off = the FFT runs on the window itself (N = window length rounded up to even); Zero-Pad Len is greyed out. A power-of-two window is the fast case |
+| Spectrum | Zero-Pad Len | Menu | 16384 | FFT size (auto-grown to ≥ next pow2 of the window) |
 | Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT` (−12 % FFT time at N = 32768; ~3 s of above-normal-priority planning once per size per machine, never on a TouchDesigner thread; the resulting wisdom is also used by Auto) |
 | EQ | EQ Enable | Toggle | **Off** | Off = no EQ code and no EQ parameter reads at all |
 | EQ | High Shelf / Low Shelf | Toggle | On / On | per-shelf bypass (only read when EQ Enable is on) |

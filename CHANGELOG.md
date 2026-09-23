@@ -28,7 +28,70 @@ Two conventions that matter if you are adding an entry:
 For what the node does *now* (rather than when it changed), see [README.md](README.md); for the
 performance analysis, see [FFT_REALTIME_OPTIMIZATION_ANALYSIS.md](FFT_REALTIME_OPTIMIZATION_ANALYSIS.md).
 
+> **Relationship to PluginBuilder_V2:** this plugin is built by the sibling
+> [`../PluginBuilder_V2`](../PluginBuilder_V2) repository — CMake module (`TDPlugin.cmake`),
+> rename-in-place deploy, API-10 SDK headers, `PluginBuilder.tox` hot reload, and
+> `dev/ci.py --project PluginProjects/FFT` as the cross-repo smoke test. Builder-side version
+> history lives in *that* repo's CHANGELOG; entries here are DSP/node behaviour only, except
+> where a builder contract change is what made a release possible (e.g. 2.9.0's backend toggle
+> needed `td_plugin_use_fftw3(... VERSION ... DYNAMIC)`).
+
 ---
+
+## [v2.11.0] - 2026-09-23 — Output Bins drives the output again; raw rfft bins; zero-padding toggle
+
+The node exists to zero-pad the transform and put its spectrum on any number of output bins, including far
+more than a plain rfft's N/2+1. v2.10 broke that by making Output Bins Mode = Auto the default: the output
+length then followed Window Sampling and Output Bins stopped mattering. This release puts the count back in
+the user's hands and adds the two raw-rfft controls that were asked for.
+
+### Changed
+- **Output Bins Mode = Auto (the default) is now the rfft's own bin count: N/2+1 of the transform actually
+  run.** That is the Zero-Pad Len frame (16384 → 8193 samples, whatever the window: a 4096-sample window
+  gave 3081 samples under the v2.10 rule), or the window with Zero-Padding off. The bins are laid out on
+  Scale / Display Max. The v2.10 rule ("what the window resolves", capped by Output Bins) is gone, together
+  with `autoBinCount` and `kMinAutoBins`. In Auto, Output Bins has no effect and is greyed out.
+- **Fixed** makes Output Bins the number of samples in each output channel, whatever the window or the pad.
+  For example, 32768 bins from a 16384-point transform (8193 rfft bins) is interpolated 4x (pinned by
+  `test_output_bin_modes`).
+- **Kaiser Beta Mode defaults to Manual (β 15)**, so the default spectrum has the same shape as in v2.9.
+  Auto β stays available, and the presets still use it.
+- **Quality presets no longer touch the output count.** Visual 60/120 and Analysis set the pad,
+  interpolation, β mode and aggregation only. Visual 120 no longer caps Output Bins at 2048.
+
+### Added
+- **Raw RFFT Bins (no interpolation)** (`Rawbins`, Spectrum page, default off). Outputs the rfft magnitude
+  untouched: N/2+1 samples, bin k at k·sr/N Hz, DC..Nyquist. The warp is the exact identity and runs as a
+  memcpy, and the output matches an independent DFT of the same frame (checked in the tests). Scale, Display
+  Max, Warp Blend, Log Floor, Output Bins, Output Bins Mode, Warp Interpolation and Warp Aggregation are
+  greyed out while it is on. Weighting, loudness/dB and ballistics still apply, because they act per bin.
+  Measured: 11.8 µs p50 vs 18.7 µs for the default warped path (`pipeline_rawbins_p50_us`).
+- **Zero-Padding** (`Zeropad`, Spectrum page, default on). Off: the transform runs on the window itself.
+  N is the window length, rounded up to even (at most one zero sample) so the last bin is exactly Nyquist.
+  Zero-Pad Len is greyed out. With Raw RFFT Bins or Auto, the output is then window/2+1 bins. With Fixed,
+  those bins are interpolated onto Output Bins. A window length with large prime factors (e.g. 3175 → 3176
+  = 8·397) plans a slower FFT than a power of two, so prefer 2048/4096/... samples with padding off.
+- Info DAT `resolution` row: shows the mode (Fixed / Auto = N/2+1 / Raw rfft), the FFT size and whether
+  it is zero-padded.
+
+### Upgrading a node saved with v2.10
+PluginBuilder's reload restores the parameter values a node already had, so the node keeps its Output
+Bins Mode; Auto now means N/2+1 of the zero-padded FFT, and Fixed means exactly Output Bins. The new
+toggles arrive with their defaults (Raw off, Zero-Padding on).
+
+## [v2.10.0] - 2026-09-23 — lock-free real-time pipeline, presets, aggregation, spectral features
+
+Summary (the detailed plan and measurements are in `AUDIT_AND_PLAN_2026-09-23.md`):
+- **Async handoff:** wait-free triple buffers between the cook and the worker (`AsyncAnalysis`). Worker
+  Wake (Poll 2 ms / Signal) and Worker Priority (Highest / MMCSS "Pro Audio").
+- **Planner:** abandoned MEASURE/PATIENT plans go to a graveyard instead of blocking a cook. PATIENT is
+  time-limited to 1.5 s.
+- **New parameters:** Quality Preset, Warp Aggregation (Off / Peak / RMS, only where one output bin covers
+  several FFT bins), Kaiser Beta Mode (Auto designs β from the dB range), Input Ingest (Auto sample
+  cursor), Spectral Features (8 Info CHOP channels).
+- **UI:** parameters that the current settings make inert are greyed out (Common API 3).
+- **Tests:** a steady-state allocation gate in the tests. A perf-regression gate (`ctest -L perf`,
+  `bench/perf_baseline.json`).
 
 ## [Unreleased] — maintainability pass: comments, structure and documentation only
 

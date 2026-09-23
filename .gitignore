@@ -70,3 +70,5 @@ Desktop.ini
 
 # The DSP tests cache wisdom next to wherever they are run from; only the project-root copy is tracked.
 fft_tests_wisdom.txt
+# The bench keeps its own private wisdom (machine-specific FFTW timings); never tracked.
+fft_bench_wisdom.txt

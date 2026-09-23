@@ -1,20 +1,6 @@
-// Shared Use License: This file is owned by Derivative Inc. (Derivative)
-// and can only be used, and/or modified for use, in conjunction with
-// Derivative's TouchDesigner software, and only if you are a licensee who has
-// accepted Derivative's TouchDesigner license or assignment agreement
-// (which also govern the use of this file). You may share or redistribute
-// a modified version of this file provided the following conditions are met:
-//
-// 1. The shared file or redistribution must retain the information set out
-//    above and use the Shared Usage License.
-//
-// 2. This file must be distributed with Derivative's software.
-//
-// 3. This file is distributed in the hope that it will be useful, with the
-//    understanding that Derivative Inc. makes NO WARRANTIES regarding the
-//    use of this file, and Derivative specifically disclaims all implied
-//    warranties of merchantability
-//
+// RateModel.h - part of Plugin_FFT (TD_Custom_FFT). Original project code: it contains nothing from
+// Derivative's samples, so it carries the project's own terms (README.md, "License / third party"),
+// not the Derivative Shared Use License that the files derived from the SDK samples keep.
 #pragma once
 
 // ---------------------------------------------------------------------------------------------
@@ -43,6 +29,7 @@
 // ---------------------------------------------------------------------------------------------
 
 #include "Parameters.h"
+#include "DSPModules.h"   // PerceptualWarping::topSlopeHzPerFrac (already included by every includer)
 
 #include <algorithm>
 #include <cmath>
@@ -113,6 +100,12 @@ inline int windowSamplesFrom(const Parameters::Values& p, double sampleRate)
 //       plugin. Also exercised by test_rate_model() in tests/dsp_tests.cpp. Not used by bench/.
 inline size_t fftSizeFrom(const Parameters::Values& p, int winSamples)
 {
+	// Zero-Padding off: the transform is the window itself. Rounded up to even (at most one zero
+	// sample) so the rfft's last bin is exactly Nyquist, which the warp grid and the axis rate assume.
+	if (!p.zeroPad) {
+		const size_t w = static_cast<size_t>(std::max(2, winSamples));
+		return w + (w & 1u);
+	}
 	size_t needed = 1;
 	while (needed < static_cast<size_t>(std::max(1, winSamples))) needed *= 2;
 	return std::max<size_t>(static_cast<size_t>(std::max(2, p.padSize)), needed);
@@ -141,9 +134,117 @@ inline size_t fftSizeFrom(const Parameters::Values& p, int winSamples)
 //       and popup strings in source/FFT.cpp, AnalysisPipeline::updateWarp() in
 //       source/AnalysisPipeline.cpp, and the other functions in this file. Also exercised by
 //       test_rate_model() in tests/dsp_tests.cpp.
-inline int outputBinCountFrom(const Parameters::Values& p)
+// ---------------------------------------------------------------------------------------------
+// v2.10: window resolution, Auto Kaiser beta, Auto bin count, presets
+// ---------------------------------------------------------------------------------------------
+
+// Kaiser's window-design relation between beta and the peak sidelobe attenuation A (dB) it achieves
+// (Kaiser & Schafer 1980): the smallest beta that keeps every sidelobe A dB below the main lobe.
+inline double kaiserBetaForSidelobeDb(double A)
 {
-	return p.bins;
+	double b = 0.0;
+	if (A > 60.0) b = 0.12438 * (A + 6.3);
+	else if (A > 13.26) b = 0.76609 * std::pow(A - 13.26, 0.4) + 0.09834 * (A - 13.26);
+	return std::clamp(b, 0.0, 100.0);
+}
+
+// The Kaiser beta the pipeline actually uses. Auto: just enough sidelobe rejection for the display's dB
+// range (80 dB -> beta ~10.7), which is the sharpest main lobe that still keeps leakage below the floor.
+// Manual beta 15 (the pre-2.10 default) buys ~114 dB of rejection an 80 dB display cannot show, paid
+// for with a main lobe ~37 % wider.
+inline double effectiveKaiserBeta(const Parameters::Values& p)
+{
+	return (p.betaMode == Parameters::BetaMode::Auto) ? kaiserBetaForSidelobeDb(p.dbRange) : p.kaiserBeta;
+}
+
+// Main-lobe half width (centre to first null) in units of 1/window-length ("window bins"): the
+// frequency resolution the window really has, whatever the zero-padding. Kaiser: sqrt(1 + (beta/pi)^2).
+inline double mainLobeHalfWidthBins(const Parameters::Values& p)
+{
+	switch (p.window) {
+	case Parameters::WindowType::Kaiser: { const double b = effectiveKaiserBeta(p) / FFTDSP::PI_D; return std::sqrt(1.0 + b * b); }
+	case Parameters::WindowType::Hann:           return 2.0;
+	case Parameters::WindowType::Hamming:        return 2.0;
+	case Parameters::WindowType::Blackman:       return 3.0;
+	case Parameters::WindowType::BlackmanHarris: return 4.0;
+	case Parameters::WindowType::Rectangular:
+	default:                                     return 1.0;
+	}
+}
+
+// The rfft's own bin count for these parameters: N/2+1 of the transform actually run (the zero-padded
+// length, or the window with Zero-Padding off). Output Bins Mode = Auto and Raw RFFT Bins output
+// exactly this many samples. Needs the input rate because a window in ms is converted with it.
+inline int rfftBinCount(const Parameters::Values& p, double sampleRate)
+{
+	const double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
+	return static_cast<int>(fftSizeFrom(p, windowSamplesFrom(p, sr)) / 2 + 1);
+}
+
+// Applies a Quality Preset on top of the individual parameters (called by Parameters::eval; pure, so
+// tests and the bench apply presets the same way). Custom changes nothing. A preset never changes the
+// output sample count: Output Bins / Output Bins Mode are always the user's.
+//   Visual 60  : N 8192, cubic warp, Auto beta, Peak aggregation
+//   Visual 120 : N 4096, cubic warp, Auto beta, Peak aggregation
+//   Analysis   : N 32768, linear warp, Auto beta, RMS aggregation (energy-faithful)
+inline void applyPreset(Parameters::Values& p)
+{
+	using namespace Parameters;
+	auto pad = [&](int len) {
+		for (int i = 0; i < kPadCount; ++i) if (kPadValues[i] == len) { p.padIndex = i; p.padSize = len; return; }
+	};
+	switch (p.preset) {
+	case Preset::Visual60:
+		pad(8192); p.warpInterp = WarpInterp::Cubic; p.betaMode = BetaMode::Auto;
+		p.warpAggregate = WarpAggregate::Peak; break;
+	case Preset::Visual120:
+		pad(4096); p.warpInterp = WarpInterp::Cubic; p.betaMode = BetaMode::Auto;
+		p.warpAggregate = WarpAggregate::Peak; break;
+	case Preset::Analysis:
+		pad(32768); p.warpInterp = WarpInterp::Linear; p.betaMode = BetaMode::Auto;
+		p.warpAggregate = WarpAggregate::Rms; break;
+	case Preset::Custom:
+	default: break;
+	}
+}
+
+// Input Ingest = Auto: how many of an input block's samples are new since the previous ingest.
+// Used by FFT::ingest (cook thread); pure so the rules are unit-tested (tests/dsp_tests.cpp).
+//   * the input did not cook since the last ingest (same totalCooks): nothing is new;
+//   * its sample range advanced by d (startIndex + numSamples): the newest min(d, n) are new;
+//   * a range that went backwards, jumped by more than a block, or did not move although the input
+//     re-cooked (a reset, a looping file, a generator that keeps startIndex): the whole block is new
+//     (the pre-2.10 behaviour, which is right for a timesliced audio input).
+struct IngestCursor {
+	double lastEnd{ 0.0 };
+	int64_t lastCooks{ -1 };
+	bool have{ false };
+
+	void reset() noexcept { have = false; }
+	size_t fresh(double startIndex, size_t n, int64_t totalCooks) noexcept {
+		const double end = startIndex + static_cast<double>(n);
+		size_t out = n;
+		if (have) {
+			if (totalCooks == lastCooks) out = 0;
+			else {
+				const double d = end - lastEnd;
+				if (d > 0.5 && d < static_cast<double>(n)) out = static_cast<size_t>(d + 0.5);
+			}
+		}
+		lastEnd = end;
+		lastCooks = totalCooks;
+		have = true;
+		return out;
+	}
+};
+
+// The output width. Fixed: Output Bins. Auto and Raw RFFT Bins: the rfft's N/2+1 (rfftBinCount).
+// getOutputInfo and the pipeline must pass the same (clamped) input rate so the declared width and the
+// built grid agree; when they briefly disagree (a rate change in flight) copyResultsToOutput copies
+// min() and zero-fills.
+inline int outputBinCountFrom(const Parameters::Values& p, double sampleRate)
+{
+	return (p.rawBins || p.binsMode == Parameters::BinsMode::Auto) ? rfftBinCount(p, sampleRate) : p.bins;
 }
 
 // Axis rate (2 * top of axis). `axisRateExact` is the rate read off the tables the last pipeline
@@ -191,8 +292,9 @@ inline double axisRate(const Parameters::Values& p, double sampleRate, double ax
 	if (nyquist <= 0.0) return sampleRate;
 	if (axisRateExact > 0.0) return axisRateExact;
 	// Not built yet. 2*fmax with fmax = min(Display Max, nyquist) — identical to what updateWarp
-	// publishes, so the reported axis never jumps once the first result lands.
-	const double fmax = std::min(p.displayMax > 0.0 ? p.displayMax : nyquist, nyquist);
+	// publishes, so the reported axis never jumps once the first result lands. Raw RFFT Bins always
+	// spans DC..Nyquist.
+	const double fmax = p.rawBins ? nyquist : std::min(p.displayMax > 0.0 ? p.displayMax : nyquist, nyquist);
 	return 2.0 * fmax;
 }
 
@@ -219,9 +321,9 @@ inline double axisRate(const Parameters::Values& p, double sampleRate, double ax
 // CALLED BY: FFT::outputSampleRate() - which is what info->sampleRate is set from in
 //       FFT::getOutputInfo(), and what the Info CHOP/DAT and popup rows report - and
 //       test_rate_model() in tests/dsp_tests.cpp. Not used by bench/.
-inline double sampleRateToTouchDesigner(const Parameters::Values& p, double cookRate)
+inline double sampleRateToTouchDesigner(const Parameters::Values& p, double sampleRate, double cookRate)
 {
-	const int n_out = outputBinCountFrom(p);
+	const int n_out = outputBinCountFrom(p, sampleRate);
 	return static_cast<double>(n_out) * (cookRate > 0.0 ? cookRate : 60.0);
 }
 
@@ -247,7 +349,7 @@ inline double sampleRateToTouchDesigner(const Parameters::Values& p, double cook
 //       The Info CHOP/DAT and popup read it through FFT::hzPerSample().
 inline double hzPerBin(const Parameters::Values& p, double sampleRate, double axisRateExact)
 {
-	const int n_out = outputBinCountFrom(p);
+	const int n_out = outputBinCountFrom(p, sampleRate);
 	if (n_out < 2) return 0.0;
 	return axisRate(p, sampleRate, axisRateExact) / (2.0 * static_cast<double>(n_out - 1));
 }
@@ -271,9 +373,9 @@ inline double hzPerBin(const Parameters::Values& p, double sampleRate, double ax
 //       fallback; do not make them consistent without deciding which is wanted (see that function).
 // CALLED BY: FFT::outputBandwidth(), which the Info CHOP, the Info DAT and the popup read, and
 //       test_rate_model() in tests/dsp_tests.cpp. Not used by bench/.
-inline double throughput(const Parameters::Values& p, double cookDtMs)
+inline double throughput(const Parameters::Values& p, double sampleRate, double cookDtMs)
 {
-	const int n_out = outputBinCountFrom(p);
+	const int n_out = outputBinCountFrom(p, sampleRate);
 	if (!(cookDtMs > 0.0)) return 0.0;
 	return static_cast<double>(n_out) * 1000.0 / cookDtMs;
 }

@@ -640,9 +640,12 @@ private:
     static constexpr uint32_t kIndexMask = 3u;   // bits 0-1: slot index
     static constexpr uint32_t kDirty     = 4u;   // bit 2: unacquired publication pending
     T m_slots[kSlots];
-    std::atomic<uint32_t> m_mid{ 1u };   // slot 1 is "clean" at start
-    uint32_t m_back{ 2u };
-    uint32_t m_front{ 0u };
+    // One cache line each: m_back is written only by the producer, m_front only by the consumer and
+    // m_mid by both. Packed together they shared one line, so every publish invalidated the consumer's
+    // copy of m_front and vice versa (false sharing between the cook thread and the worker).
+    alignas(64) std::atomic<uint32_t> m_mid{ 1u };   // slot 1 is "clean" at start
+    alignas(64) uint32_t m_back{ 2u };
+    alignas(64) uint32_t m_front{ 0u };
 };
 
 /*
@@ -673,9 +676,10 @@ WHY TWO WAITS: the worker is woken by the cook thread, and waking a thread costs
       the transition out of dormancy, where a 2 ms delay would actually be visible (see FFT.cpp's
       worker loop and myWorkerDormant).
 
-SEMANTICS: signal() is lost if nobody is waiting, so this is a wake-up, not a counter. There is no
-      "how many times was I signalled" - the job queue is the source of truth for how much work
-      there is, and this only says "look again".
+SEMANTICS: a signal() issued while nobody waits is LATCHED (auto-reset event / flag) and consumed by
+      the next wait - that is what makes the dormancy handshake safe - but several signals collapse
+      into one: this is a wake-up, not a counter. The job slot is the source of truth for how much
+      work there is, and this only says "look again".
 
 HOW TO CHANGE: The two implementations (Win32 event + waitable timer, or mutex + condvar
       elsewhere) must keep the same semantics, and waitFor must return false on timeout rather
@@ -1336,12 +1340,55 @@ public:
         }
     }
 
+    // One point of the grid computeTargetHzGrid() builds, at a fractional position frac in [0, 1]
+    // along the axis (frac = i / (n_out - 1)). Same formulas, same evaluation order, so
+    // targetHzAt(.., i/(n-1), ..) equals computeTargetHzGrid(..)[i] (pinned by a test). Used where a
+    // property of the grid is needed without building it - Output Bins Mode = Auto, per cook.
+    static double targetHzAt(int scale_code, double fmax, double frac, double warp_blend, double log_floor_hz) {
+        double per;
+        switch (scale_code) {
+            case 0: { double lmin = std::log(std::max(1.0, log_floor_hz)), lmax = std::log(fmax);
+                      per = std::exp(lmin + frac * (lmax - lmin)); break; }
+            case 1: { double m0 = htkHzToMel(0.0), m1 = htkHzToMel(fmax); per = htkMelToHz(m0 + frac * (m1 - m0)); break; }
+            case 2: { double e0 = erbRateGlasberg(0.0), e1 = erbRateGlasberg(fmax); per = erbRateToHz(e0 + frac * (e1 - e0)); break; }
+            case 3: { double b0 = hzToBark(0.0), b1 = hzToBark(fmax); per = barkToHz(b0 + frac * (b1 - b0)); break; }
+            case 4: { double c0 = hzToChroma(20.0), c1 = hzToChroma(fmax); per = chromaToHz(c0 + frac * (c1 - c0)); break; }
+            case 6: { double m0 = htkHzToMel(0.0), m1 = htkHzToMel(fmax);
+                      double lmin = std::log(std::max(1.0, log_floor_hz)), lmax = std::log(fmax);
+                      per = 0.5 * (htkMelToHz(m0 + frac * (m1 - m0)) + std::exp(lmin + frac * (lmax - lmin))); break; }
+            case 5:
+            default: per = frac * fmax; break;
+        }
+        const double lin = frac * fmax;
+        return std::max(0.0, std::min(fmax, (1.0 - warp_blend) * lin + warp_blend * per));
+    }
+
+    // d(target Hz)/d(frac) at the top of the axis: how many Hz one unit of axis position spans where the
+    // grid is coarsest. Every scale here is convex in frac (spacing grows with frequency), so the widest
+    // gap between two output bins is at the top, and it is ~ topSlopeHzPerFrac / (n_out - 1).
+    static double topSlopeHzPerFrac(int scale_code, double fmax, double warp_blend, double log_floor_hz) {
+        const double e = 1e-4;
+        return (targetHzAt(scale_code, fmax, 1.0, warp_blend, log_floor_hz) -
+                targetHzAt(scale_code, fmax, 1.0 - e, warp_blend, log_floor_hz)) / e;
+    }
+
     // 0 = linear (2 taps), 1 = Catmull-Rom cubic (4 taps, smoother lobes -> allows a smaller FFT)
     // Cubic costs two more gathers per output bin; it is worth it when the output grid is much
     // finer than the FFT's linear grid, where a linear read shows the magnitude curve's corners.
     // Any value other than 1 selects linear, so an out-of-range parameter cannot corrupt a kernel.
     void setInterpolation(int mode) noexcept { m_interp = (mode == 1) ? 1 : 0; }
     int interpolation() const noexcept { return m_interp; }
+
+    // What a coarse output bin reports (one that covers two or more FFT bins): 0 = the interpolated value
+    // (legacy), 1 = the peak of its FFT-bin range, 2 = the RMS (power mean) of the range. Takes effect at
+    // the next buildWarpTables(). Where the output grid is finer than the FFT grid nothing changes.
+    // WHY: interpolation reads two FFT bins per output bin, so with fewer output bins than FFT bins the
+    // bins in between are never read - a narrow partial that falls between two taps loses level and
+    // flickers as it moves. Peak aggregation is what makes a small Output Bins count safe for display.
+    void setAggregation(int mode) noexcept { m_agg = (mode == 1 || mode == 2) ? mode : 0; }
+    int aggregation() const noexcept { return m_agg; }
+    // How many output bins are aggregated (cover >= 2 FFT bins) with the current tables. Telemetry.
+    size_t aggregatedBins() const noexcept { return m_agg_idx.size(); }
 
     // Highest linear bin index the warp reads (+ cubic look-ahead). Magnitudes above it need not be computed.
     size_t maxLinearIndex() const noexcept { return m_max_index; }
@@ -1390,6 +1437,28 @@ public:
             if (is_id && std::abs((static_cast<double>(i0_val) + weight) - static_cast<double>(i)) > 1e-5) is_id = false;
         }
         m_is_identity = is_id;
+
+        // Aggregation ranges. Output bin i owns the FFT bins between the midpoints to its neighbours
+        // (in linear-bin units): [ceil((p[i-1]+p[i])/2), floor((p[i]+p[i+1])/2)]. Only bins that own two
+        // or more FFT bins are recorded - everywhere else the interpolated value already reads the
+        // nearest FFT bins, and a table entry would only cost time.
+        m_agg_idx.clear(); m_agg_lo.clear(); m_agg_cnt.clear();
+        if (m_agg != 0 && !is_id && n_out >= 2 && nlin >= 2 && nyquist > 0.0) {
+            auto pos = [&](size_t i) { return (m_target_hz[i] / nyquist) * denom; };
+            const double last = static_cast<double>(nlin - 1);
+            for (size_t i = 0; i < n_out; ++i) {
+                const double lo_pos = (i == 0) ? pos(0) : 0.5 * (pos(i - 1) + pos(i));
+                const double hi_pos = (i + 1 == n_out) ? pos(i) : 0.5 * (pos(i) + pos(i + 1));
+                const double lo_d = std::max(0.0, std::ceil(lo_pos - 1e-9));
+                const double hi_d = std::min(last, std::floor(hi_pos + 1e-9));
+                if (hi_d - lo_d < 1.0) continue;                       // owns 0 or 1 FFT bin: interpolation is right
+                const size_t lo = static_cast<size_t>(lo_d), hi = static_cast<size_t>(hi_d);
+                m_agg_idx.push_back(static_cast<uint32_t>(i));
+                m_agg_lo.push_back(static_cast<uint32_t>(lo));
+                m_agg_cnt.push_back(static_cast<uint32_t>(hi - lo + 1));
+                m_max_index = std::max(m_max_index, hi);
+            }
+        }
     }
 
     // Fills output_spectrum (resized to the table length) with the warped magnitudes.
@@ -1412,6 +1481,7 @@ public:
         if (m_interp == 1) {
             // Cubic handles its own tail and its own fallback; it never falls through to the loop below.
             applyWarpCubic(src, dst, idx, w_ptr, n_out, linear_magnitude.size());
+            applyAggregation(src, linear_magnitude.size(), dst);
             return;
         }
 #if defined(__AVX2__)
@@ -1440,6 +1510,79 @@ public:
             size_t i0 = idx[i];
             float w = w_ptr[i];
             dst[i] = src[i0] + w * (src[i0 + 1] - src[i0]);
+        }
+        applyAggregation(src, linear_magnitude.size(), dst);
+    }
+
+    // Overwrites the coarse output bins with the peak (or RMS) of the FFT bins each one owns. Runs after
+    // the interpolation pass, so the fine part of the axis keeps its interpolated values. Total work is
+    // at most one read of every FFT bin (the ranges do not overlap except at shared midpoints).
+    //
+    // WHY IT IS WRITTEN BRANCH-FREE: a range is 2..~50 FFT bins and its length changes from one output
+    // bin to the next, so a plain `for (j < cnt)` loop mispredicts its exit on almost every bin and runs a
+    // serial max chain - measured 4-9 us for ~1000 coarse bins. Here each range is read in 8-wide chunks
+    // (a short, well-predicted loop: the chunk count changes rarely along the axis) and the lanes past the
+    // range are masked out, then one horizontal reduction per bin: ~1-2 us for the same work.
+    void applyAggregation(const float* __restrict src, size_t src_size, float* __restrict dst) const noexcept {
+        const size_t n = m_agg_idx.size();
+        if (m_agg == 0 || n == 0) return;
+        // Local copies: MSVC does not use type-based aliasing, so with members it reloads every vector's
+        // data pointer after each store to dst.
+        const uint32_t* __restrict aidx = m_agg_idx.data();
+        const uint32_t* __restrict alo = m_agg_lo.data();
+        const uint32_t* __restrict acnt = m_agg_cnt.data();
+        const int mode = m_agg;
+        size_t k = 0;
+#if defined(__AVX2__)
+        // 16 entries: loading 8 of them starting at (8 - rem) gives `rem` all-ones lanes followed by zeros.
+        alignas(32) static const int32_t kMask[16] = { -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0 };
+        const __m256 vneg = _mm256_set1_ps(-3.402823466e+38f);
+        for (; k < n; ++k) {
+            const size_t lo = alo[k];
+            const size_t cnt = acnt[k];
+            const size_t chunks = (cnt + 7) / 8;
+            if (lo + chunks * 8 > src_size) break;                     // the last ranges near the end: scalar tail
+            const float* p = src + lo;
+            if (mode == 1) {
+                __m256 vm = vneg;
+                for (size_t c = 0; c + 1 < chunks; ++c) vm = _mm256_max_ps(vm, _mm256_loadu_ps(p + c * 8));
+                const size_t rem = cnt - (chunks - 1) * 8;             // 1..8 valid lanes in the last chunk
+                const __m256 mask = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(kMask + 8 - rem)));
+                vm = _mm256_max_ps(vm, _mm256_blendv_ps(vneg, _mm256_loadu_ps(p + (chunks - 1) * 8), mask));
+                __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(vm), _mm256_extractf128_ps(vm, 1));
+                m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+                m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+                dst[aidx[k]] = _mm_cvtss_f32(m4);
+            } else {
+                __m256 acc = _mm256_setzero_ps();
+                for (size_t c = 0; c + 1 < chunks; ++c) { const __m256 v = _mm256_loadu_ps(p + c * 8); acc = _mm256_fmadd_ps(v, v, acc); }
+                const size_t rem = cnt - (chunks - 1) * 8;
+                const __m256 mask = _mm256_castsi256_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(kMask + 8 - rem)));
+                const __m256 v = _mm256_and_ps(_mm256_loadu_ps(p + (chunks - 1) * 8), mask);
+                acc = _mm256_fmadd_ps(v, v, acc);
+                __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+                s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+                dst[aidx[k]] = std::sqrt(_mm_cvtss_f32(s4) / static_cast<float>(cnt));
+            }
+        }
+#endif
+        // Scalar path: a non-AVX2 build, and the few ranges whose 8-wide reads would pass the buffer end.
+        for (; k < n; ++k) {
+            const size_t lo = alo[k];
+            size_t cnt = acnt[k];
+            if (lo >= src_size) continue;                              // caller handed fewer bins than the tables expect
+            if (lo + cnt > src_size) cnt = src_size - lo;
+            const float* p = src + lo;
+            if (mode == 1) {
+                float m = p[0];
+                for (size_t j = 1; j < cnt; ++j) m = std::max(m, p[j]);
+                dst[aidx[k]] = m;
+            } else {
+                double acc = 0.0;
+                for (size_t j = 0; j < cnt; ++j) acc += static_cast<double>(p[j]) * p[j];
+                dst[aidx[k]] = static_cast<float>(std::sqrt(acc / static_cast<double>(cnt)));
+            }
         }
     }
 
@@ -1540,6 +1683,8 @@ private:
                                        // applyWarp compares the incoming magnitude size to it
     size_t m_max_index{ 0 };           // see maxLinearIndex()
     int m_interp{ 0 };                 // 0 linear, 1 cubic
+    int m_agg{ 0 };                    // 0 off, 1 peak, 2 rms (setAggregation)
+    std::vector<uint32_t> m_agg_idx, m_agg_lo, m_agg_cnt;   // coarse output bins and the FFT-bin range each owns
     bool m_is_identity{ false };       // see buildWarpTables()
 };
 
@@ -1901,6 +2046,76 @@ public:
 
 /*
 ===========================================================================
+ 6d. SPECTRAL FEATURES (v2.10, optional: "Spectral Features" toggle)
+===========================================================================
+WHAT: a handful of scalar descriptors of one frame, computed on the analysis worker from the LINEAR
+      magnitude spectrum (before the warp, so they do not depend on the display axis) and published on
+      the Info CHOP. These are what audio-reactive visuals are usually driven by; computing them here
+      costs one pass over the magnitude bins instead of a downstream CHOP network over the full output.
+
+  centroidHz   power-weighted mean frequency ("brightness")
+  rolloffHz    frequency below which 85 % of the power lies
+  flatness     geometric / arithmetic mean of the power, 0 (tonal) .. 1 (noise)
+  flux         half-wave rectified frame-to-frame magnitude increase, normalised by the frame's total
+               magnitude: an onset-strength signal (~0 steady, spikes on attacks)
+  rmsDb        RMS of the analysis window's time samples, dBFS (independent of the window/normalisation)
+  bass/mid/highDb  10*log10 of the power in < 250 Hz, 250 Hz - 4 kHz, > 4 kHz, on the spectrum's own
+               magnitude scale (compare them with each other and over time, not as absolute levels)
+
+COST: O(n) with n = the magnitude bins computed (up to Display Max); ~2-4 us at 8193 bins (i9-13900H).
+*/
+struct SpectralFeatures {
+    float centroidHz{ 0.0f }, rolloffHz{ 0.0f }, flatness{ 0.0f }, flux{ 0.0f };
+    float rmsDb{ -120.0f }, bassDb{ -120.0f }, midDb{ -120.0f }, highDb{ -120.0f };
+};
+
+// mag/n: linear magnitude (bin k is at k*binHz). time/nTime: the analysis window's raw samples (for
+// rmsDb). prev: the previous frame's magnitude (flux state, resized/overwritten here - per channel).
+inline void computeSpectralFeatures(const float* mag, size_t n, double binHz, const float* time, size_t nTime,
+                                    AlignedVector& prev, SpectralFeatures& f) noexcept
+{
+    f = SpectralFeatures{};
+    if (n == 0 || binHz <= 0.0) return;
+    const float* lut = FastLog10::dbTable();
+    const size_t b250 = std::min(n, static_cast<size_t>(250.0 / binHz) + 1);
+    const size_t b4k = std::min(n, static_cast<size_t>(4000.0 / binHz) + 1);
+    double total = 0.0, weighted = 0.0, sumMag = 0.0, logSum = 0.0, bass = 0.0, mid = 0.0, high = 0.0, rise = 0.0;
+    const bool havePrev = prev.size() >= n;
+    for (size_t k = 0; k < n; ++k) {
+        const float m = mag[k];
+        const double pw = static_cast<double>(m) * m;
+        total += pw;
+        weighted += pw * static_cast<double>(k);
+        sumMag += m;
+        logSum += FastLog10::scaled(std::max(m, 1e-12f), lut);        // 20*log10(m) = 10*log10(power)
+        if (k < b250) bass += pw; else if (k < b4k) mid += pw; else high += pw;
+        if (havePrev) { const float d = m - prev[k]; if (d > 0.0f) rise += d; }
+    }
+    if (total > 0.0) {
+        f.centroidHz = static_cast<float>(weighted / total * binHz);
+        const double target = 0.85 * total;
+        double acc = 0.0;
+        size_t k = 0;
+        for (; k < n; ++k) { acc += static_cast<double>(mag[k]) * mag[k]; if (acc >= target) break; }
+        f.rolloffHz = static_cast<float>(std::min(k, n - 1) * binHz);
+        const double geo = std::pow(10.0, (logSum / static_cast<double>(n)) / 10.0);   // geometric mean of power
+        f.flatness = static_cast<float>(std::clamp(geo / (total / static_cast<double>(n)), 0.0, 1.0));
+    }
+    auto db = [](double p) { return static_cast<float>(p > 1e-24 ? 10.0 * std::log10(p) : -240.0); };
+    f.bassDb = db(bass); f.midDb = db(mid); f.highDb = db(high);
+    f.flux = (havePrev && sumMag > 0.0) ? static_cast<float>(rise / sumMag) : 0.0f;
+    if (time && nTime) {
+        double s2 = 0.0;
+        for (size_t i = 0; i < nTime; ++i) s2 += static_cast<double>(time[i]) * time[i];
+        const double rms = std::sqrt(s2 / static_cast<double>(nTime));
+        f.rmsDb = static_cast<float>(rms > 1e-6 ? 20.0 * std::log10(rms) : -120.0);
+    }
+    if (prev.size() != n) prev.resize(n);                                   // grows once, then reused
+    std::memcpy(prev.data(), mag, n * sizeof(float));
+}
+
+/*
+===========================================================================
  7. ASYMMETRIC ATTACK / RELEASE BALLISTICS FILTER
 ===========================================================================
 attack/release are per-frame smoothing coefficients in [0, 0.99]
@@ -2199,8 +2414,15 @@ class FFTWEngine : public IFFTEngine {
 public:
     FFTWEngine() = default;
     ~FFTWEngine() override {
-        joinBackground();
-        destroyPlan();
+        // Teardown is the one place that may block on a measurement: the engine (and the plugin DLL
+        // with it) must not go away while a planner thread is still running inside the library.
+        abandonBackground();
+        reapGraveyard(true);
+        if (m_plan) {
+            std::lock_guard<std::mutex> lock(plannerMutex());
+            if (m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
+            m_plan = nullptr;
+        }
     }
     FFTWEngine(const FFTWEngine&) = delete;
     FFTWEngine& operator=(const FFTWEngine&) = delete;
@@ -2225,20 +2447,26 @@ public:
     // empty string means "no wisdom" - every caller below treats empty as "do not touch a file"
     // rather than trying to open a nameless path.
     // The directory is created here, on first call, so no separate setup step is needed.
+    // The default location is resolved (and its directory created) once per process: it used to be
+    // recomputed on every call, i.e. an environment lookup plus a CreateDirectoryA filesystem call each
+    // time the Info DAT's fft_backend row was rendered - on the cook thread, every cook.
     static std::string wisdomPath() {
         if (!wisdomPathOverride().empty()) return wisdomPathOverride();
+        static const std::string resolved = [] {
 #ifdef _WIN32
-        char base[MAX_PATH] = { 0 };
-        DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) n = GetEnvironmentVariableA("TEMP", base, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) return std::string();
-        std::string dir = std::string(base) + "\\TD_Custom_FFT";
-        CreateDirectoryA(dir.c_str(), nullptr);
-        return dir + "\\fftwf_wisdom.txt";
+            char base[MAX_PATH] = { 0 };
+            DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) n = GetEnvironmentVariableA("TEMP", base, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) return std::string();
+            std::string dir = std::string(base) + "\\TD_Custom_FFT";
+            CreateDirectoryA(dir.c_str(), nullptr);
+            return dir + "\\fftwf_wisdom.txt";
 #else
-        const char* home = std::getenv("HOME");
-        return home ? std::string(home) + "/.td_custom_fft_wisdom" : std::string();
+            const char* home = std::getenv("HOME");
+            return home ? std::string(home) + "/.td_custom_fft_wisdom" : std::string();
 #endif
+        }();
+        return resolved;
     }
 
     // Wisdom is per library, so the file has to be too. A wisdom file carries a header naming the
@@ -2320,7 +2548,11 @@ public:
     // "Uninitialized" with the current tag rather than cleared to empty: getPlanStatus() must always
     // return something readable, including between a backend switch and the next prepare().
     void destroyPlan() noexcept {
-        joinBackground();
+        // Never wait for a background measurement here: this runs on the pipeline owner thread (the
+        // cook thread when Async is off), and a FFTW_MEASURE / PATIENT run can take seconds. The
+        // measurement is handed to the graveyard, finishes on its own and is reaped later.
+        abandonBackground();
+        reapGraveyard(false);
         if (m_plan) {
             std::lock_guard<std::mutex> lock(plannerMutex());
             if (m_backend.api.destroyPlan)
@@ -2345,7 +2577,9 @@ public:
     // True while the background measurement is running. Read by the Info DAT to show an upgrade in
     // progress; it is an atomic load precisely because the reader is the cook thread and the writer
     // is the planner thread.
-    bool upgradeInProgress() const noexcept { return m_bg_running.load(); }
+    bool upgradeInProgress() const noexcept { return m_bg && !m_bg->done.load(std::memory_order_acquire); }
+    // Measurements abandoned by a size/backend change that are still running (telemetry).
+    size_t abandonedMeasurements() const noexcept { return m_graveyard.size(); }
 
     /*
       Planner policies
@@ -2585,21 +2819,40 @@ private:
         bool ok() const { return in && out; }
     };
 
+    // One background measurement. Owned by the engine while it is the live upgrade (m_bg), then by the
+    // graveyard if a size or backend change abandons it before it finishes. The thread touches only this
+    // struct and the library table copied into it - never the engine - so an abandoned measurement can
+    // outlive the plan it was meant to upgrade without racing anything.
+    struct BgTask {
+        std::thread thread;
+        std::atomic<fftwf_plan> plan{ nullptr };
+        std::atomic<bool> done{ false };
+        FftApi api;
+        size_t size{ 0 };
+        unsigned rigor{ FFTW_MEASURE };
+        double ms{ 0.0 };
+    };
+
+    // Upper bound on a FFTW_PATIENT measurement. FFTW's planner is process-wide and serialised by
+    // plannerMutex(), so every other node that needs a plan waits for as long as a measurement holds the
+    // lock; unbounded PATIENT was ~2.7 s at N = 32768. fftwf_set_timelimit keeps the best plan found in
+    // the budget (FFTW returns the best plan measured so far when the limit expires).
+    static constexpr double kPatientTimeLimitS = 1.5;
+
     // rigor: FFTW_MEASURE or FFTW_PATIENT. Runs at ABOVE_NORMAL: it must never be starved below the
-    // normal-priority threads it is racing, so that a plan upgrade finishes in the ~0.3 s / ~3 s it
-    // is budgeted instead of stretching out under load. It is still one notch under the analysis
-    // worker (HIGHEST), so a real cook always wins the core back from it.
+    // normal-priority threads it is racing, so that a plan upgrade finishes in its budget instead of
+    // stretching out under load. It is still one notch under the analysis worker (HIGHEST).
     void startBackgroundMeasure(size_t fft_size, unsigned rigor) {
-        joinBackground();
-        m_bg_size = fft_size;
-        m_bg_rigor = rigor;
-        m_bg_running = true;
-        // Copied by value, not read from m_backend inside the thread: prepare() re-points m_backend
-        // on the cooking thread, and a background thread reading it would be a data race. The plan
-        // it produces belongs to this library, so m_bg_api is also what destroys it.
-        const FftApi api = m_backend.api;
-        m_bg_api = api;
-        m_bg_thread = std::thread([this, fft_size, rigor, api]() {
+        abandonBackground();
+        reapGraveyard(false);
+        auto task = std::make_unique<BgTask>();
+        task->api = m_backend.api;           // copied: the owner may re-point m_backend meanwhile
+        task->size = fft_size;
+        task->rigor = rigor;
+        const std::string wisdom = task->api.hasWisdom()
+            ? wisdomPathFor(m_backend.info ? *m_backend.info : defaultBackend()) : std::string();
+        BgTask* t = task.get();
+        task->thread = std::thread([t, wisdom]() {
 #ifdef _WIN32
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
@@ -2612,37 +2865,55 @@ private:
             fftwf_plan p = nullptr;
             {
                 std::lock_guard<std::mutex> lock(plannerMutex());   // planner is single-threaded; execute() is thread-safe
-                Buffers b(api, fft_size);
-                if (b.ok()) p = api.planR2C(static_cast<int>(fft_size), b.in, b.out, rigor);
-                if (p) exportWisdom(api);
+                const bool limit = (t->rigor == FFTW_PATIENT) && t->api.setTimelimit;
+                if (limit) t->api.setTimelimit(kPatientTimeLimitS);
+                Buffers b(t->api, t->size);
+                if (b.ok()) p = t->api.planR2C(static_cast<int>(t->size), b.in, b.out, t->rigor);
+                if (limit) t->api.setTimelimit(-1.0);                  // FFTW_NO_TIMELIMIT: the setting is process-global
+                if (p && !wisdom.empty()) t->api.exportWisdom(wisdom.c_str());
             }
-            m_bg_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
-            m_bg_plan.store(p);
-            m_bg_running = false;
+            t->ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
+            t->plan.store(p, std::memory_order_release);
+            t->done.store(true, std::memory_order_release);
         });
+        m_bg = std::move(task);
+        m_bg_size = fft_size;
+        m_bg_rigor = rigor;
     }
 
 public:
     // Call once per cook from the cooking thread (before any channel executes). Swaps in a
     // background-measured plan when one is ready. Returns true when the plan changed.
     bool pollBackgroundPlan() override {
-        fftwf_plan ready = m_bg_plan.exchange(nullptr);
-        if (!ready) return false;
-        if (m_bg_size != m_fft_size) {                 // size changed meanwhile: discard
-            std::lock_guard<std::mutex> lock(plannerMutex());
-            if (m_bg_api.destroyPlan) m_bg_api.destroyPlan(ready);
-            joinBackground();
+        reapGraveyard(false);
+        if (!m_bg || !m_bg->done.load(std::memory_order_acquire)) return false;
+        fftwf_plan ready = m_bg->plan.exchange(nullptr);
+        if (!ready) {                                  // the measurement produced no plan: nothing to swap
+            if (m_bg->thread.joinable()) m_bg->thread.join();   // done -> returns immediately
+            m_bg.reset();
             return false;
         }
-        {
-            std::lock_guard<std::mutex> lock(plannerMutex());
-            if (m_plan && m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
-            m_plan = ready;
+        // try_lock, not lock: another node's measurement may hold the process-wide planner lock for up
+        // to kPatientTimeLimitS. The ready plan waits for the next job instead of stalling this thread.
+        std::unique_lock<std::mutex> lock(plannerMutex(), std::try_to_lock);
+        if (!lock.owns_lock()) { m_bg->plan.store(ready); return false; }
+        if (m_bg->size != m_fft_size || m_bg->api.destroyPlan != m_backend.api.destroyPlan) {   // size/library changed: discard
+            if (m_bg->api.destroyPlan) m_bg->api.destroyPlan(ready);
+            lock.unlock();
+            if (m_bg->thread.joinable()) m_bg->thread.join();
+            m_bg.reset();
+            return false;
         }
-        joinBackground();
+        if (m_plan && m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
+        m_plan = ready;
+        lock.unlock();
+        if (m_bg->thread.joinable()) m_bg->thread.join();
+        const double ms = m_bg->ms;
+        m_bg.reset();
+        m_wants_upgrade = false;
         const char* rigor = (m_bg_rigor == FFTW_PATIENT) ? "FFTW_PATIENT" : "FFTW_MEASURE";
-        m_planStatus = std::string(tag()) + " (" + rigor + " upgraded in background - " + std::to_string(m_bg_ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
-        if (m_log) m_log->log(std::string("[FFT Plugin] [") + tag() + "] background " + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(m_bg_ms) + " ms), swapped in");
+        m_planStatus = std::string(tag()) + " (" + rigor + " upgraded in background - " + std::to_string(ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
+        if (m_log) m_log->log(std::string("[FFT Plugin] [") + tag() + "] background " + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(ms) + " ms), swapped in");
         return true;
     }
 
@@ -2659,33 +2930,36 @@ public:
     void setBackgroundAllowed(bool allowed) override {
         if (allowed == m_bg_allowed) return;
         m_bg_allowed = allowed;
-        if (allowed && m_wants_upgrade && m_plan && !m_bg_running && m_fft_size != 0)
+        if (allowed && m_wants_upgrade && m_plan && !upgradeInProgress() && m_fft_size != 0)
             startBackgroundMeasure(m_fft_size, m_bg_rigor);
     }
 
 private:
-    // Blocks until the background measurement thread has finished, then disposes of any plan it
-    // produced but nobody collected (a size change, a backend switch, or engine teardown). Called
-    // from destroyPlan, from pollBackgroundPlan when a swap or a discard happens, and from
-    // startBackgroundMeasure before starting a new one, so there is never more than one alive.
-    //
-    // The join is wrapped in try/catch because a join can throw (a self-join, or a thread that was
-    // somehow already joined); a throw here during teardown would be worse than ignoring it, and
-    // there is nothing sensible to report - this runs in destructors. m_bg_api is the *copy* of the
-    // backend table taken when the thread started, so the leftover plan is destroyed by the library
-    // that made it even if the node has since switched backends.
-    void joinBackground() noexcept {
-        if (m_bg_thread.joinable()) {
-            try { m_bg_thread.join(); } catch (...) {}
+    // Hands the live measurement (if any) to the graveyard without waiting for it. A measurement that
+    // already finished is disposed of right here when the planner lock is free.
+    void abandonBackground() noexcept {
+        if (!m_bg) return;
+        m_graveyard.push_back(std::move(m_bg));
+        m_bg.reset();
+    }
+
+    // Joins and disposes of abandoned measurements. block = false (the owner thread, every job): only
+    // tasks that are already done, and only if the planner lock is free right now - cost when there is
+    // nothing to do is one empty() check. block = true (teardown): waits for every one of them.
+    void reapGraveyard(bool block) noexcept {
+        if (m_graveyard.empty()) return;
+        for (size_t i = 0; i < m_graveyard.size();) {
+            BgTask& t = *m_graveyard[i];
+            if (!block && !t.done.load(std::memory_order_acquire)) { ++i; continue; }
+            try { if (t.thread.joinable()) t.thread.join(); } catch (...) {}
+            if (fftwf_plan leftover = t.plan.exchange(nullptr)) {
+                std::unique_lock<std::mutex> lock(plannerMutex(), std::defer_lock);
+                if (block) lock.lock();
+                else if (!lock.try_lock()) { t.plan.store(leftover); ++i; continue; }   // retry next time
+                if (t.api.destroyPlan) t.api.destroyPlan(leftover);
+            }
+            m_graveyard.erase(m_graveyard.begin() + static_cast<std::ptrdiff_t>(i));
         }
-        fftwf_plan leftover = m_bg_plan.exchange(nullptr);
-        if (leftover) {
-            std::lock_guard<std::mutex> lock(plannerMutex());
-            // Destroyed with the library that planned it; m_bg_api is a copy taken when the thread
-            // started, so it survives a backend switch on the cooking thread.
-            if (m_bg_api.destroyPlan) m_bg_api.destroyPlan(leftover);
-        }
-        m_bg_running = false;
     }
 
     // ---- the live plan ----------------------------------------------------
@@ -2698,17 +2972,13 @@ private:
     PlanLog* m_log{ nullptr };             // not owned; the node's log, used for plan messages
 
     // ---- the background measurement ---------------------------------------
-    // The plan is handed back through an atomic pointer rather than a mutex-protected member,
-    // because the cook thread polls it once per cook and must never wait on the planner thread.
-    // The thread itself is joined only at the points listed on joinBackground().
-    std::thread m_bg_thread;
-    std::atomic<fftwf_plan> m_bg_plan{ nullptr };
-    std::atomic<bool> m_bg_running{ false };
-    FftApi m_bg_api;                       // the library m_bg_plan was created by
+    // The live measurement (m_bg) and the ones a size/backend change abandoned (m_graveyard). The plan
+    // comes back through BgTask's atomic pointer, so polling it never waits on the planner thread.
+    std::unique_ptr<BgTask> m_bg;
+    std::vector<std::unique_ptr<BgTask>> m_graveyard;
     size_t m_bg_size{ 0 };                 // N the background thread was asked to plan for
     unsigned m_bg_rigor{ FFTW_MEASURE };   // FFTW_MEASURE or FFTW_PATIENT - which upgrade is wanted,
                                            // carried from prepare() through to the status string
-    double m_bg_ms{ 0.0 };                 // how long the background measurement took, for the log
     // The node's Async state, as last delivered by setBackgroundAllowed(). Starts true: the engine may
     // be driven by a caller (the headless tests and the bench) that never says otherwise, and those
     // want the background upgrade. See setBackgroundAllowed() for the full contract.

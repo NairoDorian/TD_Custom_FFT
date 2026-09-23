@@ -83,6 +83,7 @@ more accurate.
 #include "Parameters.h"
 
 #include "FftBackend.h"   // FFTDSP::backendCount()/backendById() - the menu-value contract below
+#include "RateModel.h"    // applyPreset (pure, shared with the tests and the bench)
 
 #include <algorithm>
 #include <cmath>
@@ -262,6 +263,21 @@ const char* kChanmodeNames[]   = { "Monomix", "Firstchannel", "Allchannels" };
 const char* kChanmodeLabels[]  = { "Mono Mix (average all inputs -> 1 channel)", "First Channel Only", "All Channels (one FFT per channel)" };
 const char* kWarpinterpNames[] = { "Linear", "Cubic" };
 const char* kWarpinterpLabels[]= { "Linear (2 taps)", "Cubic Catmull-Rom (4 taps, smoother with smaller FFT)" };
+const char* kPresetNames[]     = { "Custom", "Visual60", "Visual120", "Analysis" };
+const char* kPresetLabels[]    = { "Custom (use the parameters below)", "Visual 60 fps (N 8192, cubic, auto beta)",
+                                   "Visual 120 fps (N 4096, cubic, auto beta)", "Analysis (N 32768, auto beta, RMS aggregation)" };
+const char* kBinsmodeNames[]   = { "Fixed", "Auto" };
+const char* kBinsmodeLabels[]  = { "Fixed (Output Bins = output samples)", "Auto (rfft bin count N/2+1 of the zero-padded FFT)" };
+const char* kWarpaggNames[]    = { "Off", "Peak", "Rms" };
+const char* kWarpaggLabels[]   = { "Off (interpolate, may skip peaks)", "Peak (never drops a peak)", "RMS (power mean)" };
+const char* kIngestNames[]     = { "Auto", "Appendall" };
+const char* kIngestLabels[]    = { "Auto (only new samples, from start index)", "Append All (every block, legacy)" };
+const char* kKaisermodeNames[] = { "Manual", "Auto" };
+const char* kKaisermodeLabels[]= { "Manual (Kaiser Beta)", "Auto (from dB Range Floor)" };
+const char* kWorkerwakeNames[] = { "Poll", "Signal" };
+const char* kWorkerwakeLabels[]= { "Poll (2 ms timer, no cook-thread kernel call)", "Signal (wake every cook, lowest latency)" };
+const char* kWorkerprioNames[] = { "Highest", "Mmcss" };
+const char* kWorkerprioLabels[]= { "Highest (thread priority)", "MMCSS Pro Audio (OS multimedia scheduler)" };
 const char* kPadNames[]        = { "1024", "2048", "4096", "8192", "16384", "32768", "65536" };
 const char* kPadLabels[]       = { "1K Bins", "2K Bins", "4K Bins", "8K Bins", "16K Bins", "32K Bins", "64K Bins" };
 
@@ -277,6 +293,13 @@ static_assert(sizeof(kBallmodeNames) / sizeof(kBallmodeNames[0]) == static_cast<
 static_assert(sizeof(kPadNames) / sizeof(kPadNames[0]) == static_cast<size_t>(kPadCount), "Pad menu/table mismatch");
 static_assert(sizeof(kChanmodeNames) / sizeof(kChanmodeNames[0]) == static_cast<size_t>(ChanMode::COUNT), "ChanMode menu/enum mismatch");
 static_assert(sizeof(kWarpinterpNames) / sizeof(kWarpinterpNames[0]) == static_cast<size_t>(WarpInterp::COUNT), "WarpInterp menu/enum mismatch");
+static_assert(sizeof(kPresetNames) / sizeof(kPresetNames[0]) == static_cast<size_t>(Preset::COUNT), "Preset menu/enum mismatch");
+static_assert(sizeof(kBinsmodeNames) / sizeof(kBinsmodeNames[0]) == static_cast<size_t>(BinsMode::COUNT), "BinsMode menu/enum mismatch");
+static_assert(sizeof(kWarpaggNames) / sizeof(kWarpaggNames[0]) == static_cast<size_t>(WarpAggregate::COUNT), "WarpAggregate menu/enum mismatch");
+static_assert(sizeof(kIngestNames) / sizeof(kIngestNames[0]) == static_cast<size_t>(IngestMode::COUNT), "IngestMode menu/enum mismatch");
+static_assert(sizeof(kKaisermodeNames) / sizeof(kKaisermodeNames[0]) == static_cast<size_t>(BetaMode::COUNT), "BetaMode menu/enum mismatch");
+static_assert(sizeof(kWorkerwakeNames) / sizeof(kWorkerwakeNames[0]) == static_cast<size_t>(WorkerWake::COUNT), "WorkerWake menu/enum mismatch");
+static_assert(sizeof(kWorkerprioNames) / sizeof(kWorkerprioNames[0]) == static_cast<size_t>(WorkerPriority::COUNT), "WorkerPriority menu/enum mismatch");
 
 } // namespace
 
@@ -324,15 +347,21 @@ void setup(TD::OP_ParameterManager* manager)
 	// window and 72 ms is that same window expressed at 44.1 kHz, and 20 Hz is the conventional
 	// lowest audible frequency - computeTargetHzGrid() in DSPModules.h uses 20 Hz for the same reason
 	// when it floors the Chroma axis.
+	// v2.10: the Quality Preset heads the page - when it is not Custom it overrides Zero-Pad Len, Warp
+	// Interpolation, Output Bins Mode, Kaiser Beta Mode and Warp Aggregation (greyed out accordingly).
+	appendMenu (manager, "Spectrum", PresetName,     PresetLabel,     kPresetNames,   kPresetLabels,   static_cast<int>(Preset::Custom));
 	appendMenu (manager, "Spectrum", ChanmodeName,   ChanmodeLabel,   kChanmodeNames, kChanmodeLabels, static_cast<int>(ChanMode::MonoMix));
+	appendToggle(manager, "Spectrum", RawbinsName,   RawbinsLabel,    false);
 	appendMenu (manager, "Spectrum", ScaleName,      ScaleLabel,      kScaleNames,   kScaleLabels,   static_cast<int>(Scale::Log));
 	// Display Max and Output Bins reach past the widest input the node accepts (384 kHz -> 192 kHz
 	// Nyquist) and past the largest pad (64K -> 32769 bins) so that the linear/no-resample output is
 	// reachable from the UI at every setting, without a dedicated toggle for it.
 	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 192000.0);
-	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 65536);
+	appendMenu (manager, "Spectrum", BinsmodeName,   BinsmodeLabel,   kBinsmodeNames, kBinsmodeLabels, static_cast<int>(BinsMode::Auto));
+	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 65536);   // the output sample count in Fixed
 	appendFloat(manager, "Spectrum", WarpName,       WarpLabel,       0.963, 0.0, 1.0);
 	appendMenu (manager, "Spectrum", WarpinterpName, WarpinterpLabel, kWarpinterpNames, kWarpinterpLabels, static_cast<int>(WarpInterp::Linear));
+	appendMenu (manager, "Spectrum", WarpaggName,    WarpaggLabel,    kWarpaggNames,  kWarpaggLabels,  static_cast<int>(WarpAggregate::Peak));
 	appendFloat(manager, "Spectrum", LogfloorName,   LogfloorLabel,   20.0, 1.0, 500.0);
 	appendMenu (manager, "Spectrum", WinmodeName,    WinmodeLabel,    kWinmodeNames, kWinmodeLabels, static_cast<int>(WinMode::Samples));
 	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768);
@@ -341,12 +370,14 @@ void setup(TD::OP_ParameterManager* manager)
 	// (Parameters.h), which is where the actual sample counts live. Index 4 is 16384 == kPadDefault,
 	// and the two must stay equal - eval() falls back to kPadDefault for an out-of-range index, so a
 	// mismatch would make "the default pad" mean two different lengths.
+	appendToggle(manager, "Spectrum", ZeropadName,   ZeropadLabel,    true);
 	appendMenu (manager, "Spectrum", PadName,        PadLabel,        kPadNames,     kPadLabels,     4 /* 16384 */);
 	// Planner::Auto is the Values default. The defaultIndex is a static_cast of the enum rather than
 	// a literal index, which is the pattern to keep: it is the one place a table position is written
 	// in terms of the enum, so reordering the enum moves this with it instead of silently opening the
 	// menu on a different entry.
 	appendMenu (manager, "Spectrum", PlannerName,    PlannerLabel,    kPlannerNames, kPlannerLabels, static_cast<int>(Planner::Auto));
+	appendMenu (manager, "Spectrum", IngestName,     IngestLabel,     kIngestNames,  kIngestLabels,  static_cast<int>(IngestMode::Auto));
 	// (v2.8.0) "Raw Linear Bins (no resampling)" was removed: it was a fourth way to say what Scale +
 	// Display Max + Output Bins already say. Its only effect was to skip the frequency warp, and the
 	// warp already detects the identity case and memcpy's the linear magnitude straight through
@@ -380,6 +411,7 @@ void setup(TD::OP_ParameterManager* manager)
 	// approximation, not about the window's shape). Kaiser Beta is only read by eval() when the
 	// window type is Kaiser, so the value is inert for the other five types.
 	appendMenu (manager, "Window & Weighting", WindowName,    WindowLabel,    kWindowNames,    kWindowLabels,    static_cast<int>(WindowType::Kaiser));
+	appendMenu (manager, "Window & Weighting", KaisermodeName, KaisermodeLabel, kKaisermodeNames, kKaisermodeLabels, static_cast<int>(BetaMode::Manual));
 	appendFloat(manager, "Window & Weighting", KaiserName,    KaiserLabel,    15.0, 1.0, 55.0);
 	appendMenu (manager, "Window & Weighting", WeightingName, WeightingLabel, kWeightingNames, kWeightingLabels, static_cast<int>(Weighting::Off));
 	appendMenu (manager, "Window & Weighting", MagnormName,   MagnormLabel,   kMagnormNames,   kMagnormLabels,   static_cast<int>(MagNorm::CoherentGain));
@@ -432,6 +464,11 @@ void setup(TD::OP_ParameterManager* manager)
 	// selected library is not present the plugin logs which file it looked for and falls back to FFTW3,
 	// so this toggle can never make the node stop producing a spectrum.
 	appendToggle(manager, "Performance", FftbackendName,  FftbackendLabel,  false);
+	appendMenu (manager, "Performance", WorkerwakeName,  WorkerwakeLabel,  kWorkerwakeNames, kWorkerwakeLabels, static_cast<int>(WorkerWake::Poll));
+	appendMenu (manager, "Performance", WorkerprioName,  WorkerprioLabel,  kWorkerprioNames, kWorkerprioLabels, static_cast<int>(WorkerPriority::Highest));
+	// Spectral features go to the Info CHOP (feature_* channels), computed on the worker from the linear
+	// magnitude. Off by default: ~2-4 us per analysis when on.
+	appendToggle(manager, "Performance", FeaturesName,    FeaturesLabel,    false);
 	// (v2.7.0) "Update Every N Cooks" / "Parameter Poll Every N Cooks" removed: both made the node
 	// strictly worse. Update Every N Cooks halved the spectrum's effective update rate to save a cost
 	// that the async worker already took off the cook thread; Parameter Poll Every N Cooks saved
@@ -472,7 +509,11 @@ Three patterns run through all of it:
   * THE COUNTER. `n` counts every getPar* call and is reported through `reads` at the end. It is
     telemetry only - the Info DAT shows it - but it is what makes "a disabled section costs zero
     fetches" measurable rather than a claim, so keep the increments inside the getI/getD lambdas
-    rather than at the call sites.
+    rather than at the call sites. The two numbers to know: 20 getPar* calls at the shipped
+    defaults (every optional section off), 33 with EQ + a dB mode + ballistics + the Kaiser-beta
+    read all switched on. The live count is Info CHOP channel 13, `param_reads` (see
+    FFT::getInfoCHOPChan in FFT.cpp), and the elapsed time is channel 12, `param_fetch_us`;
+    divide one by the other for the real per-read cost instead of an estimate.
   * THE MENU GUARD. menu() falls back to a named entry when the stored index is out of range. This is
     the defence against a corrupt project or a stale parameter file, and it is why adding a menu
     entry needs no change here - the fallback is a value, not an index.
@@ -514,7 +555,9 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	// DIFFERENT failure - not "the user left it alone" but "the stored value is missing or garbage"
 	// (a parameter file from an older version). Change a default and all three must move together.
 	// The numeric literals have no derivation in this file; they are the documented defaults.
+	v.preset     = menu(Preset::Custom, PresetName);
 	v.chanMode   = menu(ChanMode::MonoMix, ChanmodeName);
+	v.rawBins    = getI(RawbinsName) != 0;
 	v.scale      = menu(Scale::Log, ScaleName);
 	v.displayMax = getD(DisplaymaxName);
 	if (!(v.displayMax > 0.0)) v.displayMax = 24000.0;   // written as a negated comparison so a NaN also lands on the default
@@ -522,8 +565,10 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 		int bins = getI(BinsName);
 		v.bins = (bins <= 0) ? 16384 : std::clamp(bins, kMinBins, kMaxBins);   // a hard clamp, not the slider: a typed or scripted value can reach 8..262144
 	}
+	v.binsMode   = menu(BinsMode::Auto, BinsmodeName);
 	v.warp       = std::clamp(getD(WarpName), 0.0, 1.0);
 	v.warpInterp = menu(WarpInterp::Linear, WarpinterpName);
+	v.warpAggregate = menu(WarpAggregate::Peak, WarpaggName);
 	v.logFloor   = std::max(1.0, getD(LogfloorName));
 	v.winMode    = menu(WinMode::Samples, WinmodeName);
 	if (v.winMode == WinMode::Milliseconds) {
@@ -532,9 +577,11 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 		int ws = getI(WinsamplesName);
 		v.winSamples = (ws <= 0) ? 3175 : std::clamp(ws, 1, kMaxWinSamples);   // 3175 is the default window (72 ms at 44.1 kHz); only the lower bound is a clamp, so a huge typed value still stops at kMaxWinSamples
 	}
+	v.zeroPad    = getI(ZeropadName) != 0;
 	v.padIndex   = getI(PadName);
 	v.padSize    = (v.padIndex >= 0 && v.padIndex < kPadCount) ? kPadValues[v.padIndex] : kPadDefault;
 	v.planner    = menu(Planner::Auto, PlannerName);
+	v.ingestMode = menu(IngestMode::Auto, IngestName);
 
 	// --- EQ (only when enabled) ---
 	// eqEnable itself is always fetched - it is the gate. Everything inside is skipped when it is
@@ -561,7 +608,10 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	// value, so the fetch would be pure cost); for them the field keeps its Values default. The clamp
 	// is 0..100, wider than the 1..55 slider, and DSPModules.h explains the range.
 	v.window     = menu(WindowType::Kaiser, WindowName);
-	if (v.window == WindowType::Kaiser) v.kaiserBeta = std::clamp(getD(KaiserName), 0.0, 100.0);
+	if (v.window == WindowType::Kaiser) {
+		v.betaMode = menu(BetaMode::Manual, KaisermodeName);
+		if (v.betaMode == BetaMode::Manual) v.kaiserBeta = std::clamp(getD(KaiserName), 0.0, 100.0);
+	}
 	v.weighting  = menu(Weighting::Off, WeightingName);
 	v.magNorm    = menu(MagNorm::CoherentGain, MagnormName);
 
@@ -572,7 +622,11 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	v.loudness = menu(Loudness::Off, LoudnessName);
 	if (v.loudness != Loudness::Off) {
 		v.dbRef   = menu(DbRef::FramePeak, DbrefName);
-		v.dbRange = std::max(1e-3, getD(DbrangeName));   // lower guard only: DecibelConverter takes 1/top_db, and although it guards itself too, a zero or negative floor would be nonsense to pass. There is no upper bound, so the 160 dB slider is not the limit
+	}
+	// dB Range Floor is also what Kaiser Beta Mode = Auto designs the window for (the sidelobes only need
+	// to sit below the floor the display shows), so it is read whenever either consumer is live.
+	if (v.loudness != Loudness::Off || (v.window == WindowType::Kaiser && v.betaMode == BetaMode::Auto)) {
+		v.dbRange = std::max(1e-3, getD(DbrangeName));   // lower guard only: DecibelConverter takes 1/top_db
 	}
 
 	// --- Ballistics (only when enabled) ---
@@ -597,9 +651,75 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	// Read unconditionally (one fetch) so switching it takes effect on the next cook in both the async
 	// and the synchronous path. See Parameters.h -> Backend for why this is a toggle and not a menu.
 	v.backend     = (getI(FftbackendName) != 0) ? Backend::OneMkl : Backend::Fftw3;
+	v.workerWake  = menu(WorkerWake::Poll, WorkerwakeName);
+	v.workerPriority = menu(WorkerPriority::Highest, WorkerprioName);
+	v.features    = getI(FeaturesName) != 0;
+
+	// A Quality Preset overrides the parameters it owns (RateModel.h, applyPreset) - applied last, on
+	// top of what was just read, so the individual parameters keep their stored values for Custom.
+	applyPreset(v);
 
 	if (reads) *reads = n;
 	return v;
+}
+
+// ---------------------------------------------------------------------------------------------
+// setEnableStates - grey out what the current settings make inert (C++ API Common 3).
+// TouchDesigner may call this outside a cook; it reads only through `inputs` and writes only enable
+// states, so it cannot disturb the analysis. Every name used here is registered in setup().
+// ---------------------------------------------------------------------------------------------
+void setEnableStates(const TD::OP_Inputs* inputs, TD::OP_ParEnableState* state)
+{
+	if (!inputs || !state) return;
+	auto en = [&](const char* name, bool on) { state->setEnableState(name, on); };
+	const int preset = inputs->getParInt(PresetName);
+	const bool custom = preset == static_cast<int>(Preset::Custom);
+	const bool binsAuto = inputs->getParInt(BinsmodeName) == static_cast<int>(BinsMode::Auto);
+	const bool raw = inputs->getParInt(RawbinsName) != 0;
+	const bool zeroPad = inputs->getParInt(ZeropadName) != 0;
+	const bool kaiser = inputs->getParInt(WindowName) == static_cast<int>(WindowType::Kaiser);
+	const bool betaAuto = inputs->getParInt(KaisermodeName) == static_cast<int>(BetaMode::Auto);
+	const bool winMs = inputs->getParInt(WinmodeName) == static_cast<int>(WinMode::Milliseconds);
+	const bool loud = inputs->getParInt(LoudnessName) != static_cast<int>(Loudness::Off);
+	const bool eq = inputs->getParInt(EqenableName) != 0;
+	const bool ball = inputs->getParInt(BallenableName) != 0;
+	const bool ballMs = inputs->getParInt(BallmodeName) == static_cast<int>(BallisticsMode::Milliseconds);
+	const bool async = inputs->getParInt(AsyncName) != 0;
+
+	// what a preset owns (and what Raw RFFT Bins / Zero-Padding off make inert)
+	en(PadName, custom && zeroPad);
+	en(WarpinterpName, custom && !raw);
+	en(WarpaggName, custom && !raw);
+	// the output axis: Raw RFFT Bins bypasses all of it; Output Bins is the count only in Fixed
+	en(ScaleName, !raw);
+	en(DisplaymaxName, !raw);
+	en(WarpName, !raw);
+	en(LogfloorName, !raw);
+	en(BinsmodeName, !raw);
+	en(BinsName, !raw && !binsAuto);
+	en(KaisermodeName, custom && kaiser);
+	// window length: the unit that is not selected
+	en(WinsamplesName, !winMs);
+	en(WinmsName, winMs);
+	// Kaiser beta only for a manual Kaiser window
+	en(KaiserName, kaiser && custom && !betaAuto);
+	// dB group: Loudness on, or the Auto beta designs from the dB floor
+	en(DbrefName, loud);
+	en(DbrangeName, loud || (kaiser && (betaAuto || !custom)));
+	// EQ sub-parameters
+	en(HighshelfName, eq); en(LowshelfName, eq);
+	const bool hs = eq && inputs->getParInt(HighshelfName) != 0;
+	const bool ls = eq && inputs->getParInt(LowshelfName) != 0;
+	en(GaindbName, hs); en(CutoffhzName, hs);
+	en(LowgaindbName, ls); en(LowcutoffhzName, ls);
+	en(QName, eq); en(AmountName, eq);
+	// ballistics: the pair in the selected unit
+	en(BallmodeName, ball);
+	en(AttackName, ball && !ballMs); en(ReleaseName, ball && !ballMs);
+	en(AttackmsName, ball && ballMs); en(ReleasemsName, ball && ballMs);
+	// worker controls only matter with the worker
+	en(WorkerwakeName, async);
+	en(WorkerprioName, async);
 }
 
 } // namespace Parameters

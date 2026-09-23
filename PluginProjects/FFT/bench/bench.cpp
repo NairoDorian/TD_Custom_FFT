@@ -57,6 +57,9 @@
 // cannot be attributed to the wrong build.
 
 #include "DSPModules.h"
+#include "RateModel.h"
+#include "AnalysisPipeline.h"
+#include "AsyncAnalysis.h"
 
 #include <algorithm>
 #include <chrono>
@@ -77,7 +80,16 @@ using clk = std::chrono::steady_clock;
 // own - they are not read from the node's parameters - so a run that does not pass a flag is not
 // necessarily a run of the plugin's defaults.
 struct Args {
-    int channels = 2, fft = 32768, win = 3175, bins = 16384, scale = 0, iters = 200, db = 1, eq = 0, weight = 1, ball = 1;
+    // v2.10: the defaults are the PLUGIN's defaults (1 mono channel, N 16384, dB/weighting/ballistics off),
+    // so a run without flags measures what a fresh node does. Pre-2.10 README tables used N 32768 with
+    // everything on - pass those flags explicitly to reproduce them.
+    int channels = 1, fft = 16384, win = 3175, bins = 16384, scale = 0, iters = 200, db = 0, eq = 0, weight = 0, ball = 0;
+    int autoBins = 0;          // --cook/--gate: 1 = Output Bins Mode Auto (N/2+1 of the padded FFT, the plugin default), 0 = Fixed --bins
+    int features = 0;          // --cook: Spectral Features on
+    int preset = 0;            // --cook: 0 Custom, 1 Visual60, 2 Visual120, 3 Analysis
+    std::string gate;          // --gate <baseline.json>: perf regression gate (see perfGate)
+    int update = 0;            // --update 1 with --gate: rewrite the baseline
+    int privateWisdom = 1;     // --private-wisdom 0: use the user's %LOCALAPPDATA% wisdom (default: a private file)
     // channels: 2 is the stereo input the bench feeds and mono-mixes (see the cook mode's ingest).
     // fft = 32768 with bins = 16384 is the N and bin count the README performance tables are quoted
     // at; changing either default makes those tables describe a configuration nobody runs.
@@ -219,173 +231,231 @@ static void infoPathBench(int cooks)
 }
 
 
-// ===================== COOK-THREAD SIMULATION (--cook N) =====================
-// ------------------------------------------------------------------------------------------
-// Cook-thread simulation: exactly the work FFT::executeImpl does per cook with Async on
-// (stereo mono-mix ingest -> FIFO -> job slot -> publish + wake -> acquire result -> memcpy to
-// the output), with a worker thread running window -> FFT -> magnitude -> warp -> peak.
-// Paced at ~60 fps so the worker is idle when the next cook arrives, like in TouchDesigner.
-// ------------------------------------------------------------------------------------------
+#ifdef _MSC_VER
+#pragma warning(disable : 4996)   // fopen: the gate reads/writes one small JSON file, portable C stdio on purpose
+#endif
 
-// WHAT:  Runs N simulated cooks twice - once with the analysis on a worker thread (Async on) and
-//        once inline on the calling thread (Async off) - and prints mean/median/p99/max us per
-//        cook for each, the async phase breakdown, and how long after publish the worker picked
-//        the job up.
-// WHY:   This is the cost the operator adds to TouchDesigner's cook thread each frame, which is the
-//        number the Async design is justified by. TouchDesigner reports a node's cook time as one
-//        total, so the distribution (p99, max), the sync-vs-async comparison and the phase split
-//        come from here. Two things keep it honest and are deliberate: the cooks are paced (~60 fps,
-//        so the worker is idle when the next cook arrives) and the caches are evicted between cooks.
-//        Removing either makes the reported number better than the plugin's.
-// HOW TO CHANGE: kPollMs and the worker's thread priority mirror the plugin's own worker
-//        (FFT.cpp's workerLoop poll interval and nameAndBoostCurrentThread). If either changes
-//        there, change it here too, or this stops simulating the shipped threading.
-// CALLED BY: main(), when --cook (--cook N, N > 0) is present.
-static void cookThreadBench(const Args& a, const FFTWEngine& engine, const AlignedVector& window,
-                            const PerceptualWarping& warp, size_t n_mag, size_t pad_start)
+// ===================== COOK-THREAD MEASUREMENT (--cook N) =====================
+// v2.10: this drives the REAL code - AnalysisPipeline (the DSP chain) behind AsyncAnalysis (the triple
+// buffers, the worker, its wake policy and dormancy handshake) - exactly as FFT::executeImpl does:
+// stereo mono-mix ingest -> FIFO -> job slot -> publish -> acquire the newest result -> copy to an
+// output buffer of the declared width. Only the TouchDesigner-facing glue (parameter reads, the info
+// callbacks) is absent. Cooks are paced (~60 fps) with an 8 MB cache sweep in between, like a busy TD
+// cook thread, so the numbers are not flattered by a hot cache or a worker that never sleeps.
+//
+// Three modes, same parameters: Async + Wake Poll (the default), Async + Wake Signal, Async off.
+struct CookStats { double mean, p50, p99, max; AsyncAnalysis::Pickup pickup; uint64_t dropped; };
+
+static Parameters::Values pluginParamsFrom(const Args& a)
 {
-    struct Job { std::vector<AlignedVector> windows; uint64_t seq{ 0 }; clk::time_point published; };
-    struct Result { std::vector<AlignedVector> spectra; uint64_t seq{ 0 }; float peakHz{ 0.0f }; };
-    const uint32_t kPollMs = 2;                                      // same policy as FFT::workerLoop
-    const size_t ch = static_cast<size_t>(a.channels), win = static_cast<size_t>(a.win);
-    const size_t N = static_cast<size_t>(a.fft), bins = warp.outputBins();
-    const size_t block = 735;                                        // 44.1 kHz @ 60 fps (44100 / 60)
+    Parameters::Values p;                                            // the plugin's defaults ...
+    for (int i = 0; i < Parameters::kPadCount; ++i)                  // ... with the bench's overrides
+        if (Parameters::kPadValues[i] == a.fft) { p.padIndex = i; p.padSize = a.fft; }
+    p.bins = a.bins;
+    p.binsMode = a.autoBins ? Parameters::BinsMode::Auto : Parameters::BinsMode::Fixed;
+    p.winSamples = a.win;
+    p.scale = static_cast<Parameters::Scale>(a.scale);
+    p.warpInterp = a.interp ? Parameters::WarpInterp::Cubic : Parameters::WarpInterp::Linear;
+    p.loudness = static_cast<Parameters::Loudness>(std::clamp(a.db, 0, 2));
+    p.weighting = a.weight ? Parameters::Weighting::AWeighting : Parameters::Weighting::Off;
+    p.ballEnable = a.ball != 0;
+    p.features = a.features != 0;
+    p.planner = static_cast<Parameters::Planner>(static_cast<int>(a.planner));
+    p.backend = a.backend ? Parameters::Backend::OneMkl : Parameters::Backend::Fftw3;
+    p.displayMax = a.fmax;
+    p.preset = static_cast<Parameters::Preset>(std::clamp(a.preset, 0, 3));
+    applyPreset(p);
+    return p;
+}
 
-    TripleBuffer<Job> jobs;
-    TripleBuffer<Result> results;
-    WorkerSignal wake;
-    std::atomic<bool> stop{ false };
-    for (size_t s = 0; s < TripleBuffer<Job>::kSlots; ++s) {
-        jobs.slot(s).windows.assign(ch, AlignedVector(win, 0.0f));
-        results.slot(s).spectra.assign(ch, AlignedVector(bins, 0.0f));
-    }
-    // per-channel pipeline state (what AnalysisPipeline owns)
-    std::vector<AlignedVector> frame(ch, AlignedVector(N, 0.0f)), mag(ch);
-    std::vector<AlignedComplexVector> scratch(ch);
-    std::vector<double> pickup_us;                                   // publish -> worker acquire latency
-    pickup_us.reserve(static_cast<size_t>(a.cook) + 8);              // +8 slack (value not derived in this file)
-    auto runJob = [&](const Job& j) {
-        pickup_us.push_back(std::chrono::duration<double, std::micro>(clk::now() - j.published).count());
-        Result& r = results.back();
-        for (size_t c = 0; c < ch; ++c) {
-            multiplyInto(j.windows[c].data(), window.data(), frame[c].data() + pad_start, win);
-            engine.executeRFFT(frame[c], mag[c], scratch[c], n_mag);
-            warp.applyWarp(mag[c], r.spectra[c]);
-        }
-        size_t idx = 0;
-        findPeakWithIndex(r.spectra[0].data(), r.spectra[0].size(), idx);
-        r.peakHz = static_cast<float>(warp.targetHz()[idx]);
-        r.seq = j.seq;
-        results.publish();
-    };
-
-    // cook-side state (what the FFT operator owns)
-    std::vector<FIFOBuffer> fifo(ch);
-    for (auto& f : fifo) f.resize(win);
+static CookStats runCooks(Parameters::Values p, bool async, Parameters::WorkerWake wake, int cooks, int paceMs, bool evict)
+{
+    const double sr = 44100.0;
+    const size_t block = 735;                                        // 44.1 kHz @ 60 fps
+    p.async = async;
+    p.workerWake = wake;
+    PlanLog log;
+    AnalysisPipeline pipe(&log);
+    AsyncAnalysis an(pipe, log);
+    an.configure(async, wake, Parameters::WorkerPriority::Highest);
+    const int win = windowSamplesFrom(p, sr);
+    const size_t bins = static_cast<size_t>(outputBinCountFrom(p, sr));
+    FIFOBuffer fifo(static_cast<size_t>(win));
     std::vector<float> inL(block), inR(block);
-    // Input: two sines of different frequency, so L and R are not the same block and the mono mix has
-    // something to mix. The amplitudes and the per-sample steps (0.3 / 0.2 / 0.1 / 0.37) are
-    // (value not derived in this file): nothing here depends on the signal, only that it is not silent.
     for (size_t i = 0; i < block; ++i) { inL[i] = static_cast<float>(0.3 * std::sin(i * 0.1)); inR[i] = static_cast<float>(0.2 * std::sin(i * 0.37)); }
-    AlignedVector mixed(block);
-    std::vector<AlignedVector> output(ch, AlignedVector(bins, 0.0f));   // stands in for TouchDesigner's CHOP_Output buffers
-    uint64_t seq = 0, dropped = 0, holds = 0;
-    double us_ingest = 0, us_job = 0, us_wake = 0, us_copy = 0;      // async phase accumulators
-
-    auto cook = [&](bool async) -> double {
-        auto t0 = clk::now();
-        DenormalGuard ftz;
-        for (size_t c = 0; c < ch; ++c) {                            // ingest: mono mix of a stereo input
-            std::memcpy(mixed.data(), inL.data(), block * sizeof(float));
-            addInto(mixed.data(), inR.data(), mixed.data(), block);
-            scaleInPlace(mixed.data(), block, 0.5f);                 // /2: the mix is (L+R)/2
-            (void)blockIsSilent(mixed.data(), block);
-            fifo[c].add(mixed.data(), block);
-        }
-        auto t1 = clk::now();
-        Job& j = jobs.back();                                        // job snapshot
-        j.seq = ++seq;
-        for (size_t c = 0; c < ch; ++c) fifo[c].get(j.windows[c]);
-        j.published = clk::now();
-        if (jobs.publish()) ++dropped;
-        auto t2 = clk::now();
-        if (!async && jobs.acquire()) runJob(jobs.front());         // async: the hot worker polls; no wake-up call
-        auto t3 = clk::now();
-        results.acquire();                                           // output copy
-        const Result& r = results.front();
-        for (size_t c = 0; c < ch; ++c) std::memcpy(output[c].data(), r.spectra[c].data(), bins * sizeof(float));
-        if (seq - r.seq > 1) ++holds;
-        auto t4 = clk::now();
-        if (async) {
-            us_ingest += std::chrono::duration<double, std::micro>(t1 - t0).count();
-            us_job    += std::chrono::duration<double, std::micro>(t2 - t1).count();
-            us_wake   += std::chrono::duration<double, std::micro>(t3 - t2).count();
-            us_copy   += std::chrono::duration<double, std::micro>(t4 - t3).count();
-        }
-        return std::chrono::duration<double, std::micro>(t4 - t0).count();
-    };
-    // Sorts t in place - callers hand over a vector they have finished with - then reports the mean,
-    // the median and the p99 taken by index rather than interpolated between samples.
-    auto report = [&](const char* label, std::vector<double>& t) {
-        std::sort(t.begin(), t.end());
-        double sum = 0; for (double v : t) sum += v;
-        std::printf("  %-22s mean %6.2f us  median %6.2f us  p99 %6.2f us  max %7.2f us  (n=%zu)\n",
-                    label, sum / t.size(), t[t.size() / 2], t[t.size() * 99 / 100], t.back(), t.size());
-    };
-    // Between cooks TouchDesigner's cook thread is busy with other operators: keep the core awake
-    // and clocked up but stream through 8 MB so our working set is evicted from L1/L2 like it is in TD.
-    std::vector<float> evict(2 * 1024 * 1024, 1.0f);                 // 2*1024*1024 floats * 4 B = 8 MB
+    AlignedVector mixed(block), out(bins);
+    std::vector<float> evictBuf(evict ? 2 * 1024 * 1024 : 0, 1.0f);
     volatile float sink = 0.0f;
-    auto pace = [&] {
-        auto until = clk::now() + std::chrono::milliseconds(15);      // 15 ms of the 16.7 ms a 60 fps frame allows
-        // i += 16 floats = 64 bytes: one touch per cache line, so the sweep reads every line it streams over.
-        while (clk::now() < until) { float s = 0; for (size_t i = 0; i < evict.size(); i += 16) s += evict[i]; sink = s; }
-    };
-
-    std::thread worker([&] {
-        // Match the plugin's worker (nameAndBoostCurrentThread in FFT.cpp) so the simulated
-        // pipeline owner thread competes at the same priority level.
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    uint64_t seq = 0;
+    auto cook = [&]() -> double {
+        const auto t0 = clk::now();
         DenormalGuard ftz;
-        // wake is signaled only to stop this thread (after the timed loop), so during a run the
-        // worker finds each job by polling - which is what "Async on" measures.
-        for (;;) {
-            if (stop.load()) return;
-            if (jobs.acquire()) { runJob(jobs.front()); continue; }
-            wake.waitFor(kPollMs);
+        std::memcpy(mixed.data(), inL.data(), block * sizeof(float));
+        addInto(mixed.data(), inR.data(), mixed.data(), block);
+        scaleInPlace(mixed.data(), block, 0.5f);
+        fifo.add(mixed.data(), block);
+        AnalysisJob& j = an.jobSlot();
+        j.seq = ++seq; j.numChannels = 1; j.sampleRate = sr; j.winSamples = win; j.dtMs = 1000.0 / 60.0; j.p = p; j.reset = false;
+        if (j.windows.size() != 1) j.windows.resize(1);
+        if (j.silent.size() != 1) j.silent.assign(1, 0);
+        fifo.get(j.windows[0]);
+        an.publish();
+        an.acquireResult();
+        const AnalysisResult& r = an.result();
+        if (!r.spectra.empty()) {
+            const size_t n = std::min(bins, r.spectra[0].size());
+            std::memcpy(out.data(), r.spectra[0].data(), n * sizeof(float));
         }
-    });
-    std::vector<double> t_async, t_sync;
-    t_async.reserve(static_cast<size_t>(a.cook));
-    t_sync.reserve(static_cast<size_t>(a.cook));
-    for (int it = 0; it < 5; ++it) { cook(true); pace(); }         // warm-up (5 cooks: value not derived in this file)
-    // The warm-up's phases are discarded so the first report is of warm caches and a live thread pool.
-    dropped = 0; holds = 0; us_ingest = us_job = us_wake = us_copy = 0;
-    for (int it = 0; it < a.cook; ++it) {
-        pace();
-        t_async.push_back(cook(true));
+        return std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+    };
+    auto pace = [&] {
+        const auto until = clk::now() + std::chrono::milliseconds(paceMs);
+        while (clk::now() < until) {
+            if (evict) { float s = 0; for (size_t i = 0; i < evictBuf.size(); i += 16) s += evictBuf[i]; sink = s; }
+        }
+    };
+    for (int i = 0; i < 30; ++i) { cook(); pace(); }                  // warm-up: plan, tables, buffers, worker
+    std::vector<double> t;
+    t.reserve(static_cast<size_t>(cooks));
+    for (int i = 0; i < cooks; ++i) { pace(); t.push_back(cook()); }
+    std::sort(t.begin(), t.end());
+    double sum = 0; for (double v : t) sum += v;
+    CookStats cs{ sum / t.size(), t[t.size() / 2], t[std::min(t.size() - 1, t.size() * 99 / 100)], t.back(), an.pickup(), an.jobsDropped() };
+    an.configure(false, wake, Parameters::WorkerPriority::Highest);
+    return cs;
+}
+
+static void cookThreadBench(const Args& a)
+{
+    const Parameters::Values p = pluginParamsFrom(a);
+    std::printf("\ncook-thread cost per cook (real AsyncAnalysis + AnalysisPipeline; %d output bins, N=%d, stereo mono-mix ingest, "
+                "~60 fps pacing, caches evicted between cooks, n=%d):\n",
+                outputBinCountFrom(p, 44100.0), p.padSize, a.cook);
+    struct Mode { const char* name; bool async; Parameters::WorkerWake wake; };
+    const Mode modes[] = { { "Async, Wake Poll", true, Parameters::WorkerWake::Poll },
+                           { "Async, Wake Signal", true, Parameters::WorkerWake::Signal },
+                           { "Async off (inline)", false, Parameters::WorkerWake::Poll } };
+    for (const Mode& m : modes) {
+        const CookStats c = runCooks(p, m.async, m.wake, a.cook, 15, true);
+        std::printf("  %-20s mean %7.2f us  p50 %7.2f us  p99 %7.2f us  max %8.2f us", m.name, c.mean, c.p50, c.p99, c.max);
+        if (m.async) std::printf("  | pickup p50 %.0f us p99 %.0f us, late %llu, dropped %llu",
+                                 c.pickup.p50Us, c.pickup.p99Us, static_cast<unsigned long long>(c.pickup.late),
+                                 static_cast<unsigned long long>(c.dropped));
+        std::printf("\n");
     }
-    stop.store(true);
-    wake.signal();
-    worker.join();
-    const uint64_t async_dropped = dropped, async_holds = holds;
-    std::vector<double> async_pickup = pickup_us;
-    for (int it = 0; it < a.cook; ++it) {
-        pace();
-        t_sync.push_back(cook(false));
+}
+
+// ===================== PERF GATE (--gate <baseline.json> [--update 1]) =====================
+// A fixed set of measurements on the real code, compared against a per-machine baseline. Registered
+// with ctest under the label "perf" (td_plugin_add_bench ... GATE): `ctest -L perf`. A metric fails
+// when it exceeds baseline * 1.30 + 2 us. Each metric is the minimum over 5 rounds of a median.
+// --update 1 re-measures and rewrites the baseline (do it on the machine the gate runs on, idle).
+// The FFT plans come from the bench's private wisdom file, so the gate never touches the user's.
+static bool readBaseline(const char* path, std::vector<std::pair<std::string, double>>& out)
+{
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    size_t pos = 0;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        const size_t end = text.find('"', pos + 1);
+        if (end == std::string::npos) break;
+        const std::string key = text.substr(pos + 1, end - pos - 1);
+        const size_t colon = text.find(':', end);
+        if (colon == std::string::npos) break;
+        size_t v0 = colon + 1;
+        while (v0 < text.size() && (text[v0] == ' ' || text[v0] == '	')) ++v0;
+        if (v0 < text.size() && text[v0] == '"') {                      // a string value (e.g. "_note"): skip it whole
+            const size_t close = text.find('"', v0 + 1);
+            if (close == std::string::npos) break;
+            pos = close + 1;
+            continue;
+        }
+        char* stop = nullptr;
+        const double v = std::strtod(text.c_str() + colon + 1, &stop);
+        if (stop != text.c_str() + colon + 1) out.emplace_back(key, v);
+        pos = (stop && stop > text.c_str() + colon) ? static_cast<size_t>(stop - text.c_str()) : colon + 1;
     }
-    std::printf("\ncook-thread cost per cook (%zu channel(s), %zu bins, N=%zu, stereo mono-mix ingest, ~60 fps pacing, caches evicted between cooks):\n", ch, bins, N);
-    report("Async on (worker)", t_async);
-    std::printf("  %-22s ingest %.2f  job snapshot+publish %.2f  (wake call %.2f)  acquire+output copy %.2f  (mean us)\n", "  async phases",
-                us_ingest / a.cook, us_job / a.cook, us_wake / a.cook, us_copy / a.cook);
-    report("Async off (inline)", t_sync);
-    if (!async_pickup.empty()) {
-        std::sort(async_pickup.begin(), async_pickup.end());
-        std::printf("  async: worker picked the job up %.0f us (median) / %.0f us (max) after publish with a %u ms poll; "
-                    "%llu job(s) dropped, %llu cook(s) held beyond the normal 1-frame latency\n",
-                    async_pickup[async_pickup.size() / 2], async_pickup.back(), kPollMs,
-                    static_cast<unsigned long long>(async_dropped), static_cast<unsigned long long>(async_holds));
+    return true;
+}
+
+static double pipelineP50(Parameters::Values p, int iters)
+{
+    p.async = false;
+    PlanLog log;
+    AnalysisPipeline pipe(&log);
+    AnalysisJob job;
+    job.numChannels = 1; job.sampleRate = 44100.0; job.winSamples = windowSamplesFrom(p, 44100.0); job.p = p; job.dtMs = 16.7;
+    job.windows.assign(1, AlignedVector(static_cast<size_t>(job.winSamples)));
+    for (size_t i = 0; i < job.windows[0].size(); ++i) job.windows[0][i] = static_cast<float>(0.3 * std::sin(i * 0.1) + 0.1 * std::sin(i * 1.7));
+    job.silent.assign(1, 0);
+    AnalysisResult res;
+    for (int i = 0; i < 50; ++i) pipe.process(job, res);
+    std::vector<double> t(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        const auto t0 = clk::now();
+        pipe.process(job, res);
+        t[static_cast<size_t>(i)] = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
     }
+    std::sort(t.begin(), t.end());
+    return t[t.size() / 2];
+}
+
+static int perfGate(const Args& a)
+{
+    // Noise control for a laptop: pin to one core at high priority, and score every metric as the
+    // MINIMUM of 5 rounds' medians - interference (turbo steps, thermals, background work) only ever
+    // makes a round slower, so the minimum is the stable estimate of what the code costs.
+#ifdef _WIN32
+    SetThreadAffinityMask(GetCurrentThread(), 1ull << 2);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+    auto best = [](auto fn) { double b = 1e30; for (int r = 0; r < 5; ++r) b = std::min(b, fn()); return b; };
+    std::vector<std::pair<std::string, double>> m;
+    Parameters::Values def;                                          // the plugin's defaults (Auto = 8193 bins, beta 15)
+    def.planner = Parameters::Planner::Measured;                     // measured plans (from the bench's wisdom)
+    Parameters::Values fixed16k = def; fixed16k.rawBins = true;       // the raw rfft path (identity memcpy)
+    Parameters::Values v60 = def; v60.preset = Parameters::Preset::Visual60; applyPreset(v60);
+    Parameters::Values full = def; full.loudness = Parameters::Loudness::Db; full.weighting = Parameters::Weighting::AWeighting;
+    full.ballEnable = true; full.features = true;
+    m.emplace_back("pipeline_default_p50_us", best([&] { return pipelineP50(def, 800); }));
+    m.emplace_back("pipeline_rawbins_p50_us", best([&] { return pipelineP50(fixed16k, 800); }));
+    m.emplace_back("pipeline_visual60_p50_us", best([&] { return pipelineP50(v60, 800); }));
+    m.emplace_back("pipeline_fullchain_p50_us", best([&] { return pipelineP50(full, 800); }));
+    m.emplace_back("cook_async_poll_p50_us", best([&] { return runCooks(def, true, Parameters::WorkerWake::Poll, 200, 4, false).p50; }));
+    m.emplace_back("cook_sync_p50_us", best([&] { return runCooks(def, false, Parameters::WorkerWake::Poll, 200, 4, false).p50; }));
+
+    if (a.update) {
+        FILE* f = std::fopen(a.gate.c_str(), "wb");
+        if (!f) { std::printf("gate: cannot write %s\n", a.gate.c_str()); return 2; }
+        std::fprintf(f, "{\n  \"_note\": \"fft_bench --gate baseline; regenerate with --gate <this file> --update 1 on the gating machine\",\n");
+        for (size_t i = 0; i < m.size(); ++i)
+            std::fprintf(f, "  \"%s\": %.3f%s\n", m[i].first.c_str(), m[i].second, i + 1 < m.size() ? "," : "");
+        std::fprintf(f, "}\n");
+        std::fclose(f);
+        std::printf("gate: baseline written to %s\n", a.gate.c_str());
+        for (auto& kv : m) std::printf("  %-28s %9.3f us\n", kv.first.c_str(), kv.second);
+        return 0;
+    }
+    std::vector<std::pair<std::string, double>> base;
+    if (!readBaseline(a.gate.c_str(), base)) { std::printf("gate: cannot read %s\n", a.gate.c_str()); return 2; }
+    int fails = 0, compared = 0;
+    for (auto& kv : m) {
+        const auto it = std::find_if(base.begin(), base.end(), [&](auto& b) { return b.first == kv.first; });
+        if (it == base.end()) { std::printf("  %-28s %9.3f us  (no baseline)\n", kv.first.c_str(), kv.second); continue; }
+        ++compared;
+        const double limit = it->second * 1.30 + 2.0;
+        const bool ok = kv.second <= limit;
+        if (!ok) ++fails;
+        std::printf("  %-28s %9.3f us  baseline %9.3f  limit %9.3f  %s\n", kv.first.c_str(), kv.second, it->second, limit, ok ? "ok" : "REGRESSION");
+    }
+    if (compared == 0) { std::printf("gate: the baseline has no metrics - run with --update 1 once on this machine\n"); return 0; }
+    std::printf("gate: %d regression(s)\n", fails);
+    return fails ? 1 : 0;
 }
 
 // ===================== ARGUMENT PARSING =====================
@@ -416,6 +486,12 @@ static Args parse(int argc, char** argv)
         else if (k == "--interp") a.interp = std::atoi(v);
         else if (k == "--fmax") a.fmax = std::atof(v);
         else if (k == "--cook") a.cook = std::atoi(v);
+        else if (k == "--auto-bins") a.autoBins = std::atoi(v);
+        else if (k == "--features") a.features = std::atoi(v);
+        else if (k == "--preset") a.preset = std::atoi(v);
+        else if (k == "--gate") a.gate = v;
+        else if (k == "--update") a.update = std::atoi(v);
+        else if (k == "--private-wisdom") a.privateWisdom = std::atoi(v);
         else if (k == "--info") a.info = std::atoi(v);
         else if (k == "--planner") {
             std::string p = v;
@@ -458,6 +534,9 @@ int main(int argc, char** argv)
     // measurable and buys a crash whose last line is the line it died on.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     Args a = parse(argc, argv);
+    // Private wisdom by default: a bench run must neither depend on nor rewrite the user's plan cache.
+    if (a.privateWisdom) FFTWEngine::wisdomPathOverride() = "fft_bench_wisdom.txt";
+    if (!a.gate.empty()) return perfGate(a);
     const double sr = 44100.0;                                       // the input rate the whole run is modelled at
     const size_t N = static_cast<size_t>(a.fft), win = static_cast<size_t>(a.win), bins = static_cast<size_t>(a.bins);
     std::printf("FFT bench: channels=%d fft=%zu win=%zu bins=%zu scale=%d db=%d iters=%d (AVX2 %s)\n",
@@ -704,7 +783,7 @@ int main(int argc, char** argv)
     // Both run last and print after everything above, so their output is never mixed into the stage
     // table they follow. They reuse the plan and the warp tables built at the top of main: neither
     // builds its own engine, so neither shows a plan build in its numbers.
-    if (a.cook > 0) cookThreadBench(a, engine, window, warp, n_mag, pad_start);
+    if (a.cook > 0) cookThreadBench(a);
     if (a.info > 0) infoPathBench(a.info);
     return 0;
 }
