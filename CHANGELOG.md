@@ -16,6 +16,14 @@ sections below. They mean specific things here, and the distinction has been wor
 | **Verified** | The evidence: the test check count, the benchmark number, or the check that was run against a real binary. A change with no entry here was not measured |
 | **Measured / Confirmed in TouchDesigner** | Numbers and observations from a real run, with the machine named |
 | **Notes / Still open** | Design reasoning, and - deliberately - what is *not* established. If a claim in this file could not be verified, it says so here rather than being stated as fact |
+| **Evaluated, not kept** | A change that was built and measured, and lost. Recorded so it is not tried again blind |
+| **Tests** | Same role as **Verified**, for entries whose evidence is mainly new test coverage |
+| **Documentation** | Markdown-only changes that shipped with the release (documents added, retired or corrected) |
+
+Some entries also carry a section named for their topic (for example *"Upgrading a node saved with
+v2.10"* or *"FFT backend and plan flags"*). Every entry corresponds to committed work: a
+documentation-only pass that shipped without a version bump is filed under the version it followed,
+with the commit named in its heading, rather than as "Unreleased".
 
 Two conventions that matter if you are adding an entry:
 
@@ -26,7 +34,9 @@ Two conventions that matter if you are adding an entry:
   claims more than was measured is worse than no entry.
 
 For what the node does *now* (rather than when it changed), see [README.md](README.md); for the
-performance analysis, see [FFT_REALTIME_OPTIMIZATION_ANALYSIS.md](FFT_REALTIME_OPTIMIZATION_ANALYSIS.md).
+performance analysis and the current plan, see [AUDIT_AND_PLAN_2026-09-23.md](AUDIT_AND_PLAN_2026-09-23.md).
+(The older FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md, which entries
+below still name as history, were retired 2026-09-23; see git history.)
 
 > **Relationship to PluginBuilder_V2:** this plugin is built by the sibling
 > [`../PluginBuilder_V2`](../PluginBuilder_V2) repository — CMake module (`TDPlugin.cmake`),
@@ -94,14 +104,26 @@ P-core) and interleaved A/B runs of the previous build.
 - **Weighting and the dB reference peak share one pass** (`multiplyInPlaceMax`): 1.0 → 0.57 µs at 8193
   bins. With a dBFS reference, the peak pass is skipped entirely, since that reference never used it.
 
+### Changed (Textport)
+Follow-up commit `de8b13a`, same day, same version number.
+- **The long backend line is printed once per backend, not once per plan.** It is repeated only on a
+  backend switch or when the plan's SIMD kernels change. Every plan still gets its short `plan N=... in
+  x ms` line. Resizing on oneMKL used to print the full "FFTW 3.3.4 wrappers to Intel oneMKL [...]" line
+  for every size.
+
 ### FFT backend and plan flags (measured, nothing to change)
 - **oneMKL runs the FFT 18–27 % faster than FFTW:** 3.87 / 8.41 / 17.73 µs vs 4.71 / 11.55 / 23.65 µs
   (FFTW with MEASURE plans) at N = 8K / 16K / 32K, median of 3 pinned runs. FFTW with a PATIENT plan is
-  9.70 µs at 16K, so oneMKL still leads by ~13 %. A first comparison in this release claimed the
-  opposite: it passed `--backend 1` where the bench takes a name (`--backend mkl`), so both runs used
-  FFTW. FFTW stays the default because it is 3 MB, vendored and wisdom-cached. Choose oneMKL (FFT
-  Backend on) for speed. It then loads 5 DLLs (~177 MB) and spends ~39 ms initialising once per
-  process, on the worker thread when Async is on.
+  9.70 µs at 16K, so oneMKL still leads by ~13 %. FFTW stays the default because it is 3 MB, vendored
+  and wisdom-cached. Choose oneMKL (FFT Backend on) for speed. It then loads 5 DLLs (~177 MB) and spends
+  ~39 ms initialising once per process, on the worker thread when Async is on.
+  - *Correction:* an earlier version of this entry (commit `01d0c00`) had it backwards ("FFTW beats
+    oneMKL at every size"). That bench run passed `--backend 1` where the bench takes a name
+    (`--backend mkl`), so both runs used FFTW. Corrected in `de8b13a`.
+- **oneMKL deployment trimmed (2026-09-23):** `__Plugins__/FFT/` now holds the 14 oneMKL DLLs the
+  backend can dispatch to (plus `oneMKL-licenses/`). `mkl_intel_thread`, `mkl_tbb_thread` and
+  `libimalloc.dll` were removed: the sequential threading layer is forced at load, so they are never
+  loaded.
 - Preserve-input out-of-place, the current setup, is the fastest execute:
   - `FFTW_DESTROY_INPUT` plus re-zeroing the pad each frame is 1–5 % slower;
   - in-place plus re-zeroing is 10–20 % slower.
@@ -124,12 +146,6 @@ P-core) and interleaved A/B runs of the previous build.
 - **Polynomial log2 (degree 3–5) for dB:** 30 % slower than the gather table. The 8-segment form above is
   what beat it.
 
-### Changed (Textport)
-- **The long backend line is printed once per backend, not once per plan.** It is repeated only on a
-  backend switch or when the plan's SIMD kernels change. Every plan still gets its short `plan N=... in
-  x ms` line. Resizing on oneMKL used to print the full "FFTW 3.3.4 wrappers to Intel oneMKL [...]" line
-  for every size.
-
 ### Tests
 - `test_v212_simd_kernels` covers:
   - both warp kernels vs a scalar reference on five grids (mixed permute/gather, all permute, all gather);
@@ -139,10 +155,22 @@ P-core) and interleaved A/B runs of the previous build.
   - the `FastLog2Seg` error bound, scalar and vector;
   - the aggregation skip (NaN sentinel: every bin written, and every Peak bin is a real FFT bin);
   - `applyInPlace` == `apply` + copy, bit for bit;
-  - the features vs the pre-2.12 scalar loop.
-- Result: 744 checks, 0 failures.
+  - the features vs the pre-2.12 scalar loop;
+  - the plan log: the long backend line once per backend, one short `plan N=` line per size (added
+    with the Textport change in `de8b13a`).
+- Result: 744 checks, 0 failures at `01d0c00`; 748 checks, 0 failures at `de8b13a`.
 - `bench/perf_baseline.json` was last written while the machine was under load. Regenerate it on an idle
   machine with `fft_bench --gate bench/perf_baseline.json --update 1`.
+
+### Documentation
+- FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md are retired (see git
+  history). [AUDIT_AND_PLAN_2026-09-23.md](AUDIT_AND_PLAN_2026-09-23.md) supersedes both.
+- New notes: [ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md](ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md)
+  and [INSTALLER_PLAN_2026-09-23.md](INSTALLER_PLAN_2026-09-23.md).
+- `FFT_REFERENCE/` (the original Python prototype) is removed from the repository. It is kept on disk
+  and is now gitignored.
+- `PluginProjects/FFT/3rdParty/fftw3/README.md`: the oneMKL file list is now the trimmed set above,
+  with the three unneeded DLLs named and the reason they are never loaded.
 
 ## [v2.11.0] - 2026-09-23 — Output Bins drives the output again; raw rfft bins; zero-padding toggle
 
@@ -199,7 +227,11 @@ Summary (the detailed plan and measurements are in `AUDIT_AND_PLAN_2026-09-23.md
 - **Tests:** a steady-state allocation gate in the tests. A perf-regression gate (`ctest -L perf`,
   `bench/perf_baseline.json`).
 
-## [Unreleased] — maintainability pass: comments, structure and documentation only
+## [v2.9.1, docs-only follow-up] - 2026-09-21 — maintainability pass: comments, structure and documentation only
+
+Commit `71c13b8`, made after the v2.9.1 release and without a version bump, so the node still reported
+v2.9.1; the next build to ship it was v2.10.0 (`8e18b41`). This entry was headed "Unreleased" until
+2026-09-23.
 
 No behaviour change of any kind. No parameter added, removed or renamed, no default changed, no
 algorithm touched, no version bump. **`fft_tests`: 607 checks, 0 failures** before and after, which
@@ -293,6 +325,7 @@ is the whole of the evidence that nothing moved.
   version is data rather than a comment - but a reader who finds the two disagreeing should know which is
   authoritative for "which build is actually loaded": the constants are, because that is what the
   middle-click popup's `Plugin:` line and the Info DAT report. See the comment above `kMajorVersion`.
+  *(Resolved since: `plugin.json` was bumped with the node from v2.11.0 on, and reads `2.12.0` now.)*
 - **Nothing in this pass is a performance change, and no number in this file or in the README was
   re-measured.** The benchmark figures quoted in the entries below and in the README are the ones taken
   when those changes were made; treat them as a record, not as a current reading, and re-run
@@ -906,7 +939,7 @@ and read by the cook's core, then written into TouchDesigner's buffer); `Output 
 
 ## [v2.3.0] - 2026-08-26 — mono-first real-time architecture
 
-Implements the roadmap in `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (tiers 0–2 except the FFT library swap).
+Implements the roadmap in `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (tiers 0–2 except the FFT library swap; the document was retired 2026-09-23, see git history).
 
 ### Architecture
 - **Async analysis (default on)**: the cook thread only mixes/EQs/ingests the new audio block and copies the last

@@ -15,7 +15,8 @@ __Plugins__/**/*.dll.old*
 
 # The oneMKL runtime, when it is deployed next to FFT.dll so the FFT Backend toggle works in
 # TouchDesigner: the plugin resolves the library from its own directory (pluginDirectory() in
-# FftBackend.h), so `__Plugins__/FFT/` is the only place it can live at run time. It is 521 MB and
+# FftBackend.h), so `__Plugins__/FFT/` is the only place it can live at run time. It is 14 DLLs / 456 MB
+# (the redist package is 17 DLLs / 521 MB; the plugin never loads the other three) and
 # entirely optional - the plugin runs on the vendored FFTW3 with none of it present - so it is never
 # vendored here, only staged by hand for the machine that wants it. The notices *are* kept with it,
 # because the Intel Simplified Software License requires the license text and the third-party
@@ -72,3 +73,6 @@ Desktop.ini
 fft_tests_wisdom.txt
 # The bench keeps its own private wisdom (machine-specific FFTW timings); never tracked.
 fft_bench_wisdom.txt
+
+# Local reference material (the original Python FFT prototype); kept on disk, not in the repository.
+FFT_REFERENCE/

@@ -91,8 +91,9 @@ prefixes, so the file name is the only thing on disk that says which one is in p
 ## How the build finds and uses this
 
 `td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)` in `PluginProjects/FFT/CMakeLists.txt`
-(defined in `PluginBuilder_V2/cmake/TDPlugin.cmake`) locates these files, generates the `.lib` from
-the `.def` when it is missing, and stages/deploys the DLL. `DYNAMIC` means the plugin does **not**
+(defined in `PluginBuilder_V2/cmake/TDPlugin.cmake`) locates these files, generates a `.lib` from
+the `.def` (in the build tree, never in this directory) only when the vendored one is missing or
+names the wrong DLL, and stages/deploys the DLL. `DYNAMIC` means the plugin does **not**
 link the import library — see [§Two libraries, one ABI](#two-libraries-one-abi-why-nothing-is-linked).
 
 The whole path, in the order it happens:
@@ -100,11 +101,11 @@ The whole path, in the order it happens:
 | step | who | what happens |
 |---|---|---|
 | 1 | `PluginProjects/FFT/CMakeLists.txt` | calls `td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)` |
-| 2 | `_td_find_3rdparty()` | finds this directory. It tries, in order: `<plugin source>/3rdParty/fftw3`, then `${PLUGIN_BUILDER_DIR}/3rdParty/fftw3`, then `${TD_SAMPLES_DIR}/3rdParty/fftw3`. The first that exists wins |
+| 2 | `_td_find_3rdparty()` | finds this directory. It tries, in order: `<plugin source>/3rdParty/fftw3`, then `${TD_SAMPLES_DIR}/3rdParty/fftw3`, then `${PLUGIN_BUILDER_DIR}/3rdParty/fftw3`. The first that exists wins, so this plugin-local copy always wins here |
 | 3 | `td_plugin_use_fftw3()` | picks the tag (`3.3.11-avx2`), so the stem `libfftw3f` plus the tag gives `libfftw3f-3.3.11-avx2` |
 | 4 | `td_plugin_use_fftw3()` | adds `include/` to the FFT target and defines `TD_PLUGIN_HAS_FFTW3=1` (plus `TD_PLUGIN_FFTW3_DYNAMIC=1` under `DYNAMIC`) |
-| 5 | `td_plugin_use_fftw3()` | regenerates `lib/<stem>-<tag>.lib` with `lib.exe` if it is missing or older than the `.def` |
-| 6 | `td_plugin_add_runtime_dll()` | copies `bin/<stem>-<tag>.dll` next to `FFT.dll` in the build output, and into the deployment folder `Plugin_FFT/__Plugins__/FFT/` |
+| 5 | `td_plugin_use_fftw3()` | uses `lib/<stem>-<tag>.lib` as-is when it exists and the `.def`'s `LIBRARY` line names `<stem>-<tag>.dll`; otherwise (MSVC only) writes a corrected `.def` and runs `lib.exe` into `<build>/td_deps/fftw3/`. Nothing is ever written into this directory |
+| 6 | `td_plugin_add_runtime_dll()` | copies `bin/<stem>-<tag>.dll` next to `FFT.dll` in the build output and records it in `<build>/FFT_runtime_dlls.txt`. A standalone build also copies it into the deployment folder `Plugin_FFT/__Plugins__/FFT/`; under `PluginBuilder.tox` (`PLUGINBUILDER_BUILD` set) PluginBuilder stages exactly the files that list names |
 | 7 | `source/FftBackend.h`, at run time | `loadBackendFrom()` opens the DLL from the plugin's own directory and fills in an `FftApi` table of function pointers |
 
 Step 7 is the part that surprises people, so it is worth naming the functions correctly. There is no
@@ -212,13 +213,14 @@ the one step people get wrong:
 4. Generate the import library from it:
    `lib.exe /nologo /machine:x64 /def:libfftw3f-3.3.11-avx2.def /out:libfftw3f-3.3.11-avx2.lib`.
    You can also skip this — `td_plugin_use_fftw3()` runs exactly this command for you when the
-   `.lib` is missing or older than the `.def`.
+   `.lib` is missing, but it writes the result into `<build>/td_deps/fftw3/`, not into `lib/`, so
+   the vendored tree is only complete on its own if you run it yourself.
 
 The reason the `.def`'s `LIBRARY` line must name the same file the DLL is called: the import library
 embeds that name, and the loader follows the **embedded** name, not the `.lib`'s own file name. So a
 renamed-dll-but-untouched-def pair fails at load time with "module not found" while the correctly
-named DLL sits right beside it. The CMake rewrites the line when the two disagree, so a future
-re-versioning cannot silently produce that mismatch.
+named DLL sits right beside it. When the two disagree the CMake builds from a corrected copy of the
+`.def` (in the build tree), so a future re-versioning cannot silently produce that mismatch.
 
 **5. Copy the header.** Take the upstream `fftw3.h` unmodified, name it
 `include/fftw3-3.3.11-avx2.h`, and leave the small `include/fftw3.h` redirector pointing at it.
@@ -248,10 +250,9 @@ library itself rather than the plugin's use of it.
 in the other DLL, run it again. The exe is not rebuilt between runs — only the file on disk changes.
 The substitute must carry the **same file name** as the one the exe was linked against, because the
 module loader resolves the import by name; the probe prints the real `fftwf_version` and the
-resolved full path, so a mislabelled file cannot pass unnoticed. (The CMake comment that introduces
-this probe refers to a "3.3.5 → 3.3.11 AVX2 comparison"; no numbers for that comparison are kept in
-this README. The probe prints them per machine, and they move with the CPU and with FFTW's own
-version.)
+resolved full path, so a mislabelled file cannot pass unnoticed. (No FFTW-vs-FFTW numbers are kept in
+this README — the CMake comment that introduces the probe says the same. The probe prints them per
+machine, and they move with the CPU and with FFTW's own version.)
 
 ## Replacing it with a different FFTW build
 
@@ -267,7 +268,7 @@ obvious, so they are listed explicitly.
 |---|---|---|
 | `<ROOT>/include/fftw3.h` | yes | the include name every consumer writes. Can be the real header or a redirector |
 | `<ROOT>/include/fftw3-<tag>.h` | optional | used in preference to `fftw3.h` when it exists; this is how the header gets version-stamped |
-| `<ROOT>/lib/<stem>-<tag>.def` | optional | needed only if the `.lib` has to be generated |
+| `<ROOT>/lib/<stem>-<tag>.def` | optional | needed only if the `.lib` has to be generated (it is then generated into the build tree) |
 | `<ROOT>/lib/<stem>-<tag>.lib` | yes (unless `DYNAMIC`) | the import library. Under `DYNAMIC` the configure fails only if the *header* is missing |
 | `<ROOT>/bin/<stem>-<tag>.dll` | yes in practice | also accepted in `lib/` or in `ROOT` itself. Without it the configure warns, and the plugin then loads whatever else it can find |
 | `<ROOT>/VERSION` | optional | provenance only; feeds four log lines and one CMake target property |
@@ -283,11 +284,16 @@ obvious, so they are listed explicitly.
    `3.3.11` as text), and silently linking the wrong FFTW is exactly the mistake the tag exists to
    prevent. With exactly one, the tag is inferred from its file name; with none, the legacy
    unversioned layout (`libfftw3f-3.{dll,lib,def}` + `include/fftw3.h`) is assumed.
-3. **The `.def`'s `LIBRARY` line is rewritten for you** when it disagrees with the DLL name, so a
-   copy that kept upstream's `LIBRARY fftw3f.dll` line is corrected at configure time.
-4. **The `.lib` is regenerated when the `.def` is newer.** But this only happens under MSVC and only
-   if `lib.exe` can be found on `PATH`. Otherwise the configure warns and keeps whatever `.lib` was
-   there — which is why a `.lib` that does not match its `.def` is worth checking by hand.
+3. **The `.def`'s `LIBRARY` line is corrected for you** when it disagrees with the DLL name, so a
+   copy that kept upstream's `LIBRARY fftw3f.dll` line still works. The vendored file is not edited:
+   the corrected `.def` and the `.lib` built from it go to `<build>/td_deps/fftw3/`. (Earlier
+   revisions rewrote the files here whenever the `.def` was not older than the `.lib`, which after
+   every git checkout left the vendored `.lib` permanently "modified".)
+4. **A `.lib` is generated only when the vendored one is missing or its `.def` names the wrong
+   DLL** — not on timestamps. This only happens under MSVC and only if `lib.exe` can be found on
+   `PATH`; otherwise the configure warns and uses whatever `.lib` is there. A vendored `.lib` whose
+   `.def` has the right `LIBRARY` line is used as-is even if the export list changed, which is why a
+   `.lib` that does not match its `.def` is worth checking by hand.
 5. **`DYNAMIC` does not mean "nothing links this".** The plugin does not link it, but the headless
    executables do: `_td_add_console()` links `TD_PLUGIN_FFTW3_LINK` into `fft_tests`,
    `fft_bench` and the probes, and defines `FFTW_DLL` for them, because they are single-backend by
@@ -305,8 +311,8 @@ obvious, so they are listed explicitly.
    different version logs a `** MISMATCH` warning (it still runs).
 
 **The symbol set the plugin actually needs.** All of it is resolved at run time; nothing is linked.
-Twelve `fftwf_` symbols are looked up for the FFTW3 backend, plus one non-FFTW symbol on the oneMKL
-path:
+Thirteen `fftwf_` symbols are looked up (the same list for both backends), plus one non-FFTW symbol
+on the oneMKL path:
 
 | symbol | required? | role |
 |---|---|---|
@@ -314,6 +320,7 @@ path:
 | `fftwf_plan_dft_r2c_1d`, `fftwf_execute_dft_r2c`, `fftwf_destroy_plan` | **required** | plan, run, destroy. Together with the allocator pair these are the five `FftApi::complete()` demands, and a library missing any of them is rejected |
 | `fftwf_import_wisdom_from_filename`, `fftwf_export_wisdom_to_filename` | optional | required *together* to count as a working wisdom cache |
 | `fftwf_sprint_plan` | optional | the only runtime way to see which SIMD kernels the library chose |
+| `fftwf_set_timelimit` | optional | caps the background `FFTW_PATIENT` measurement at 1.5 s (v2.10). Process-global planner state, so it is set and reset inside one planner-mutex section; without it PATIENT simply runs unbounded |
 | `fftwf_init_threads`, `fftwf_plan_with_nthreads` | optional | resolved for their **existence only**, never called. Their presence is reported as "threads API present (unused)" |
 | `fftwf_version`, `fftwf_cc` | optional | **data** symbols, read as C strings |
 | `MKL_Set_Threading_Layer` | optional | oneMKL only, and only when the descriptor asks for it. Not an `fftwf_` symbol at all |
@@ -404,20 +411,42 @@ the real array, so the question cannot arise.
 ## Using Intel oneMKL instead (the FFT Backend toggle)
 
 The node's **FFT Backend** toggle (Performance page) switches between this vendored FFTW3 build and
-Intel oneMKL's FFTW3 interface, at run time, on the same node. Measured on this project's bench on an
-i9-13900H (6 visible cores, AVX2, no AVX-512), same binary, `--fft 16384 --bins 16384`, only the
-library differing:
+Intel oneMKL's FFTW3 interface, at run time, on the same node. Measured for v2.9.0 (2026-09-21) on
+this project's bench on an i9-13900H (6 visible cores, AVX2, no AVX-512), same binary,
+`--fft 16384 --bins 16384`, only the library differing:
 
 | library | fft+mag | total per cook |
 |---|---|---|
 | FFTW3 3.3.11 AVX2, `FFTW_MEASURE` plan from wisdom | 11.94 µs | 21.06 µs |
 | Intel oneMKL 2026.1.0 | 8.85 µs | 17.63 µs |
 
-Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** every time (absolute
-times move with laptop thermals; the direction did not). oneMKL is the faster of the two on this
-Intel CPU, and it is the reason the toggle exists. The same numbers appear in the project
-`CHANGELOG.md`, which is where the "13-34 %" and the "8.85 µs vs 11.94 µs in the first pair" figures
-are recorded; they are not re-derived here.
+Four paired runs each way put oneMKL **13–34 % faster on the fft+mag stage** every time
+(absolute times move with laptop thermals; the direction did not). A re-measurement on 2026-09-23,
+median of 3 pinned runs across three sizes, agrees:
+
+| N | FFTW3, `FFTW_MEASURE` plan | Intel oneMKL | oneMKL faster by |
+|---|---|---|---|
+| 8192 | 4.71 µs | 3.87 µs | 18 % |
+| 16384 | 11.55 µs | 8.41 µs | 27 % |
+| 32768 | 23.65 µs | 17.73 µs | 25 % |
+
+An `FFTW_PATIENT` plan narrows the gap but does not close it: 9.70 µs at 16K, so oneMKL still leads
+by ~13 %. oneMKL is the faster of the two on this Intel CPU, and it is the reason the toggle exists.
+FFTW3 stays the default because it is 3 MB, vendored, and wisdom-cached; oneMKL loads 5 DLLs
+(~177 MB) and spends ~39 ms initialising once per process. Both sets of numbers are recorded in the
+project [`CHANGELOG.md`](../../../../CHANGELOG.md) (the 2026-09-23 set under "FFT backend and plan
+flags"); they are not re-derived here.
+
+**To repeat the A/B, pass the backend by name:** `fft_bench --backend mkl` or `--backend fftw3`. A
+number is not accepted — `--backend 1` prints one "unknown --backend" line and runs FFTW3, so both
+halves of the comparison measure the same library. An earlier 2026-09-23 comparison made exactly that
+mistake and briefly concluded the opposite.
+
+The FFTW3 plan itself was checked the same day, and the current setup is already the fastest
+execute: an out-of-place plan that preserves its input (the r2c default). `FFTW_DESTROY_INPUT` plus
+re-zeroing the pad every frame is 1–5 % slower, and in-place plus re-zeroing is 10–20 % slower.
+`FFTW_PATIENT` executes 10–15 % faster than `FFTW_MEASURE` at 16K/32K; that is what **FFT Planner =
+Patient** buys, at a one-time ~1.5 s background plan per size that is then cached in wisdom.
 
 ### Why the oneMKL backend reports "FFTW 3.3.4", and why that is not out of date
 
@@ -444,9 +473,12 @@ exports **78**, but oneMKL lacks every post-3.3.4 addition — `fftwf_copy_plan`
 oneMKL 2026.0's release notes list DFT optimizations for power-of-two 1-D complex transforms, which
 is exactly this node's workload.
 
-**Nothing the plugin uses is missing.** The plugin resolves **twelve** `fftwf_` symbols at run time,
-plus one non-FFTW symbol on the oneMKL path (`MKL_Set_Threading_Layer`). All twelve are exported by
-`mkl_rt.3.dll`. Ten of the twelve are also exported by the vendored `libfftw3f-3.3.11-avx2.dll`; the
+**Nothing the plugin uses is missing.** The plugin resolves **thirteen** `fftwf_` symbols at run
+time, plus one non-FFTW symbol on the oneMKL path (`MKL_Set_Threading_Layer`). The original twelve
+are exported by `mkl_rt.3.dll`; the thirteenth, `fftwf_set_timelimit` (added in v2.10), is listed in
+the vendored `.def` and its name is present in `mkl_rt.3.dll` too (a string search, not a `dumpbin`
+check — and it is optional, and only ever called on the FFTW3 path, since oneMKL never runs a PATIENT
+measurement). Eleven of the thirteen are exported by the vendored `libfftw3f-3.3.11-avx2.dll`; the
 two exceptions are `fftwf_init_threads` and `fftwf_plan_with_nthreads`, which that build does not
 export because it was configured `-DENABLE_THREADS=OFF`. Both are **optional** — they are resolved
 for their existence only and never called — so their absence costs nothing and cannot produce a null
@@ -456,7 +488,7 @@ note on the FFTW3 side. The five *required* symbols (`fftwf_malloc`, `fftwf_free
 libraries, which is the property that actually matters.
 
 (An earlier revision of this file said "all 19 real functions it resolves are exported by both
-DLLs". The count was wrong — it is twelve, not nineteen — and the blanket "by both" was wrong for
+DLLs". The count was wrong — it was twelve at the time, not nineteen — and the blanket "by both" was wrong for
 the two threads entry points. The conclusion it was drawn for still holds, for the five required
 symbols.) The three symbols that appear only as type names (`fftwf_complex`, `fftwf_plan`,
 `fftwf_wisdom`) are typedefs in the header and are correctly exported by neither. `fftwf_cleanup`
@@ -464,44 +496,55 @@ and `fftwf_forget_wisdom` are exported by both but appear only in a comment in `
 deliberately, for the process-global reason given there.
 
 What the MKL backend *does* cost is plan control: oneMKL picks its own plan, so `FFT Planner`
-(Estimate / Measure / Patient) has no effect and `FFTW_WISDOM_ONLY` and the wisdom file are no-ops.
+(Auto / Fast / Measured / Patient, on the Spectrum page) has no effect and `FFTW_WISDOM_ONLY` and the wisdom file are no-ops.
 The log line says so rather than leaving it to be discovered by A/B. The only
 way to get plan control *and* Intel's kernels would be oneMKL's native DFTI interface
 (`DftiCreateDescriptor` / `DftiComputeForward`), which is a separate engine behind `IFFTEngine` and a
 much larger change than the toggle — worth it only if the plan policy turns out to matter here more
-than the ~35 % stage win does.
+than the 18–27 % transform win does.
 
-**oneMKL is not redistributed here.** It is **521 MB** of Intel-licensed binaries (16 `mkl_*.dll`
-plus `libimalloc.dll`, extracted from the 165.9 MB `intelmkl.redist.win-x64` 2026.1.0.226 package)
-and the ISSL requires its notice files to ship with it, which is the user's call to make, not a
-build script's. To enable the toggle on a machine:
+**oneMKL is not redistributed here.** The `intelmkl.redist.win-x64` 2026.1.0.226 package (165.9 MB
+download) extracts to **17** runtime DLLs, **521 MB** (16 `mkl_*.dll` plus `libimalloc.dll`); the
+14 this plugin can use come to **456 MB**. They are Intel-licensed binaries and the ISSL requires
+their notice files to ship with them, which is the user's call to make, not a build script's. To
+enable the toggle on a machine:
 
 1. Get the runtime DLLs — `intelmkl.redist.win-x64` from nuget.org, or the oneMKL component of the
    oneAPI toolkit (https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html).
-2. Copy these next to `FFT.dll` (into `Plugin_FFT/__Plugins__/FFT/`), all the same version:
-   `mkl_rt.3.dll`, `mkl_core.3.dll`, `mkl_def.3.dll`, `mkl_mc3.3.dll`, `mkl_avx2.3.dll`,
-   `mkl_avx512.3.dll`, `mkl_avx10.3.dll`, `mkl_sequential.3.dll`, `mkl_intel_thread.3.dll`,
-   `mkl_tbb_thread.3.dll`, the `mkl_vml_*.3.dll` set, and `libimalloc.dll` — i.e. copy every DLL in
-   the package's `runtimes/win-x64/native` directory, which is exactly the 17 above.
+2. Copy these next to `FFT.dll` (into `Plugin_FFT/__Plugins__/FFT/`), all the same version — **14 files, 456 MB**:
+   `mkl_rt.3.dll`, `mkl_core.3.dll`, `mkl_sequential.3.dll`, the CPU kernel set `mkl_def.3.dll`,
+   `mkl_mc3.3.dll`, `mkl_avx2.3.dll`, `mkl_avx512.3.dll`, `mkl_avx10.3.dll`, and the matching VML set
+   `mkl_vml_def.3.dll`, `mkl_vml_mc3.3.dll`, `mkl_vml_avx2.3.dll`, `mkl_vml_avx512.3.dll`,
+   `mkl_vml_avx10.3.dll`, `mkl_vml_cmpt.3.dll`.
    *(The `.3` suffix is the ABI version oneMKL 2026.x uses; 2025.x is `.2`, 2020.4 and earlier are
    unversioned. The plugin looks for `mkl_rt.3.dll`, then `mkl_rt.2.dll`, then `mkl_rt.dll`.)*
-   **Only the `mkl_rt` name matters for loading; the rest are shipped so that the code path Intel
-   dispatches to exists on whatever CPU the project is opened on.** Kernel DLLs are
-   architecture-specific and oneMKL loads its layer and kernels at run time.
+   **Only the `mkl_rt` name matters for loading; the kernel and VML sets are shipped so that the code
+   path Intel dispatches to exists on whatever CPU the project is opened on.** Measured on the
+   i9-13900H (AVX2, no AVX-512) with the backend live, the process loads exactly five of them:
+   `mkl_rt`, `mkl_core`, `mkl_sequential`, `mkl_avx2`, `mkl_vml_avx2` (~177 MB). An AVX-512 or older
+   CPU picks the `avx512`/`avx10` or `def`/`mc3` variants instead, which is why those stay.
+   **Not needed, and removed from the deployment (2026-09-23):** `mkl_intel_thread.3.dll` and
+   `mkl_tbb_thread.3.dll` (the plugin forces the sequential layer at load, see below, so neither can
+   ever be loaded; the TBB one would also need a `tbb12.dll` that is not shipped) and
+   `libimalloc.dll` (never loaded by the FFT path). The redist package contains all 17; copying the
+   three extra files is harmless but wastes ~66 MB.
    **`libiomp5md.dll` is not on this list and the redist does not ship one** — see the two
    deliberate decisions below. This list used to name it, which was wrong twice over: it is not in
    the package, and asking for it would have produced the Error #15 described below on purpose.
 3. Copy the notices too — the package's `license.txt` and `share/doc/mkl/licensing/`, which
    require attribution (`third-party-programs.txt` is the one that matters here). The ISSL permits
    redistribution but requires these to travel with the DLLs. On this machine they live in
-   `__Plugins__/FFT/oneMKL-licenses/` beside the DLLs, and `.gitignore` keeps the whole
-   deployment out of the repository.
+   `__Plugins__/FFT/oneMKL-licenses/` (`license.txt` and `third-party-programs.txt`) beside the
+   DLLs, and `.gitignore` keeps the whole deployment out of the repository.
 4. Open the node's Performance page and turn **FFT Backend** on. The Info DAT row `fft_backend` and
    the textport log name the library, its path and its version, so there is no doubt which one ran.
+   In the textport (v2.12), every plan still gets its own `[oneMKL] plan N=... in x ms` line, but the
+   long backend description is printed once per backend, and after that only a short kernel note,
+   and only when the chosen kernels change — so a resize does not repeat the whole description.
 
 Where the plugin looks for them is **its own directory, not `build/bin`**: `loadBackend()`'s
 directory argument defaults to `pluginDirectory()`, and the library is opened with
-`LOAD_WITH_ALTERED_SEARCH_PATH` so oneMKL finds its 16 sibling DLLs in that same folder without any
+`LOAD_WITH_ALTERED_SEARCH_PATH` so oneMKL finds its sibling DLLs in that same folder without any
 `PATH` entry. Staging them in `build/bin/Release` (what the bench and the tests resolve against)
 therefore proves the backend works but does **not** make it work in TouchDesigner — that needs the
 copy into `__Plugins__/FFT/`.
@@ -530,5 +573,10 @@ that node — it never leaves the node without a plan.
 
 ## License
 
-FFTW is GPL. oneMKL is under the Intel Simplified Software License and is not distributed with this
-project. See §"License / third party" in the project README.
+FFTW is GPL, and the vendored DLL is deployed beside `FFT.dll`, so distributing the plugin falls
+under the GPL. Note what is **not** here yet: this directory holds no copy of FFTW's `COPYING`, and
+the repository has no `LICENSE` file of its own. Adding both — a `LICENSE` for Plugin_FFT, and
+FFTW's `COPYING` shipped with `libfftw3f-3.3.11-avx2.dll` — is planned in
+[`INSTALLER_PLAN_2026-09-23.md`](../../../../INSTALLER_PLAN_2026-09-23.md) §6. oneMKL is under the
+Intel Simplified Software License and is not distributed with this project. See §"License / third
+party" in the [project README](../../../../README.md).

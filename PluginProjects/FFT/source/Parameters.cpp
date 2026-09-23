@@ -252,7 +252,7 @@ const char* kWinmodeNames[]    = { "Samples", "Milliseconds" };
 const char* kWinmodeLabels[]   = { "Samples (Window Sampling)", "Milliseconds (Window Length ms)" };
 const char* kPlannerNames[]    = { "Auto", "Fast", "Measured", "Patient" };
 const char* kPlannerLabels[]   = { "Auto (instant plan, measured plan upgraded in background)", "Fast (Estimate only, never stalls)", "Measured (blocking measure once per size, wisdom cached)",
-                                   "Patient (instant plan, FFTW_PATIENT measured in background ~3 s once per size, wisdom cached)" };
+                                   "Patient (instant plan, FFTW_PATIENT measured in background, capped at 1.5 s once per size, wisdom cached)" };
 const char* kMagnormNames[]    = { "Coherentgain", "Fullscale" };
 const char* kMagnormLabels[]   = { "Coherent Gain (mean(window) = 1)", "Full Scale (sine amplitude 1 -> 1.0)" };
 const char* kDbrefNames[]      = { "Framepeak", "Dbfs", "Agc" };
@@ -348,7 +348,7 @@ void setup(TD::OP_ParameterManager* manager)
 	// lowest audible frequency - computeTargetHzGrid() in DSPModules.h uses 20 Hz for the same reason
 	// when it floors the Chroma axis.
 	// v2.10: the Quality Preset heads the page - when it is not Custom it overrides Zero-Pad Len, Warp
-	// Interpolation, Output Bins Mode, Kaiser Beta Mode and Warp Aggregation (greyed out accordingly).
+	// Interpolation, Kaiser Beta Mode and Warp Aggregation (greyed out accordingly); never the output count.
 	appendMenu (manager, "Spectrum", PresetName,     PresetLabel,     kPresetNames,   kPresetLabels,   static_cast<int>(Preset::Custom));
 	appendMenu (manager, "Spectrum", ChanmodeName,   ChanmodeLabel,   kChanmodeNames, kChanmodeLabels, static_cast<int>(ChanMode::MonoMix));
 	appendToggle(manager, "Spectrum", RawbinsName,   RawbinsLabel,    false);

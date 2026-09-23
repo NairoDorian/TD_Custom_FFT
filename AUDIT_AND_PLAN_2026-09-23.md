@@ -1,5 +1,11 @@
 # Plugin_FFT — Audit, Current State & Progression Plan (2026-09-23)
 
+> **Read this first.** This audit is dated 2026-09-23 and describes the **pre-v2.10 state** (v2.9.1);
+> §0 and §1 are kept as that record, not updated. For what has shipped since, see the Status addendum
+> at the end of §4 and `CHANGELOG.md` v2.10.0–v2.12.0. The two retired performance docs
+> (`FFT_REALTIME_OPTIMIZATION_ANALYSIS.md`, `FFT_REALTIME_PERFORMANCE_ROADMAP.md`) are gone; what
+> they said that is still valid is in **Appendix B**, and their full text is in git history.
+
 > **What this is.** A full-read review of `Plugin_FFT` (v2.9.1, HEAD `71c13b8` + an uncommitted
 > comment-only working tree), ending in a phased plan whose centre of gravity is **real-time cost and
 > real-time quality**. No code was changed.
@@ -161,7 +167,8 @@ The cost of the oversampling is measured in §1.1:
   largest term and is not measured here. It is paid on TD's main thread for every sample.
 
 **The biggest real-time lever in the project is Output Bins**, and the roadmap has left it open since
-v2.3 (item 1.4, "Bins = Auto"). It needs R2 to be correct.
+v2.3 (item 1.4, "Bins = Auto"; the roadmap is now retired, see Appendix B / git history). It needs R2
+to be correct.
 
 **R2 — The warp point-samples; it never aggregates.** Verified in code; the consequence is inferred.
 - `buildWarpTables` gives each output bin an `(i0, w)` pair (`DSPModules.h:1357-1393`), and
@@ -293,6 +300,11 @@ spot-checked.
 
 Fix the Bark inverse there and generate golden vectors offline into a committed header.
 
+> **Update (2026-09-23, later).** The Bark inverse was fixed in the v2.10 work (commit `8e18b41`).
+> `Audio_Live2.py:316` now reads `(z + 4.422) / 1.22`, matching the C++. The `FFT_REFERENCE/`
+> folder was then removed from the repository on 2026-09-23. It is kept locally and gitignored
+> (`.gitignore:77`), so the golden-vector idea would need its source vendored back in first.
+
 ### 2.4 🟡 Threading and memory model (latent, all currently benign on x64/MSVC)
 
 - **T1.** `AnalysisPipeline::backendInfo()` reads `myBackend`, a plain pointer, from the Info thread
@@ -338,7 +350,8 @@ Fix the Bark inverse there and generate golden vectors offline into a committed 
 
 - **Documentation entropy.** There are five overlapping markdown files, roughly 270 KB. The two perf
   documents are now mostly "Correction to the correction" blocks and history, and the source is about
-  60–70 % comments by volume, a lot of it version history.
+  60–70 % comments by volume, a lot of it version history. (Both perf documents were retired later the
+  same day; their still-valid content is in Appendix B, the rest is in git history.)
   - The *content* is honest and valuable.
   - The *shape* makes the real contract hard to find, and every doc pass risks drift. F4 is exactly
     that.
@@ -409,7 +422,7 @@ project already does well. Effort: S ≤ ½ day, M ≤ 2 days, L > 2 days.
 | # | Item | Effort | Accept when |
 |---|---|---|---|
 | 2.1 | **R2: an aggregating warp.** Per output bin `[lo,hi]`; `max` (default) or power-mean where `hi-lo > 1`, interpolation elsewhere; AVX2 | M | New test: a tone swept across 200 positions at 1024 and 2048 bins has peak-level ripple < 0.5 dB (point-sampling today: expect several dB); warp ≤ 2 µs at 2048 bins |
-| 2.2 | **`Output Bins = Auto`** (roadmap 1.4). Choose `n_out` so the output spacing ≈ ½ main-lobe width at every frequency, capped by a user maximum | M | Default output ≤ 2048–4096 bins with no visible loss against 16384 (A/B screenshot + peak test); cook ≤ 6 µs mean |
+| 2.2 | **`Output Bins = Auto`** (retired roadmap 1.4; see Appendix B / git history). Choose `n_out` so the output spacing ≈ ½ main-lobe width at every frequency, capped by a user maximum | M | Default output ≤ 2048–4096 bins with no visible loss against 16384 (A/B screenshot + peak test); cook ≤ 6 µs mean |
 | 2.3 | **Q1: `Kaiser Beta = Auto`** from `dB Range Floor` (β ≈ 0.1244·(A+6.3)); keep the manual override | S | At 80 dB: β ≈ 10.7, main lobe −27 %; a sidelobe test shows the floor still below range |
 | 2.4 | **Quality preset menu** (`Custom / Visual 60 fps / Visual 120 fps / Analysis`) that sets pad, bins, interpolation and β together (e.g. Visual = N 8192, cubic, Auto bins, Auto β) | S | Visual preset: worker ≤ 12 µs, cook ≤ 6 µs, and a 2-bin-separated test tone pair still resolved at 200 Hz |
 | 2.5 | **Q3: dB-domain interpolation option** (and \|X\|² → 10·log10 skipping sqrt when dB is on) | S | dB-mode DSP −1–2 µs; visual A/B |
@@ -448,11 +461,48 @@ project already does well. Effort: S ≤ ½ day, M ≤ 2 days, L > 2 days.
 The phase-2 figures come from the measured 2048-bin and N 8192 cubic rows in §1.1. The aggregating
 warp adds ~1–2 µs, which is inferred.
 
+### Status addendum (end of 2026-09-23): what shipped, and Phase 5
+
+Shipped in **v2.10.0–v2.12.0** (details in `CHANGELOG.md`):
+- **Phases 0–1** in full.
+- **2.1** (aggregating warp), **2.3** (Auto β), **2.4** (quality presets), **2.6** (`IngestCursor`),
+  **2.7** (planner graveyard + `try_lock` + PATIENT time limit), **2.8** (enable states).
+- **3.1** (Worker Wake Poll/Signal + MMCSS), **3.3** (`analysis_latency` Info row).
+- **4.2** (spectral features).
+- **2.2** was redefined by the user in v2.11. Output Bins Mode **Auto = N/2+1 of the (zero-padded) FFT**,
+  and it is the default. **Fixed** = exactly Output Bins (upsampling allowed). The Raw RFFT Bins and
+  Zero-Padding toggles were added.
+- The resolution-derived count described in 2.2 above is gone. Output-count semantics are the user's
+  call; never change them for performance.
+- **v2.12** added the AVX2/FMA pass (A/B-measured, full chain 1.64×) and corrected the FFTW vs oneMKL
+  figures: **oneMKL is 18–27 % faster**.
+
+**Still open:** 2.5 (dB-domain interpolation), 3.2/3.4, 4.1 (multi-resolution), 4.3 (TOP), 4.4 (phase),
+4.5.
+
+**Phase 5: from the EssentiaTD review and the installer plan (2026-09-23)**
+
+Sources: `ESSENTIATD_LESSONS_FOR_PLUGIN_FFT_2026-09-23.md` (§ numbers below refer to it) and
+`INSTALLER_PLAN_2026-09-23.md`.
+
+| # | Item | Effort | Accept when |
+|---|---|---|---|
+| 5.1 | **Don't publish a job on a stale cook** (no fresh samples): hold the last result (lessons §2.1) | S | Test: the input cooks every 2nd frame, so flux never reads 0 on held frames and ballistics don't advance on held frames |
+| 5.2 | **Ballistics dt from audio time** (fresh samples / sr), not `deltaMS` (lessons §2.2) | S | Same attack/release trajectory at 735 / 882 / 1470-sample timeslices, within 1 % |
+| 5.3 | Sanitize `timeInfo->rate` (finite, 1..1000, else 60) wherever it is read | XS | A unit test with NaN / inf / 1e9 |
+| 5.4 | **Warning slots** + **coverage warning** (window < samples per cook) + `analyzed_fraction` and `true_resolution_hz` Info rows (lessons §3, §2.3, §1.1) | S | Two warnings coexist; the coverage warning fires at 1600 > 1024 and not at 800 < 1024 |
+| 5.5 | **Headless `FFT::execute()` harness** (EssentiaTD `TDStubs.h` pattern) and cook-path tests | M | 5.1–5.4 are tested through the shipped `execute()` |
+| 5.6 | HFC (nearly free in `featureSums`), mel band energies, MFCC-13 | M | Each against an independent reference; the allocation gate stays green |
+| 5.7 | SuperFlux novelty on a short sub-window + optional adaptive onset pulse (time-based) | M | Onset F1 on a click track ≥ plain flux; no vibrato false positives on a test tone |
+| 5.8 | **Installer** (Inno Setup, per-user, core + optional oneMKL component, TD-running / AVX2 / VC++ runtime checks); add a LICENSE and ship FFTW's COPYING first | M | Windows Sandbox install → node loads → uninstall clean (installer plan §8) |
+| 5.9 | Check whether TD `LoadLibrary`s every DLL in the Plugins tree at start-up (the 14 oneMKL DLLs: 3 core + 5 CPU kernels + 6 VML); relocate oneMKL if so | S | TD cold-start time with and without the oneMKL set, measured |
+
 ---
 
 ## 5. Things measured before that should not be re-optimised
 
-These are from the existing roadmap and CHANGELOG and remain valid:
+These are from the roadmap (now retired; see Appendix B / git history) and CHANGELOG and remain valid.
+Appendix B.1 adds the other measured facts the retired docs held:
 - FFTW threads (13–51 % slower on a single 1-D transform).
 - `FFTW_DESTROY_INPUT` (slower).
 - PATIENT as the default (−12 % execute for 2.7 s of planning, so it stays opt-in).
@@ -491,3 +541,101 @@ These are from the existing roadmap and CHANGELOG and remain valid:
   Log / blend 0.963 / floor 20 Hz.
 - **Kaiser figures** use the main-lobe half-width `√(1+(β/π)²)·fs/L` and the Kaiser design relation
   for attenuation (approximate for a window's peak sidelobe).
+
+---
+
+## Appendix B — Carried over from the retired performance docs (2026-09-23)
+
+`FFT_REALTIME_OPTIMIZATION_ANALYSIS.md` (**ANA**) and `FFT_REALTIME_PERFORMANCE_ROADMAP.md` (**RM**)
+were deleted on 2026-09-23. Most of their content was either history (already in `CHANGELOG.md`) or
+plan items that have since shipped (§4 addendum). This appendix keeps only what is **still true at
+v2.12.0** and **not already said** in this audit or the CHANGELOG. Each item was re-checked against
+`PluginProjects/FFT/source/` today. Full text: `git show 8e18b41:FFT_REALTIME_PERFORMANCE_ROADMAP.md`
+(same for the other file).
+
+Caveat on old numbers: unless marked i9, the figures from those docs were taken on the original
+i7-class development machine at N = 32768. Trust the ratios; the absolute µs cannot be compared with §1.1.
+
+### B.1 Measured or verified facts (adds to §5; do not re-optimise these)
+
+- **FTZ/DAZ is already in place, on both threads.** `FFTDSP::DenormalGuard` sets MXCSR `0x8040`
+  (`DSPModules.h:224-226`). If the cook time spikes on digital silence, a new float path is running
+  outside a guard. That is a coverage regression: fix the coverage, do not add a second FTZ.
+  (RM §1.2, §4 step 5)
+- **Aligned and unaligned loads compile to the same code on MSVC (`vmovups`).** The 32-byte
+  `AlignedAllocator` is there for portability and as an explicit contract, not for speed. The
+  contract is still real: an unaligned input to a `_mm256_load_ps` kernel **faults**, it does not
+  merely run slower (`DSPModules.h:1915`). New kernels take `AlignedVector` inputs.
+  (RM §3; ANA §7 item 2)
+- **The silence short-circuit is narrow on purpose.** It only fires when
+  `silent && Loudness == Off && !ballEnable` (`AnalysisPipeline.cpp:376`): a dB mode must still publish
+  its floor, and ballistics must still decay. Widening the condition would be a correctness bug, not a
+  speed-up. (RM §1.5)
+- **"Magnitude only up to the warp's max bin" saves nothing at the defaults.** It exists
+  (`AnalysisPipeline.cpp:307`), but Display Max defaults to 24000 Hz (`Parameters.h:465`), which is
+  above the 22.05 kHz Nyquist at 44.1 kHz. The saving only appears when Display Max sits below Nyquist,
+  so do not count it in a default-configuration budget. (RM §1.9)
+- **A slow SIMD loop is not proof that SIMD is wrong.** The pre-`adc8945` SIMD dB loop measured slower
+  than scalar because every vector took a store/reload round trip through `alignas(32)` stack
+  temporaries. The fix was a better vector kernel. The v2.12 register-spill results are the same
+  lesson: read the assembly before concluding anything. (ANA §5.2)
+
+### B.2 Rejected or closed ideas, and why (so nobody tries them again)
+
+- **Update-rate divider / hop control** (`Update Every N Cooks`, and the `Min Hop ms` variant that was
+  never built). §5 lists it as removed; here is why. The divider only skipped *worker* jobs. The cook
+  thread pays for ingest and the copy on every frame either way, so it halved the spectrum rate and
+  bought no frame-budget saving (CHANGELOG v2.7.0). It is now doubly wrong, because it would also
+  change what the flux and onset features mean. If a node's total CPU ever matters, 5.1 (don't publish
+  on a stale cook) is the principled version of the same idea. (RM §1.6)
+- **`cookEveryFrameIfAsked` to save idle cooks.** RM §3 said it cost nothing and only avoided unused
+  cooks. That is **superseded**. With it, an unpulled node never reaches the Info, warning or error
+  callbacks, and the popup comes up empty (CHANGELOG v2.9.0, `FFT.cpp:239-263`). `cookEveryFrame =
+  true` is load-bearing. (RM §3)
+- **In-place r2c to shrink the cache footprint.** Both docs listed this as the open footprint idea.
+  v2.12 measured in-place execution with the per-frame re-zero at 10–20 % slower (CHANGELOG v2.12,
+  "FFT backend and plan flags"), so it is closed.
+  - Footprint for reference (derived from `DspState`, `AnalysisPipeline.h:182-184`, not measured):
+    at N 16384 with Auto bins, one channel is ≈ 64 KB padded frame, 64 KB complex scratch, 32 KB each
+    for magnitude, previous spectrum, previous linear (features only) and the result, plus the shared
+    warp tables. That is roughly 0.25–0.3 MB, well inside a P-core L2.
+  (RM §1.10, ANA §7.1)
+- **FFTW_EXHAUSTIVE, or a size-adaptive planner.** EXHAUSTIVE caused multi-second plan stalls (the
+  "32 s at N 16384" figure was never re-verified). There is no size threshold anywhere in the tree,
+  so do not go looking for one. The planner is a user policy (`Auto`/`Fast`/`Measured`/`Patient`)
+  plus a background upgrade and wisdom. That combination removed the stall/quality trade-off
+  instead of choosing a side of it. (ANA §1 entries 1, 8, 10, 13; §6.2)
+- **Sliding or recursive DFT on the log grid:** O(bins) work per *sample* (16384 × 735 per frame),
+  orders of magnitude worse than one FFT. The arithmetic settles it. (RM Tier 3)
+- **GPU FFT (cuFFT / VkFFT) for the transform itself.** The estimate: per-frame upload and download
+  (~192 KB per channel at N 32768) plus sync dominate below ~16 channels. It was never measured, and
+  it is a different thing from 4.3, which is GPU *output*. (RM Tier 3)
+- **pffft:** never tried and never ruled out. With the vendored AVX2 FFTW and oneMKL already
+  available (oneMKL 18–27 % faster, §4 addendum), there is no case for a third backend unless GPL
+  removal becomes a goal. (RM §1.8 row 3)
+- **`/fp:contract` spelled out explicitly:** redundant, because `/fp:fast` implies it. (ANA §4)
+
+### B.3 Still-open ideas, and where they would fit
+
+| Idea | Source | Where it fits | Note |
+|---|---|---|---|
+| Batched `fftwf_plan_many_dft_r2c` for `Channels = All Channels` | RM §1.8 row 5, §6 | Phase 4 (new item, after 4.1) | Probe: `howmany = 4` gave 86.3 → 29.9 µs per transform (CHANGELOG v2.7.0). It only helps All Channels; Mono Mix (default) issues one transform. The v2.8.0 path was removed because `fftwf_plan_with_nthreads` mutated global FFTW state. A retry must be single-threaded `plan_many`, built under the planner mutex, and checked against the existing `std::execution::par` fan-out (−38 % at 2 channels). |
+| Unroll `applyWarp` / `applyWarpCubic` to 2 × 8 lanes per iteration | ANA §7.1 | Phase 1.6 perf gate, as a candidate A/B | Both still run one 8-lane block (`DSPModules.h:1476-1530`, `:1656`). After the v2.12 load+permute rewrite, and given that unrolling features ×2 measured 12 % slower (spills), expect nothing. Unmeasured, low priority. |
+| GPU FFT for ≥ 16-channel instances | RM Tier 3 | Phase 4, after 4.3 (it would share the GPU plumbing) | Only if a many-channel use case appears. See B.2. |
+
+### B.4 Measurement protocol additions (for §6)
+
+- **Measure both surfaces.** With Async on, a change can move work between the cook thread
+  (`--cook`, `cook_time_us`) and the worker (per-stage bench, `dsp_time_us`) without changing either
+  total. Report both. (RM §4)
+- **Pin the plan and name the backend.** Pass `--planner fast|measured|patient` so a plan difference
+  cannot pass for a code difference. Check the echoed configuration: an unknown flag name is skipped
+  silently, and an unknown `--planner` value silently falls back to Auto (`bench.cpp:463-465, 496-499`).
+  Only `--backend` warns on an unknown value, and it takes names (`mkl`, `fftw3`). Passing `--backend 1`
+  is how the v2.12 "FFTW faster than oneMKL" mistake happened. (RM §4 step 1)
+- **Null-plugin floor.** A CHOP that outputs zeros at the same bins × channels measures what
+  TouchDesigner itself charges for the output. Nothing in this plugin can go below that. With the DSP
+  on the worker, this floor plus the result copy is most of the cook-thread budget.
+  **TD cook time − `cook_time_us` = host overhead.** (RM §4 steps 3–4)
+- **Silence test.** Feed digital silence and watch for cook-time spikes, as the regression check for
+  B.1's FTZ/DAZ coverage. (RM §4 step 5)
