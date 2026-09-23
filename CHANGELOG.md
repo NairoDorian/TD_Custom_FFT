@@ -38,6 +38,100 @@ performance analysis, see [FFT_REALTIME_OPTIMIZATION_ANALYSIS.md](FFT_REALTIME_O
 
 ---
 
+## [v2.12.0] - 2026-09-23 — AVX2/FMA pass: load+permute warp, branch-free peak, table-free dB log, vector features
+
+Every kernel change was A/B-measured before it was kept: the committed v2.11 `fft_bench` against this
+tree, run interleaved in random order, pinned to one P-core at high priority, 3 rounds on an idle CPU
+(i9-13900H). The table shows medians in µs. Proposals that did not measure faster were not kept (see
+"Evaluated, not kept").
+
+| Metric (µs, median) | v2.11 | v2.12 | Speedup |
+|---|---|---|---|
+| pipeline, full chain (dB + ballistics + features) | 36.35 | 22.20 | **1.64×** |
+| pipeline, plugin defaults | 19.10 | 17.60 | 1.09× |
+| pipeline, Visual 60 preset | 9.90 | 8.90 | 1.11× |
+| cook, synchronous | 28.15 | 25.20 | 1.12× |
+| stage: warp, Log linear, 16384 bins | 4.50 | 2.52 | **1.79×** |
+| stage: warp, Log cubic, 16384 bins | 8.08 | 4.82 | **1.68×** |
+| stage: dB normalised, 16384 bins | 4.22 | 3.58 | 1.18× |
+| stage: peak + index, 16384 bins | 1.26 | 0.94 | 1.34× |
+| stage table total (Log linear, dB, ballistics) | 24.79 | 21.31 | 1.16× |
+
+### Changed (faster)
+- **Warp, linear and cubic: load + permute instead of gather.** i0 is non-decreasing along the axis. When
+  the 8 output bins of a vector read taps inside one 8-float window, which is the fine, upsampled part of
+  the axis (~83 % of the vectors at the 16384-bin Log default), each tap is one unaligned load plus one
+  `vpermps` instead of an 8-element gather. The output is bit-identical to the gather path, and the tests
+  compare every grid against a scalar reference.
+- **Warp with aggregation: the trailing run of aggregated bins is no longer interpolated.** Aggregation
+  overwrites those bins anyway, and they are exactly the gather-heavy coarse part of the axis.
+- **dB: `FastLog2Seg` replaces the 8 KB table gather.** It uses the exponent plus an 8-segment quadratic of
+  the mantissa, with the coefficients fetched by `vpermps` from registers. The constants fold into one
+  FMA per 8 bins, and the reference offset is now exact (`std::log10`, once per call). The maximum error
+  drops from **0.0027 dB to 0.00016 dB**, and there is no gather, which is also the slow instruction on
+  E-cores.
+- **Peak + index: four independent (max, index) vector chains**, with no data-dependent branch. The cost
+  no longer depends on the data: the old filter-and-rescan form cost 4.5 µs on a rising spectrum, and this
+  one costs ~0.9 µs on any spectrum. The first maximum still wins a tie.
+- **Spectral features: vectorised.** The loop is split at the band edges, so there is no per-bin branch.
+  The sums use AVX2 float lanes, flushed to double every 256 bins. The rolloff search skips 64-bin blocks,
+  and the RMS is vectorised. Measured **~16.5 → ~3.5 µs** at 8193 bins. The comment claiming "2–4 µs" for
+  the old loop was wrong.
+- **Ballistics: `applyInPlace` writes the output and the state in one pass.** This removes the extra
+  16384-float `memcpy` per cook in `runChannel`.
+- **Small ones:** `blockIsSilent` masks the sign bit once after the loop (132 → 91 ns).
+  `FastLog10::scaledVec` drops a redundant `& 0xFF`, since its inputs are positive.
+
+### Second pass (same day): reductions and the pass structure after the warp
+These were measured the same way, with in-process microbenchmarks (min of 40 rounds × 3 reps, pinned
+P-core) and interleaved A/B runs of the previous build.
+- **`peakMagnitude`: four independent max accumulators.** With one accumulator every iteration waited on
+  the previous max's 4-cycle latency, so the loop was latency-bound. **2× faster:** 0.41 → 0.21 µs at
+  8193 bins, 0.81 → 0.41 µs at 16384. The dB stage with a Frame Peak reference measured 1.12× faster in
+  the stage A/B.
+- The same fix went into the other single-accumulator reductions: the rolloff block sums, the RMS sum,
+  and the new weighting+max pass.
+- **Weighting and the dB reference peak share one pass** (`multiplyInPlaceMax`): 1.0 → 0.57 µs at 8193
+  bins. With a dBFS reference, the peak pass is skipped entirely, since that reference never used it.
+
+### FFT backend and plan flags (measured, nothing to change)
+- FFTW beats oneMKL at every size: 5.9 / 13.6 / 29.1 µs vs 6.0 / 14.4 / 31.9 µs at N = 8K / 16K / 32K.
+- Preserve-input out-of-place, the current setup, is the fastest execute:
+  - `FFTW_DESTROY_INPUT` plus re-zeroing the pad each frame is 1–5 % slower;
+  - in-place plus re-zeroing is 10–20 % slower.
+- `FFTW_PATIENT` executes 10–15 % faster than `FFTW_MEASURE` at 16K/32K (9.70 vs 10.97 µs at 16K). Choose
+  **FFT Planner = Patient** for it: the one-time 1.5 s background planning per size is then cached in
+  wisdom. It is not the default, because every new pipeline, the test suite's included, would pay that
+  planning up front, and engine teardown waits for it to finish.
+
+### Evaluated, not kept (measured)
+- **One fused kernel for dB + ballistics + the peak search:** 15 % slower with the peak search in it,
+  because ~23 live vectors spill on AVX2's 16 registers. Without the peak search it was 0–4 % faster,
+  since at these sizes the spectrum is L1/L2-resident and the dB loop is ALU-bound. Not worth ~150 lines.
+- **The features log through `FastLog2Seg`:** 4 % slower than the gather table in that ALU-heavy loop,
+  where the gather uses otherwise idle load ports.
+- **Unrolling the features loop ×2:** 12 % slower (register spills).
+- **Hardware `_mm256_sqrt_ps` for the magnitude:** 45 % slower than the existing rsqrt + Newton-Raphson
+  step (1185 vs 820 ns at 8193 bins). A 6-instruction NR variant was not faster either.
+- **`cmp(s, d)` instead of `cmp(diff, 0)` in ballistics:** no change. The loop iterations are independent,
+  so shortening one iteration's dependency chain buys nothing.
+- **Polynomial log2 (degree 3–5) for dB:** 30 % slower than the gather table. The 8-segment form above is
+  what beat it.
+
+### Tests
+- `test_v212_simd_kernels` covers:
+  - both warp kernels vs a scalar reference on five grids (mixed permute/gather, all permute, all gather);
+  - the peak index vs a scalar "first max" for 13 lengths × 4 patterns;
+  - the silence edge cases (-0.0 and denormals);
+  - the dB error bound;
+  - the `FastLog2Seg` error bound, scalar and vector;
+  - the aggregation skip (NaN sentinel: every bin written, and every Peak bin is a real FFT bin);
+  - `applyInPlace` == `apply` + copy, bit for bit;
+  - the features vs the pre-2.12 scalar loop.
+- Result: 744 checks, 0 failures.
+- `bench/perf_baseline.json` was last written while the machine was under load. Regenerate it on an idle
+  machine with `fft_bench --gate bench/perf_baseline.json --update 1`.
+
 ## [v2.11.0] - 2026-09-23 — Output Bins drives the output again; raw rfft bins; zero-padding toggle
 
 The node exists to zero-pad the transform and put its spectrum on any number of output bins, including far

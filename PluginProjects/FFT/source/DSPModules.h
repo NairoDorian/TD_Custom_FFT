@@ -246,12 +246,14 @@ inline bool blockIsSilent(const float* x, size_t n) noexcept {
     size_t i = 0;
 #if defined(__AVX2__)
     __m256i acc = _mm256_setzero_si256();
-    const __m256i mask = _mm256_set1_epi32(0x7FFFFFFF);   // 0x7FFFFFFF: clear the sign bit
     // One early exit after the loop rather than a branch per vector: _mm256_testz_si256 is true
     // only when every lane of the accumulator is zero, i.e. every sample seen was 0.0 or -0.0.
+    // The sign-bit mask is applied once, after the loop: (a & m) | (b & m) == (a | b) & m, so
+    // masking every load was one AND per vector for nothing (measured 132 -> 91 ns at 3175 samples).
     for (; i + 7 < n; i += 8) {
-        acc = _mm256_or_si256(acc, _mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i)), mask));
+        acc = _mm256_or_si256(acc, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i)));
     }
+    acc = _mm256_and_si256(acc, _mm256_set1_epi32(0x7FFFFFFF));   // clear the sign bit: -0.0 is silence
     if (!_mm256_testz_si256(acc, acc)) return false;
 #endif
     for (; i < n; ++i) {
@@ -1459,6 +1461,12 @@ public:
                 m_max_index = std::max(m_max_index, hi);
             }
         }
+        // The trailing run of aggregated bins (on a Log/Mel/... axis: every bin from where the output
+        // spacing passes 2 FFT bins to the top) is fully overwritten by applyAggregation, so the
+        // interpolation pass stops where that run starts - it was computing values nobody reads, and on
+        // the gather path (the coarse part of the axis is exactly where the permute path does not fit).
+        m_interp_end = n_out;
+        for (size_t k = m_agg_idx.size(); k > 0 && m_agg_idx[k - 1] + 1 == m_interp_end; --k) --m_interp_end;
     }
 
     // Fills output_spectrum (resized to the table length) with the warped magnitudes.
@@ -1478,9 +1486,11 @@ public:
         const uint32_t* idx = m_i0.data();
         const float* w_ptr = m_w.data();
         size_t i = 0;
+        // With aggregation on, the bins from m_interp_end up are all overwritten by applyAggregation.
+        const size_t n_interp = (m_agg != 0 && m_interp_end <= n_out) ? m_interp_end : n_out;
         if (m_interp == 1) {
             // Cubic handles its own tail and its own fallback; it never falls through to the loop below.
-            applyWarpCubic(src, dst, idx, w_ptr, n_out, linear_magnitude.size());
+            applyWarpCubic(src, dst, idx, w_ptr, n_interp, linear_magnitude.size());
             applyAggregation(src, linear_magnitude.size(), dst);
             return;
         }
@@ -1493,11 +1503,28 @@ public:
         // callers must still pass at least m_nlin magnitudes. What it does guarantee is that the
         // SIMD path never gathers out of bounds, keeping a caller bug a scalar read rather than a
         // fault inside a vector instruction where the cause is far harder to see.
-        if (linear_magnitude.size() >= m_nlin) {
-            for (; i + 7 < n_out; i += 8) {
-                __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
-                __m256 v0 = _mm256_i32gather_ps(src, vi, 4);
-                __m256 v1 = _mm256_i32gather_ps(src + 1, vi, 4);
+        //
+        // LOAD + PERMUTE instead of GATHER where it fits. i0 is non-decreasing along the axis, so when
+        // the 8 output bins of a vector read taps inside one 8-float window (i0[i+7] - i0[i] <= 7: the
+        // fine, upsampled part of the axis - ~83 % of the vectors at the 16384-bin Log default), the
+        // taps are one unaligned load + one in-register vpermps each instead of an 8-element gather.
+        // Same values, same FMA: the output is bit-identical to the gather path (tests pin it).
+        // Measured 4.0 -> 2.2 us at 16384 bins (i9-13900H P-core). The span test is a well-predicted
+        // branch: it flips once, where the axis becomes coarser than the FFT grid.
+        const size_t src_n = linear_magnitude.size();
+        if (src_n >= m_nlin) {
+            for (; i + 7 < n_interp; i += 8) {
+                const __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
+                const uint32_t base = idx[i];
+                __m256 v0, v1;
+                if (idx[i + 7] - base <= 7 && base + 9 <= src_n) {
+                    const __m256i rel = _mm256_sub_epi32(vi, _mm256_set1_epi32(static_cast<int>(base)));
+                    v0 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base), rel);
+                    v1 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base + 1), rel);
+                } else {
+                    v0 = _mm256_i32gather_ps(src, vi, 4);
+                    v1 = _mm256_i32gather_ps(src + 1, vi, 4);
+                }
                 __m256 w = _mm256_loadu_ps(w_ptr + i);
                 _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(w, _mm256_sub_ps(v1, v0), v0));
             }
@@ -1506,7 +1533,7 @@ public:
         // Scalar tail: handles a non-AVX2 build entirely, and the last <8 bins otherwise.
         // Same formula as the vector block and deliberately written in the same order
         // (v0 + w * (v1 - v0)) so a build with and without AVX2 agrees to the last bit.
-        for (; i < n_out; ++i) {
+        for (; i < n_interp; ++i) {
             size_t i0 = idx[i];
             float w = w_ptr[i];
             dst[i] = src[i0] + w * (src[i0 + 1] - src[i0]);
@@ -1571,7 +1598,7 @@ public:
         for (; k < n; ++k) {
             const size_t lo = alo[k];
             size_t cnt = acnt[k];
-            if (lo >= src_size) continue;                              // caller handed fewer bins than the tables expect
+            if (lo >= src_size) { dst[aidx[k]] = 0.0f; continue; }     // caller handed fewer bins than the tables expect (the bin may not have been interpolated)
             if (lo + cnt > src_size) cnt = src_size - lo;
             const float* p = src + lo;
             if (mode == 1) {
@@ -1622,15 +1649,26 @@ public:
         const __m256i one = _mm256_set1_epi32(1), two = _mm256_set1_epi32(2);
         const __m256 h = _mm256_set1_ps(0.5f), c2 = _mm256_set1_ps(2.0f), c3 = _mm256_set1_ps(3.0f),
                      c4 = _mm256_set1_ps(4.0f), c5 = _mm256_set1_ps(5.0f), fz = _mm256_setzero_ps();
+        // Load + permute where the 8 output bins' taps fit one window (see applyWarp): the four taps
+        // i0-1 .. i0+2 are then four overlapping unaligned loads + vpermps, and none of the edge clamps
+        // can bind (base >= 1 and base + 9 <= last). Bit-identical to the gathers; 7.6 -> 4.8 us at
+        // 16384 bins (i9-13900H P-core).
         for (; i + 7 < n_out; i += 8) {
-            __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
-            __m256i im1 = _mm256_max_epi32(_mm256_sub_epi32(vi, one), v_zero);
-            __m256i ip1 = _mm256_min_epi32(_mm256_add_epi32(vi, one), v_last);
-            __m256i ip2 = _mm256_min_epi32(_mm256_add_epi32(vi, two), v_last);
-            __m256 p0 = _mm256_i32gather_ps(src, im1, 4);
-            __m256 p1 = _mm256_i32gather_ps(src, vi, 4);
-            __m256 p2 = _mm256_i32gather_ps(src, ip1, 4);
-            __m256 p3 = _mm256_i32gather_ps(src, ip2, 4);
+            const __m256i vi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(idx + i));
+            const uint32_t base = idx[i];
+            __m256 p0, p1, p2, p3;
+            if (base >= 1 && idx[i + 7] - base <= 7 && base + 10 <= src_size) {
+                const __m256i rel = _mm256_sub_epi32(vi, _mm256_set1_epi32(static_cast<int>(base)));
+                p0 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base - 1), rel);
+                p1 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base), rel);
+                p2 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base + 1), rel);
+                p3 = _mm256_permutevar8x32_ps(_mm256_loadu_ps(src + base + 2), rel);
+            } else {
+                p0 = _mm256_i32gather_ps(src, _mm256_max_epi32(_mm256_sub_epi32(vi, one), v_zero), 4);
+                p1 = _mm256_i32gather_ps(src, vi, 4);
+                p2 = _mm256_i32gather_ps(src, _mm256_min_epi32(_mm256_add_epi32(vi, one), v_last), 4);
+                p3 = _mm256_i32gather_ps(src, _mm256_min_epi32(_mm256_add_epi32(vi, two), v_last), 4);
+            }
             __m256 t = _mm256_loadu_ps(w_ptr + i);
             __m256 a = _mm256_sub_ps(p2, p0);                                                          // -p0 + p2
             __m256 b = _mm256_sub_ps(_mm256_fmadd_ps(c4, p2, _mm256_fmsub_ps(c2, p0, _mm256_mul_ps(c5, p1))), p3); // 2p0-5p1+4p2-p3
@@ -1685,6 +1723,7 @@ private:
     int m_interp{ 0 };                 // 0 linear, 1 cubic
     int m_agg{ 0 };                    // 0 off, 1 peak, 2 rms (setAggregation)
     std::vector<uint32_t> m_agg_idx, m_agg_lo, m_agg_cnt;   // coarse output bins and the FFT-bin range each owns
+    size_t m_interp_end{ 0 };          // interpolate [0, m_interp_end); the rest is all aggregated (buildWarpTables)
     bool m_is_identity{ false };       // see buildWarpTables()
 };
 
@@ -1850,9 +1889,12 @@ public:
 #if defined(__AVX2__)
     // Same computation, eight lanes at a time: exponent extraction and mantissa indexing are both
     // pure integer ops, and the gather is the only memory access. Returns 20*log10 for each lane.
+    // PRECONDITION: every lane is a positive float (both callers clamp to >= 1e-12 first), so the sign
+    // bit is 0 and bits >> 23 is the biased exponent already - the scalar form's & 0xFF is not needed.
+    // (A polynomial log2 was measured as the alternative: 30 % slower than this gather on Raptor Lake.)
     static inline __m256 scaledVec(__m256 v, const float* t) noexcept {
         const __m256i bits = _mm256_castps_si256(v);
-        const __m256i exp = _mm256_sub_epi32(_mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xFF)), _mm256_set1_epi32(127));
+        const __m256i exp = _mm256_sub_epi32(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(127));
         const __m256i idx = _mm256_and_si256(_mm256_srli_epi32(bits, 23 - kTableBits), _mm256_set1_epi32(kTableSize - 1));
         const __m256 lut = _mm256_i32gather_ps(t, idx, 4);
         return _mm256_fmadd_ps(_mm256_cvtepi32_ps(exp), _mm256_set1_ps(kLog10_2_Scaled), lut);
@@ -1919,20 +1961,57 @@ inline void multiplyInPlace(float* __restrict spectrum, const float* __restrict 
     for (; i < len; ++i) spectrum[i] *= curve[i];
 }
 
+// spectrum[i] *= curve[i], returning max(spectrum) after the multiply: the weighting pass and the dB
+// reference peak in one read of the spectrum (v2.12; used when a Frame Peak / AGC reference needs it).
+inline float multiplyInPlaceMax(float* __restrict spectrum, const float* __restrict curve, size_t len) noexcept {
+    float m = 0.0f;
+    size_t i = 0;
+#if defined(__AVX2__)
+    __m256 vm0 = _mm256_setzero_ps(), vm1 = vm0, vm2 = vm0, vm3 = vm0;   // four chains: see peakMagnitude
+    for (; i + 31 < len; i += 32) {
+        const __m256 a = _mm256_mul_ps(_mm256_load_ps(spectrum + i), _mm256_load_ps(curve + i));
+        const __m256 b = _mm256_mul_ps(_mm256_load_ps(spectrum + i + 8), _mm256_load_ps(curve + i + 8));
+        const __m256 c = _mm256_mul_ps(_mm256_load_ps(spectrum + i + 16), _mm256_load_ps(curve + i + 16));
+        const __m256 d = _mm256_mul_ps(_mm256_load_ps(spectrum + i + 24), _mm256_load_ps(curve + i + 24));
+        _mm256_store_ps(spectrum + i, a); _mm256_store_ps(spectrum + i + 8, b);
+        _mm256_store_ps(spectrum + i + 16, c); _mm256_store_ps(spectrum + i + 24, d);
+        vm0 = _mm256_max_ps(vm0, a); vm1 = _mm256_max_ps(vm1, b); vm2 = _mm256_max_ps(vm2, c); vm3 = _mm256_max_ps(vm3, d);
+    }
+    for (; i + 7 < len; i += 8) {
+        const __m256 a = _mm256_mul_ps(_mm256_load_ps(spectrum + i), _mm256_load_ps(curve + i));
+        _mm256_store_ps(spectrum + i, a);
+        vm0 = _mm256_max_ps(vm0, a);
+    }
+    alignas(32) float t[8];
+    _mm256_store_ps(t, _mm256_max_ps(_mm256_max_ps(vm0, vm1), _mm256_max_ps(vm2, vm3)));
+    for (int k = 0; k < 8; ++k) m = std::max(m, t[k]);
+#endif
+    for (; i < len; ++i) { spectrum[i] *= curve[i]; m = std::max(m, spectrum[i]); }
+    return m;
+}
+
 // Maximum value (data 32-byte aligned)
 // The horizontal reduction at the end (store 8 lanes to memory, scan them) is the standard way to
 // finish a vector max; there is no cheaper instruction for it on AVX2. Called on the magnitude
 // spectrum to find the value the dB reference is taken from (AbsFS/FramePeak modes) and to drive
 // the AGC follower. Returns 0 for an empty range so a zero-length axis cannot poison the reference.
+//
+// v2.12: four independent accumulators. With one, every iteration waited for the previous max
+// (4-cycle latency) and the loop was latency-bound: 0.51 us at 8193 bins. Four chains let the loads run
+// at throughput.
 inline float peakMagnitude(const float* __restrict data, size_t n) noexcept {
     if (n == 0) return 0.0f;
     float max_val = data[0];
     size_t i = 0;
 #if defined(__AVX2__)
-    __m256 v_max = _mm256_set1_ps(max_val);
-    for (; i + 15 < n; i += 16) {
-        v_max = _mm256_max_ps(v_max, _mm256_max_ps(_mm256_load_ps(data + i), _mm256_load_ps(data + i + 8)));
+    __m256 v_max = _mm256_set1_ps(max_val), m1 = v_max, m2 = v_max, m3 = v_max;
+    for (; i + 31 < n; i += 32) {
+        v_max = _mm256_max_ps(v_max, _mm256_load_ps(data + i));
+        m1 = _mm256_max_ps(m1, _mm256_load_ps(data + i + 8));
+        m2 = _mm256_max_ps(m2, _mm256_load_ps(data + i + 16));
+        m3 = _mm256_max_ps(m3, _mm256_load_ps(data + i + 24));
     }
+    v_max = _mm256_max_ps(_mm256_max_ps(v_max, m1), _mm256_max_ps(m2, m3));
     for (; i + 7 < n; i += 8) v_max = _mm256_max_ps(v_max, _mm256_load_ps(data + i));
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, v_max);
@@ -1942,31 +2021,51 @@ inline float peakMagnitude(const float* __restrict data, size_t n) noexcept {
     return max_val;
 }
 
-// Peak value and index (data 32-byte aligned). Vector loop starts at 0 (aligned) and only
-// inspects a chunk when some lane exceeds the running max.
+// Peak value and index (data 32-byte aligned). The first bin wins a tie (strict >), which is what
+// makes the reported peak index stable frame to frame when two bins hold the same value.
 //
-// WHY THE SCALAR RESCAN INSIDE THE BRANCH: finding the index of the maximum cannot be done in a
-// register - SIMD gives the value but not "which lane". So the vector loop is used purely as a
-// cheap filter (one compare and a movemask per 8 bins, and on a spectrum most chunks fail it), and
-// only a chunk that actually contains a new maximum is spilled to memory and scanned. The `>`
-// comparison rather than `>=` means the *first* bin wins a tie, which is what makes the reported
-// peak index stable frame to frame when two bins hold the same value - do not change it to >=.
-// peak_idx is always written (0 for an empty range), so the caller never reads a stale index.
+// HOW: four independent (running max, index-of-max) vector pairs over 32 bins per step. Per lane a
+// strict > keeps the earliest index, and the final 32-way reduction breaks value ties on the lower
+// index, so the result is exactly the scalar "first maximum". No data-dependent branch and no
+// loop-carried latency chain (four chains hide the compare+blend latency), so the cost no longer
+// depends on the data: the previous "filter, then rescan the chunk" form cost 0.85 us on a noisy
+// spectrum but 4.5 us on a rising one (every chunk a new maximum); this is ~0.9 us for both at 16384
+// bins (i9-13900H P-core). peak_idx is always written (0 for an empty range).
 inline float findPeakWithIndex(const float* __restrict data, size_t n, size_t& peak_idx) noexcept {
     peak_idx = 0;
     if (n == 0) return 0.0f;
     float max_val = data[0];
     size_t i = 0;
 #if defined(__AVX2__)
-    for (; i + 7 < n; i += 8) {
-        __m256 v = _mm256_load_ps(data + i);
-        __m256 gt = _mm256_cmp_ps(v, _mm256_set1_ps(max_val), _CMP_GT_OQ);
-        if (_mm256_movemask_ps(gt) != 0) {
-            alignas(32) float tmp[8];
-            _mm256_store_ps(tmp, v);
-            for (int j = 0; j < 8; ++j) {
-                if (tmp[j] > max_val) { max_val = tmp[j]; peak_idx = i + j; }
-            }
+    if (n >= 32) {
+        __m256 m0 = _mm256_load_ps(data), m1 = _mm256_load_ps(data + 8), m2 = _mm256_load_ps(data + 16), m3 = _mm256_load_ps(data + 24);
+        const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        __m256i c0 = lane, c1 = _mm256_add_epi32(lane, _mm256_set1_epi32(8)),
+                c2 = _mm256_add_epi32(lane, _mm256_set1_epi32(16)), c3 = _mm256_add_epi32(lane, _mm256_set1_epi32(24));
+        __m256i x0 = c0, x1 = c1, x2 = c2, x3 = c3;
+        const __m256i step = _mm256_set1_epi32(32);
+        auto upd = [](__m256& m, __m256i& x, __m256 v, __m256i c) noexcept {
+            const __m256 gt = _mm256_cmp_ps(v, m, _CMP_GT_OQ);
+            m = _mm256_max_ps(m, v);
+            x = _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(x), _mm256_castsi256_ps(c), gt));
+        };
+        for (i = 32; i + 31 < n; i += 32) {
+            c0 = _mm256_add_epi32(c0, step); c1 = _mm256_add_epi32(c1, step);
+            c2 = _mm256_add_epi32(c2, step); c3 = _mm256_add_epi32(c3, step);
+            upd(m0, x0, _mm256_load_ps(data + i), c0);
+            upd(m1, x1, _mm256_load_ps(data + i + 8), c1);
+            upd(m2, x2, _mm256_load_ps(data + i + 16), c2);
+            upd(m3, x3, _mm256_load_ps(data + i + 24), c3);
+        }
+        alignas(32) float mv[32];
+        alignas(32) int32_t iv[32];
+        _mm256_store_ps(mv, m0); _mm256_store_ps(mv + 8, m1); _mm256_store_ps(mv + 16, m2); _mm256_store_ps(mv + 24, m3);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(iv), x0);      _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 8), x1);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 16), x2); _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 24), x3);
+        max_val = mv[0]; peak_idx = static_cast<size_t>(iv[0]);
+        for (int l = 1; l < 32; ++l) {
+            const size_t li = static_cast<size_t>(iv[l]);
+            if (mv[l] > max_val || (mv[l] == max_val && li < peak_idx)) { max_val = mv[l]; peak_idx = li; }
         }
     }
 #endif
@@ -1978,6 +2077,57 @@ inline float findPeakWithIndex(const float* __restrict data, size_t n, size_t& p
 
 /*
 ===========================================================================
+ 6b'. FastLog2Seg - log2 without a table gather (v2.12, used by the dB stage)
+===========================================================================
+WHAT: log2(x) for positive normal floats as exponent + an 8-segment quadratic of the mantissa. The
+      segment is the top 3 mantissa bits, and its three coefficients are fetched with vpermps from
+      three registers - no memory access at all (FastLog10's 8 KB table needs a hardware gather).
+ACCURACY: max |error| 2.7e-5 in log2 = 0.00016 dB (Chebyshev fit per segment); the table is 0.0027 dB.
+SPEED (i9-13900H, 16384 bins, min of 60 rounds x 3 reps, interleaved): dB-normalized 15 % faster than
+      the gather table, plain dB equal. Gathers are also the slow instruction on E-cores, which this
+      avoids. Coefficients: per segment j, the quadratic through log2(1 + j/8 + u) at the 3 Chebyshev
+      nodes of u in [0, 1/8), solved in long double (refit = same recipe; the test pins the error).
+PRECONDITION: x > 0 and normal (the dB stage clamps to >= 1e-12 first).
+*/
+struct FastLog2Seg {
+    // c0, c1, c2 per segment j = top 3 mantissa bits; u = mantissa - j/8 in [0, 1/8).
+    alignas(32) static constexpr float kC0[8] = { 2.564386887e-05f, 1.699432731e-01f, 3.219415843e-01f, 4.594418406e-01f,
+                                                  5.849704146e-01f, 7.004460096e-01f, 8.073599935e-01f, 9.068947434e-01f };
+    alignas(32) static constexpr float kC1[8] = { 1.438983321e+00f, 1.279752135e+00f, 1.152207255e+00f, 1.047755003e+00f,
+                                                  9.606496096e-01f, 8.869041204e-01f, 8.236659169e-01f, 7.688398957e-01f };
+    alignas(32) static constexpr float kC2[8] = { -6.398096681e-01f, -5.120694041e-01f, -4.190979004e-01f, -3.493308127e-01f,
+                                                  -2.956413627e-01f, -2.534430921e-01f, -2.196758091e-01f, -1.922342032e-01f };
+    static constexpr float kDbPerOctave = 6.0205999132796239f;   // 20 * log10(2)
+
+    static float log2(float x) noexcept {
+        uint32_t bits;
+        std::memcpy(&bits, &x, sizeof(bits));
+        const uint32_t j = (bits >> 20) & 7u;
+        const float e = static_cast<float>(static_cast<int>(bits >> 23) - 127);
+        const uint32_t ub = (bits & 0x000FFFFFu) | 0x3F800000u;
+        float u;
+        std::memcpy(&u, &ub, sizeof(u));
+        u -= 1.0f;
+        return (kC0[j] + u * (kC1[j] + u * kC2[j])) + e;
+    }
+#if defined(__AVX2__)
+    struct Regs { __m256 c0, c1, c2; };
+    static Regs regs() noexcept { return { _mm256_load_ps(kC0), _mm256_load_ps(kC1), _mm256_load_ps(kC2) }; }
+    static inline __m256 log2(__m256 v, const Regs& r) noexcept {
+        const __m256i bits = _mm256_castps_si256(v);
+        const __m256i j = _mm256_srli_epi32(bits, 20);            // vpermps reads only the low 3 bits: the segment
+        const __m256 e = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(127)));
+        const __m256 u = _mm256_sub_ps(_mm256_castsi256_ps(_mm256_or_si256(_mm256_and_si256(bits, _mm256_set1_epi32(0x000FFFFF)),
+                                                                           _mm256_set1_epi32(0x3F800000))), _mm256_set1_ps(1.0f));
+        __m256 q = _mm256_fmadd_ps(_mm256_permutevar8x32_ps(r.c2, j), u, _mm256_permutevar8x32_ps(r.c1, j));
+        q = _mm256_fmadd_ps(q, u, _mm256_permutevar8x32_ps(r.c0, j));
+        return _mm256_add_ps(q, e);
+    }
+#endif
+};
+
+/*
+===========================================================================
  6c. DECIBEL CONVERSION
 ===========================================================================
 mode: 1 = dB, 2 = dB normalised to [0,1] over [-top_db, 0]
@@ -1986,60 +2136,59 @@ inv_ref: 1 / reference magnitude (0 dB point). The caller chooses the reference
 */
 class DecibelConverter {
 public:
+    // v2.12: log2 by FastLog2Seg (no gather, 0.00016 dB) and every constant folded into one FMA:
+    //   dB   = log2(m) * 6.0206 + 20*log10(inv_ref)                      , then max(dB, -top_db)
+    //   norm = log2(m) * (6.0206 / top_db) + (20*log10(inv_ref) / top_db + 1), then clamp [0, 1]
+    // (norm = (dB - floor) / top_db with floor = -top_db, and dB >= floor is exactly norm >= 0.)
+    // The reference offset is computed exactly once per call with std::log10.
     static inline void convertToDB(int mode, double top_db, float inv_ref, AlignedVector& spectrum) noexcept {
         if (mode == 0 || spectrum.empty()) return;
         size_t n = spectrum.size();
         float* data = spectrum.data();
         if (!(inv_ref > 0.0f) || !std::isfinite(inv_ref)) inv_ref = 1.0f;
 
-        const float* lut = FastLog10::dbTable();   // hoisted: one static-init guard check per call, not per 8 bins
-        const float db_offset = FastLog10::scaled(inv_ref, lut);
+        const double tdb = std::max(1e-6, top_db);
+        const float db_offset = static_cast<float>(20.0 * std::log10(static_cast<double>(inv_ref)));
         const float floor_val = static_cast<float>(-top_db);
-        const float inv_top_db = static_cast<float>(1.0 / std::max(1e-6, top_db));
         const float kMinMag = 1e-12f;
+        const float k1 = FastLog2Seg::kDbPerOctave;
+        const float k2 = static_cast<float>(FastLog2Seg::kDbPerOctave / tdb);
+        const float c2 = static_cast<float>(db_offset / tdb + 1.0);
 
         size_t k = 0;
 #if defined(__AVX2__)
+        const FastLog2Seg::Regs lr = FastLog2Seg::regs();
         const __m256 min_v = _mm256_set1_ps(kMinMag);
-        const __m256 db_off_v = _mm256_set1_ps(db_offset);
-        const __m256 floor_v = _mm256_set1_ps(floor_val);
         if (mode == 2) {
-            const __m256 zero_v = _mm256_setzero_ps();
-            const __m256 one_v = _mm256_set1_ps(1.0f);
-            const __m256 inv_top_db_v = _mm256_set1_ps(inv_top_db);
+            const __m256 zero_v = _mm256_setzero_ps(), one_v = _mm256_set1_ps(1.0f);
+            const __m256 kv = _mm256_set1_ps(k2), cv = _mm256_set1_ps(c2);
             for (; k + 15 < n; k += 16) {
-                __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
-                __m256 db0 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0, lut), db_off_v), floor_v);
-                __m256 db1 = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1, lut), db_off_v), floor_v);
-                __m256 n0 = _mm256_mul_ps(_mm256_sub_ps(db0, floor_v), inv_top_db_v);
-                __m256 n1 = _mm256_mul_ps(_mm256_sub_ps(db1, floor_v), inv_top_db_v);
-                _mm256_store_ps(data + k,     _mm256_min_ps(_mm256_max_ps(zero_v, n0), one_v));
-                _mm256_store_ps(data + k + 8, _mm256_min_ps(_mm256_max_ps(zero_v, n1), one_v));
+                const __m256 l0 = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k), min_v), lr);
+                const __m256 l1 = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k + 8), min_v), lr);
+                _mm256_store_ps(data + k,     _mm256_min_ps(_mm256_max_ps(_mm256_fmadd_ps(l0, kv, cv), zero_v), one_v));
+                _mm256_store_ps(data + k + 8, _mm256_min_ps(_mm256_max_ps(_mm256_fmadd_ps(l1, kv, cv), zero_v), one_v));
             }
             for (; k + 7 < n; k += 8) {
-                __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                __m256 db = _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v, lut), db_off_v), floor_v);
-                __m256 nn = _mm256_mul_ps(_mm256_sub_ps(db, floor_v), inv_top_db_v);
-                _mm256_store_ps(data + k, _mm256_min_ps(_mm256_max_ps(zero_v, nn), one_v));
+                const __m256 l = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k), min_v), lr);
+                _mm256_store_ps(data + k, _mm256_min_ps(_mm256_max_ps(_mm256_fmadd_ps(l, kv, cv), zero_v), one_v));
             }
         } else {
+            const __m256 kv = _mm256_set1_ps(k1), cv = _mm256_set1_ps(db_offset), floor_v = _mm256_set1_ps(floor_val);
             for (; k + 15 < n; k += 16) {
-                __m256 v0 = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                __m256 v1 = _mm256_max_ps(_mm256_load_ps(data + k + 8), min_v);
-                _mm256_store_ps(data + k,     _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v0, lut), db_off_v), floor_v));
-                _mm256_store_ps(data + k + 8, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v1, lut), db_off_v), floor_v));
+                const __m256 l0 = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k), min_v), lr);
+                const __m256 l1 = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k + 8), min_v), lr);
+                _mm256_store_ps(data + k,     _mm256_max_ps(_mm256_fmadd_ps(l0, kv, cv), floor_v));
+                _mm256_store_ps(data + k + 8, _mm256_max_ps(_mm256_fmadd_ps(l1, kv, cv), floor_v));
             }
             for (; k + 7 < n; k += 8) {
-                __m256 v = _mm256_max_ps(_mm256_load_ps(data + k), min_v);
-                _mm256_store_ps(data + k, _mm256_max_ps(_mm256_add_ps(FastLog10::scaledVec(v, lut), db_off_v), floor_v));
+                const __m256 l = FastLog2Seg::log2(_mm256_max_ps(_mm256_load_ps(data + k), min_v), lr);
+                _mm256_store_ps(data + k, _mm256_max_ps(_mm256_fmadd_ps(l, kv, cv), floor_v));
             }
         }
 #endif
         for (; k < n; ++k) {
-            float raw_v = std::max(kMinMag, data[k]);
-            float db = std::max(FastLog10::scaled(raw_v, lut) + db_offset, floor_val);
-            data[k] = (mode == 2) ? std::max(0.0f, std::min(1.0f, (db - floor_val) * inv_top_db)) : db;
+            const float l = FastLog2Seg::log2(std::max(kMinMag, data[k]));
+            data[k] = (mode == 2) ? std::max(0.0f, std::min(1.0f, l * k2 + c2)) : std::max(l * k1 + db_offset, floor_val);
         }
     }
 };
@@ -2062,51 +2211,132 @@ WHAT: a handful of scalar descriptors of one frame, computed on the analysis wor
   bass/mid/highDb  10*log10 of the power in < 250 Hz, 250 Hz - 4 kHz, > 4 kHz, on the spectrum's own
                magnitude scale (compare them with each other and over time, not as absolute levels)
 
-COST: O(n) with n = the magnitude bins computed (up to Display Max); ~2-4 us at 8193 bins (i9-13900H).
+COST: O(n) with n = the magnitude bins computed (up to Display Max); ~3.5 us at 8193 bins (i9-13900H,
+measured; the pre-2.12 scalar loop was ~16-20 us, not the 2-4 us this line used to claim).
 */
 struct SpectralFeatures {
     float centroidHz{ 0.0f }, rolloffHz{ 0.0f }, flatness{ 0.0f }, flux{ 0.0f };
     float rmsDb{ -120.0f }, bassDb{ -120.0f }, midDb{ -120.0f }, highDb{ -120.0f };
 };
 
+namespace detail {
+#if defined(__AVX2__)
+inline float hsum8(__m256 v) noexcept {
+    __m128 s4 = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    return _mm_cvtss_f32(_mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1)));
+}
+#endif
+// The per-bin sums of computeSpectralFeatures over [lo, hi). One call per band, so the band test is
+// gone from the loop. The vector body accumulates in float lanes and flushes to double every 256
+// bins, which keeps a 32K-bin sum at ~1e-7 relative accuracy (the result matches the double loop to
+// the printed precision of every feature).
+struct FeatureSums { double pw = 0.0, weighted = 0.0, mag = 0.0, logDb = 0.0, rise = 0.0; };
+// logDb accumulates 20*log10(m) with the FastLog10 table: in this loop, already ALU-heavy with five
+// accumulations, the gather (load ports) measured 4 % faster than FastLog2Seg (ALU); the dB stage is the
+// opposite case.
+inline void featureSums(const float* mag, const float* prev, size_t lo, size_t hi, FeatureSums& a) noexcept {
+    size_t k = lo;
+    const float* lut = FastLog10::dbTable();
+#if defined(__AVX2__)
+    const __m256 tiny = _mm256_set1_ps(1e-12f), z = _mm256_setzero_ps(), eight = _mm256_set1_ps(8.0f);
+    while (k + 8 <= hi) {
+        const size_t end = std::min(hi, k + 256);
+        __m256 spw = z, swk = z, smag = z, slg = z, srise = z;
+        __m256 kk = _mm256_add_ps(_mm256_set1_ps(static_cast<float>(k)), _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7));
+        for (; k + 8 <= end; k += 8) {
+            const __m256 m = _mm256_loadu_ps(mag + k);
+            const __m256 pw = _mm256_mul_ps(m, m);
+            spw = _mm256_add_ps(spw, pw);
+            swk = _mm256_fmadd_ps(pw, kk, swk);
+            smag = _mm256_add_ps(smag, m);
+            slg = _mm256_add_ps(slg, FastLog10::scaledVec(_mm256_max_ps(m, tiny), lut));   // 20*log10(m)
+            if (prev) srise = _mm256_add_ps(srise, _mm256_max_ps(_mm256_sub_ps(m, _mm256_loadu_ps(prev + k)), z));
+            kk = _mm256_add_ps(kk, eight);
+        }
+        a.pw += hsum8(spw); a.weighted += hsum8(swk); a.mag += hsum8(smag); a.logDb += hsum8(slg); a.rise += hsum8(srise);
+    }
+#endif
+    for (; k < hi; ++k) {
+        const float m = mag[k];
+        const double pw = static_cast<double>(m) * m;
+        a.pw += pw;
+        a.weighted += pw * static_cast<double>(k);
+        a.mag += m;
+        a.logDb += FastLog10::scaled(std::max(m, 1e-12f), lut);
+        if (prev) { const float d = m - prev[k]; if (d > 0.0f) a.rise += d; }
+    }
+}
+} // namespace detail
+
 // mag/n: linear magnitude (bin k is at k*binHz). time/nTime: the analysis window's raw samples (for
 // rmsDb). prev: the previous frame's magnitude (flux state, resized/overwritten here - per channel).
+//
+// v2.12: the loop is split at the two band edges (no per-bin band branch), the sums are AVX2
+// (detail::featureSums), the rolloff search skips 64-bin blocks before scanning the one that crosses
+// 85 %, and the time-domain RMS is vectorized. Measured 16.5 -> 3.5 us at 8193 bins + 3175 samples
+// (i9-13900H P-core); the features are the same to the printed precision.
 inline void computeSpectralFeatures(const float* mag, size_t n, double binHz, const float* time, size_t nTime,
                                     AlignedVector& prev, SpectralFeatures& f) noexcept
 {
     f = SpectralFeatures{};
     if (n == 0 || binHz <= 0.0) return;
-    const float* lut = FastLog10::dbTable();
     const size_t b250 = std::min(n, static_cast<size_t>(250.0 / binHz) + 1);
     const size_t b4k = std::min(n, static_cast<size_t>(4000.0 / binHz) + 1);
-    double total = 0.0, weighted = 0.0, sumMag = 0.0, logSum = 0.0, bass = 0.0, mid = 0.0, high = 0.0, rise = 0.0;
-    const bool havePrev = prev.size() >= n;
-    for (size_t k = 0; k < n; ++k) {
-        const float m = mag[k];
-        const double pw = static_cast<double>(m) * m;
-        total += pw;
-        weighted += pw * static_cast<double>(k);
-        sumMag += m;
-        logSum += FastLog10::scaled(std::max(m, 1e-12f), lut);        // 20*log10(m) = 10*log10(power)
-        if (k < b250) bass += pw; else if (k < b4k) mid += pw; else high += pw;
-        if (havePrev) { const float d = m - prev[k]; if (d > 0.0f) rise += d; }
-    }
+    const float* pv = (prev.size() >= n) ? prev.data() : nullptr;
+    detail::FeatureSums lo, mid, hi;
+    detail::featureSums(mag, pv, 0, b250, lo);
+    detail::featureSums(mag, pv, b250, b4k, mid);
+    detail::featureSums(mag, pv, b4k, n, hi);
+    const double total = lo.pw + mid.pw + hi.pw;
+    const double sumMag = lo.mag + mid.mag + hi.mag;
     if (total > 0.0) {
-        f.centroidHz = static_cast<float>(weighted / total * binHz);
+        f.centroidHz = static_cast<float>((lo.weighted + mid.weighted + hi.weighted) / total * binHz);
         const double target = 0.85 * total;
         double acc = 0.0;
         size_t k = 0;
+#if defined(__AVX2__)
+        for (; k + 64 <= n; k += 64) {                     // whole 64-bin blocks below the 85 % point
+            // four FMA chains (one chain was latency-bound: 8 dependent FMAs per block)
+            __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+            for (size_t j = 0; j < 64; j += 32) {
+                const __m256 a0 = _mm256_loadu_ps(mag + k + j), a1 = _mm256_loadu_ps(mag + k + j + 8);
+                const __m256 a2 = _mm256_loadu_ps(mag + k + j + 16), a3 = _mm256_loadu_ps(mag + k + j + 24);
+                s0 = _mm256_fmadd_ps(a0, a0, s0); s1 = _mm256_fmadd_ps(a1, a1, s1);
+                s2 = _mm256_fmadd_ps(a2, a2, s2); s3 = _mm256_fmadd_ps(a3, a3, s3);
+            }
+            const double b = detail::hsum8(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
+            if (acc + b >= target) break;
+            acc += b;
+        }
+#endif
         for (; k < n; ++k) { acc += static_cast<double>(mag[k]) * mag[k]; if (acc >= target) break; }
         f.rolloffHz = static_cast<float>(std::min(k, n - 1) * binHz);
+        const double logSum = lo.logDb + mid.logDb + hi.logDb;
         const double geo = std::pow(10.0, (logSum / static_cast<double>(n)) / 10.0);   // geometric mean of power
         f.flatness = static_cast<float>(std::clamp(geo / (total / static_cast<double>(n)), 0.0, 1.0));
     }
     auto db = [](double p) { return static_cast<float>(p > 1e-24 ? 10.0 * std::log10(p) : -240.0); };
-    f.bassDb = db(bass); f.midDb = db(mid); f.highDb = db(high);
-    f.flux = (havePrev && sumMag > 0.0) ? static_cast<float>(rise / sumMag) : 0.0f;
+    f.bassDb = db(lo.pw); f.midDb = db(mid.pw); f.highDb = db(hi.pw);
+    f.flux = (pv && sumMag > 0.0) ? static_cast<float>((lo.rise + mid.rise + hi.rise) / sumMag) : 0.0f;
     if (time && nTime) {
         double s2 = 0.0;
-        for (size_t i = 0; i < nTime; ++i) s2 += static_cast<double>(time[i]) * time[i];
+        size_t i = 0;
+#if defined(__AVX2__)
+        while (i + 8 <= nTime) {
+            const size_t end = std::min(nTime, i + 512);
+            __m256 q0 = _mm256_setzero_ps(), q1 = q0, q2 = q0, q3 = q0;          // four FMA chains
+            for (; i + 32 <= end; i += 32) {
+                const __m256 x0 = _mm256_loadu_ps(time + i), x1 = _mm256_loadu_ps(time + i + 8);
+                const __m256 x2 = _mm256_loadu_ps(time + i + 16), x3 = _mm256_loadu_ps(time + i + 24);
+                q0 = _mm256_fmadd_ps(x0, x0, q0); q1 = _mm256_fmadd_ps(x1, x1, q1);
+                q2 = _mm256_fmadd_ps(x2, x2, q2); q3 = _mm256_fmadd_ps(x3, x3, q3);
+            }
+            for (; i + 8 <= end; i += 8) { const __m256 x = _mm256_loadu_ps(time + i); q0 = _mm256_fmadd_ps(x, x, q0); }
+            s2 += detail::hsum8(_mm256_add_ps(_mm256_add_ps(q0, q1), _mm256_add_ps(q2, q3)));
+        }
+#endif
+        for (; i < nTime; ++i) s2 += static_cast<double>(time[i]) * time[i];
         const double rms = std::sqrt(s2 / static_cast<double>(nTime));
         f.rmsDb = static_cast<float>(rms > 1e-6 ? 20.0 * std::log10(rms) : -120.0);
     }
@@ -2165,6 +2395,9 @@ public:
         // mispredicting one in SIMD (adjacent bins routinely go opposite ways), so the vector body
         // selects the coefficient with blendv on a sign-agnostic "is the new value higher" compare
         // instead. Same arithmetic, no branch. The scalar tail below keeps the if/else form.
+        // (Comparing s > d instead of diff > 0 shortens each vector's dependency chain, but the
+        // iterations are independent, so it is throughput- and bandwidth-bound: measured no change,
+        // 1013 vs 1027 ns at 16384 bins. Not worth a second spelling of the same test.)
         const __m256 v_att = _mm256_set1_ps(att_factor);
         const __m256 v_rel = _mm256_set1_ps(rel_factor);
         const __m256 v_zero = _mm256_setzero_ps();
@@ -2189,6 +2422,43 @@ public:
         for (; i < n; ++i) {
             float diff = src[i] - dst[i];
             dst[i] += ((diff > 0.0f) ? att_factor : rel_factor) * diff;
+        }
+    }
+
+    // The pipeline's form: `io` is the new frame on entry and the smoothed frame on exit, and `state`
+    // (the carried history) receives the same smoothed frame - both written in the one pass. This is
+    // apply() followed by copying state into io, without the separate 16384-float copy pass
+    // (v2.12: the runChannel memcpy it replaces was a full extra load+store of the spectrum per cook).
+    inline void applyInPlace(float attack, float release, AlignedVector& io, AlignedVector& state) noexcept {
+        const size_t n = io.size();
+        if (state.size() != n || (attack <= 0.0f && release <= 0.0f)) { state = io; return; }
+        const float att_factor = 1.0f - std::clamp(attack, 0.0f, 0.999f);
+        const float rel_factor = 1.0f - std::clamp(release, 0.0f, 0.999f);
+        float* __restrict x = io.data();
+        float* __restrict st = state.data();
+        size_t i = 0;
+#if defined(__AVX2__)
+        const __m256 v_att = _mm256_set1_ps(att_factor), v_rel = _mm256_set1_ps(rel_factor), v_zero = _mm256_setzero_ps();
+        for (; i + 15 < n; i += 16) {
+            const __m256 s0 = _mm256_load_ps(x + i), d0 = _mm256_load_ps(st + i);
+            const __m256 s1 = _mm256_load_ps(x + i + 8), d1 = _mm256_load_ps(st + i + 8);
+            const __m256 diff0 = _mm256_sub_ps(s0, d0), diff1 = _mm256_sub_ps(s1, d1);
+            const __m256 r0 = _mm256_fmadd_ps(_mm256_blendv_ps(v_rel, v_att, _mm256_cmp_ps(diff0, v_zero, _CMP_GT_OQ)), diff0, d0);
+            const __m256 r1 = _mm256_fmadd_ps(_mm256_blendv_ps(v_rel, v_att, _mm256_cmp_ps(diff1, v_zero, _CMP_GT_OQ)), diff1, d1);
+            _mm256_store_ps(st + i, r0); _mm256_store_ps(st + i + 8, r1);
+            _mm256_store_ps(x + i, r0);  _mm256_store_ps(x + i + 8, r1);
+        }
+        for (; i + 7 < n; i += 8) {
+            const __m256 s = _mm256_load_ps(x + i), d = _mm256_load_ps(st + i);
+            const __m256 diff = _mm256_sub_ps(s, d);
+            const __m256 r = _mm256_fmadd_ps(_mm256_blendv_ps(v_rel, v_att, _mm256_cmp_ps(diff, v_zero, _CMP_GT_OQ)), diff, d);
+            _mm256_store_ps(st + i, r); _mm256_store_ps(x + i, r);
+        }
+#endif
+        for (; i < n; ++i) {
+            const float diff = x[i] - st[i];
+            const float r = st[i] + ((diff > 0.0f) ? att_factor : rel_factor) * diff;
+            st[i] = r; x[i] = r;
         }
     }
 };
@@ -2307,8 +2577,11 @@ public:
 // that shuffle trick, and it is cheaper than the alternative.
 //
 // WHY THE RECIPROCAL SQUARE ROOT: rsqrt + one Newton-Raphson step is accurate to ~23 bits (i.e. to
-// within a float's representable precision) at about half the latency of a hardware sqrt. This runs
-// once per bin per cook, so it is worth the two extra instructions. The 1e-30 floor inside it keeps
+// within a float's representable precision). It is also the faster form on the target CPU: measured
+// against hardware _mm256_sqrt_ps (v2.12, i9-13900H P-core, 8193 bins) rsqrt+NR is 820 ns and vsqrtps
+// 1185 ns - vsqrtps ymm is ~6 cycles/instruction throughput on one port, the NR step is a few FMAs
+// spread over two. Max difference between the two: 2.4e-7 relative. Keep it unless a re-measure says
+// otherwise. The 1e-30 floor inside it keeps
 // a zero bin from producing infinity through the reciprocal - the floor is far below any magnitude
 // that survives to the dB stage, so it never changes a displayed value.
 //

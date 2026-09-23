@@ -414,20 +414,29 @@ AnalysisPipeline::runChannel(DspState& st, const FFTDSP::AlignedVector& window_i
 	// The size check guards the one case the weighting key cannot see coming: a curve built for a
 	// different bin count (the axis is rebuilt before this runs, but the curve's own update happens
 	// in process(), and a mismatch here must skip rather than read past the curve).
+	// When a Frame Peak / AGC dB reference needs the peak of the weighted spectrum, the weighting pass
+	// measures it in the same read (multiplyInPlaceMax); the dBFS reference needs no peak at all.
+	const int loudness = static_cast<int>(p.loudness);
+	const bool needRefPeak = loudness != 0 && p.dbRef != Parameters::DbRef::Dbfs;
+	float refPeak = 0.0f;
+	bool haveRefPeak = false;
 	if (p.weighting != Parameters::Weighting::Off && myWeightingCurve.size() == out.size()) {
-		FFTDSP::multiplyInPlace(out.data(), myWeightingCurve.data(), out.size());
+		if (needRefPeak) { refPeak = FFTDSP::multiplyInPlaceMax(out.data(), myWeightingCurve.data(), out.size()); haveRefPeak = true; }
+		else FFTDSP::multiplyInPlace(out.data(), myWeightingCurve.data(), out.size());
 	}
 
 	// 5. dB with the selected reference
-	const int loudness = static_cast<int>(p.loudness);
+	// st.prev_spectrum holds the previous frame in whatever unit that frame was in. Crossing the Off
+	// boundary changes the unit (linear magnitude <-> dB), and smoothing across a unit change would drag
+	// a dB frame toward a linear magnitude, so the history is dropped at the crossing (both directions).
+	// Only the boundary is handled: dB <-> dB-normalized is a rescale of the same dB curve and is
+	// continuous enough to keep smoothing through.
+	if (loudness != 0) { if (st.prev_loudness_mode == 0) st.prev_spectrum.clear(); }
+	else if (st.prev_loudness_mode != 0) st.prev_spectrum.clear();
+	st.prev_loudness_mode = loudness;
+
 	if (loudness != 0) {
-		// st.prev_spectrum holds the previous frame in whatever unit that frame was in. Crossing the
-		// Off boundary changes the unit (linear magnitude <-> dB), and smoothing across a unit change
-		// would drag a dB frame toward a linear magnitude, so the history is dropped at the crossing.
-		// Only the boundary is handled: dB <-> dB-normalized is a rescale of the same dB curve and is
-		// continuous enough to keep smoothing through.
-		if (st.prev_loudness_mode == 0) st.prev_spectrum.clear();
-		float peak = FFTDSP::peakMagnitude(out.data(), out.size());
+		const float peak = needRefPeak ? (haveRefPeak ? refPeak : FFTDSP::peakMagnitude(out.data(), out.size())) : 0.0f;
 		float ref = 1.0f;
 		// The three dB references, and what each one means physically:
 		//   Dbfs      - 0 dB is the loudest a full-scale signal could be, so the reading is absolute.
@@ -460,23 +469,19 @@ AnalysisPipeline::runChannel(DspState& st, const FFTDSP::AlignedVector& window_i
 		if (!(ref > 0.0f)) ref = 1.0f;
 		// The converter takes 1/ref (a multiply per bin) rather than dividing per bin.
 		FFTDSP::DecibelConverter::convertToDB(loudness, p.dbRange, 1.0f / ref, out);
-	} else if (st.prev_loudness_mode != 0) {
-		// Leaving a dB mode for linear: the stored history is in dB, so it cannot be smoothed against
-		// a linear frame. (The mirror of the check above, for the same reason.)
-		st.prev_spectrum.clear();
 	}
-	st.prev_loudness_mode = loudness;
 
 	// 6. ballistics (bypassed at 0/0)
+	// (v2.12 measured fusing dB + ballistics + the peak search into one loop: with the peak it was 15 %
+	// slower - 23 live vectors spill on AVX2's 16 registers - and without it 0-4 % faster, because at
+	// these sizes the spectrum is L1/L2-resident and the dB loop is ALU-bound, not memory-bound. Not kept.)
 	if (attackCoef > 0.0f || releaseCoef > 0.0f) {
 		FFTDSP::BallisticsFilter ball;
-		// apply() reads `current` and writes the smoothed frame into prev_out; it never writes through
-		// `current`. So the smoothed result has to be copied back into the buffer the caller publishes,
-		// and prev_spectrum keeps only the history the next frame smooths against.
+		// applyInPlace() smooths `out` in place and writes the same frame into prev_spectrum (the history
+		// the next frame smooths against) in the one pass - no separate copy back (v2.12).
 		// The filter object is constructed per call and holds no state itself - all the state is in
 		// prev_spectrum, which is why one stack object per channel per frame is correct and cheap.
-		ball.apply(attackCoef, releaseCoef, out, st.prev_spectrum);
-		std::memcpy(out.data(), st.prev_spectrum.data(), bins * sizeof(float));
+		ball.applyInPlace(attackCoef, releaseCoef, out, st.prev_spectrum);
 	}
 }
 

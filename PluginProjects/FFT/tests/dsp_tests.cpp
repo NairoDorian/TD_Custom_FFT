@@ -1959,6 +1959,203 @@ static void test_planner_graveyard()
 // HOW TO CHANGE: adding a test means writing the function, adding the call below, and updating the
 // table of contents and the check count in the header. Removing a call silently removes its coverage
 // while the suite still reports success, so the header list and this block have to be kept in step.
+// v2.12 SIMD kernels against scalar references: the load+permute warp paths (linear and cubic, on
+// grids that switch between the permute and the gather path), the branch-free peak index (first
+// maximum wins, every length and tail), the silence test, the FMA dB normalisation, and the
+// vectorized spectral features against the pre-2.12 scalar loop.
+static void test_v212_simd_kernels()
+{
+    section("v2.12 SIMD kernels vs scalar references (warp permute, peak index, dB, features)");
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> U(0.0f, 1.0f);
+
+    // --- warp: Log (mixed permute/gather), Linear upsampled (all permute), Linear downsampled (all gather)
+    struct G { int scale; size_t nout; size_t nlin; double blend; };
+    const G grids[] = { { 0, 16384, 8193, 0.963 }, { 5, 20000, 4097, 0.0 }, { 5, 1000, 8193, 0.0 }, { 1, 777, 2049, 1.0 }, { 0, 37, 513, 0.963 } };
+    for (const G& g : grids) {
+        AlignedVector src(g.nlin);
+        for (auto& v : src) v = U(rng);
+        for (int interp = 0; interp <= 1; ++interp) {
+            PerceptualWarping w;
+            w.setInterpolation(interp);
+            w.setAggregation(0);
+            w.buildWarpTables(g.scale, 22050.0, g.nout, 22050.0, g.blend, 20.0, g.nlin);
+            AlignedVector out;
+            w.applyWarp(src, out);
+            CHECK(out.size() == g.nout);
+            // scalar reference from the same grid definition
+            const auto& hz = w.targetHz();
+            double worst = 0.0;
+            const int last = static_cast<int>(g.nlin) - 1;
+            for (size_t i = 0; i < g.nout; ++i) {
+                double frac = hz[i] / 22050.0 * static_cast<double>(g.nlin - 1);
+                const double r = std::round(frac);
+                if (std::abs(frac - r) < 1e-6) frac = r;
+                const int i0 = static_cast<int>(std::max(0.0, std::min(static_cast<double>(g.nlin - 2), std::floor(frac))));
+                const double t = std::clamp(frac - i0, 0.0, 1.0);
+                double ref;
+                if (interp == 0) {
+                    ref = src[i0] + t * (static_cast<double>(src[i0 + 1]) - src[i0]);
+                } else {
+                    const double p0 = src[std::max(i0 - 1, 0)], p1 = src[i0], p2 = src[std::min(i0 + 1, last)], p3 = src[std::min(i0 + 2, last)];
+                    ref = std::max(0.0, 0.5 * (2.0 * p1 + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t * t * t));
+                }
+                worst = std::max(worst, std::abs(ref - out[i]));
+            }
+            CHECK(worst < 1e-5);
+            if (worst >= 1e-5) std::printf("  warp scale %d nout %zu nlin %zu interp %d: worst %.3g\n", g.scale, g.nout, g.nlin, interp, worst);
+        }
+    }
+
+    // --- peak index: first maximum, every length 0..100 plus large, random / rising / ties / constant
+    auto refPeak = [](const float* d, size_t n, size_t& idx) { idx = 0; if (!n) return 0.0f; float m = d[0]; for (size_t i = 1; i < n; ++i) if (d[i] > m) { m = d[i]; idx = i; } return m; };
+    bool peakOk = true;
+    for (size_t n : { size_t(0), size_t(1), size_t(7), size_t(8), size_t(31), size_t(32), size_t(33), size_t(63), size_t(64), size_t(100), size_t(1000), size_t(16384), size_t(16385) }) {
+        AlignedVector d(n + 1);
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            for (size_t i = 0; i < n; ++i) d[i] = pattern == 0 ? U(rng) : pattern == 1 ? static_cast<float>(i) : pattern == 2 ? static_cast<float>((i * 7) % 5) : 1.0f;
+            size_t a1 = 99, a2 = 99;
+            const float v1 = findPeakWithIndex(d.data(), n, a1), v2 = refPeak(d.data(), n, a2);
+            if (v1 != v2 || a1 != a2) { peakOk = false; std::printf("  peak n %zu pattern %d: %zu vs %zu\n", n, pattern, a1, a2); }
+        }
+    }
+    CHECK(peakOk);
+
+    // --- silence: -0.0 is silent, one denormal / one sample in the tail is not
+    {
+        AlignedVector z(3175, 0.0f);
+        CHECK(blockIsSilent(z.data(), z.size()));
+        z[100] = -0.0f; CHECK(blockIsSilent(z.data(), z.size()));
+        z[3174] = 1e-40f; CHECK(!blockIsSilent(z.data(), z.size()));
+        z[3174] = 0.0f; z[5] = -1e-30f; CHECK(!blockIsSilent(z.data(), z.size()));
+    }
+
+    // --- dB normalised: FMA form vs the exact formula (the table's own error is ~0.003 dB)
+    {
+        AlignedVector m(4099);
+        for (auto& v : m) v = std::exp((U(rng) - 0.7f) * 20.0f);
+        AlignedVector d = m;
+        DecibelConverter::convertToDB(2, 80.0, 1.0f / 3.0f, d);
+        double worst = 0.0;
+        for (size_t i = 0; i < m.size(); ++i) {
+            const double ex = std::clamp((20.0 * std::log10(std::max(1e-12, static_cast<double>(m[i]) / 3.0)) + 80.0) / 80.0, 0.0, 1.0);
+            worst = std::max(worst, std::abs(ex - d[i]) * 80.0);
+        }
+        CHECK(worst < 0.005);   // dB
+    }
+
+    // --- FastLog2Seg: scalar and vector agree, max error 0.0002 dB over 1e-12 .. 1e6
+    {
+        double worstS = 0.0, worstV = 0.0;
+        const FastLog2Seg::Regs lr = FastLog2Seg::regs();
+        alignas(32) float in[8], outv[8];
+        for (int i = 0; i < 400000; ++i) {
+            const float x = static_cast<float>(std::exp(-27.6 + 41.4 * (i / 400000.0)));
+            const double ex = std::log2(static_cast<double>(x));
+            worstS = std::max(worstS, std::abs(FastLog2Seg::log2(x) - ex));
+            in[i & 7] = x;
+            if ((i & 7) == 7) {
+                _mm256_store_ps(outv, FastLog2Seg::log2(_mm256_load_ps(in), lr));
+                for (int l = 0; l < 8; ++l) worstV = std::max(worstV, std::abs(outv[l] - std::log2(static_cast<double>(in[l]))));
+            }
+        }
+        CHECK(worstS * FastLog2Seg::kDbPerOctave < 2e-4);
+        CHECK(worstV * FastLog2Seg::kDbPerOctave < 2e-4);
+    }
+
+    // --- aggregation skip: with Peak/RMS on, every output bin is written (NaN sentinel), the fine part
+    //     equals the plain interpolation, and a Peak bin holds an actual FFT-bin value
+    for (int interp = 0; interp <= 1; ++interp) {
+        for (int agg = 1; agg <= 2; ++agg) {
+            AlignedVector src(8193);
+            for (auto& v : src) v = U(rng);
+            PerceptualWarping plain, aggd;
+            plain.setInterpolation(interp); plain.setAggregation(0);
+            aggd.setInterpolation(interp);  aggd.setAggregation(agg);
+            plain.buildWarpTables(0, 22050.0, 8193, 22050.0, 0.963, 20.0, 8193);
+            aggd.buildWarpTables(0, 22050.0, 8193, 22050.0, 0.963, 20.0, 8193);
+            AlignedVector o1, o2(8193, std::numeric_limits<float>::quiet_NaN());
+            plain.applyWarp(src, o1);
+            aggd.applyWarp(src, o2);
+            size_t nan = 0, same = 0, fromSrc = 0;
+            for (size_t i = 0; i < o2.size(); ++i) {
+                if (std::isnan(o2[i])) { ++nan; continue; }
+                if (o2[i] == o1[i]) ++same;
+                else if (agg == 1 && std::find(src.begin(), src.end(), o2[i]) != src.end()) ++fromSrc;
+            }
+            CHECK(nan == 0);
+            CHECK(aggd.aggregatedBins() > 100);
+            CHECK(same + aggd.aggregatedBins() >= o2.size());           // every non-aggregated bin is the interpolation
+            if (agg == 1) CHECK(same + fromSrc == o2.size());            // every Peak bin is a real FFT-bin value
+        }
+    }
+
+    // --- in-place ballistics == apply() + copy, bit for bit (and the reset / off paths)
+    {
+        AlignedVector cur(16389), prevA(16389), prevB;
+        for (size_t i = 0; i < cur.size(); ++i) { cur[i] = U(rng); prevA[i] = U(rng); }
+        prevB = prevA;
+        AlignedVector io = cur;
+        BallisticsFilter bf;
+        bf.apply(0.3f, 0.8f, cur, prevA);
+        bf.applyInPlace(0.3f, 0.8f, io, prevB);
+        CHECK(std::memcmp(prevA.data(), prevB.data(), prevA.size() * 4) == 0);
+        CHECK(std::memcmp(io.data(), prevA.data(), io.size() * 4) == 0);
+        AlignedVector empty, io2 = cur;
+        bf.applyInPlace(0.3f, 0.8f, io2, empty);                          // no history yet: restart at the frame
+        CHECK(empty.size() == cur.size() && std::memcmp(io2.data(), cur.data(), cur.size() * 4) == 0);
+    }
+
+    // --- weighting + reference peak in one pass
+    {
+        AlignedVector a1(1003), a2, curve(1003);
+        for (size_t i = 0; i < a1.size(); ++i) { a1[i] = U(rng); curve[i] = 0.5f + U(rng); }
+        a2 = a1;
+        const float m1 = multiplyInPlaceMax(a1.data(), curve.data(), a1.size());
+        multiplyInPlace(a2.data(), curve.data(), a2.size());
+        CHECK(std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0);
+        CHECK(m1 == peakMagnitude(a2.data(), a2.size()));
+    }
+
+    // --- spectral features vs the pre-2.12 scalar loop
+    {
+        const size_t n = 8193;
+        const double binHz = 44100.0 / 16384.0;
+        AlignedVector mag(n), tim(3175), prevA, prevB;
+        for (size_t i = 0; i < n; ++i) mag[i] = U(rng) * static_cast<float>(std::exp(-static_cast<double>(i) / 1500.0));
+        for (auto& x : tim) x = U(rng) - 0.5f;
+        SpectralFeatures f;
+        computeSpectralFeatures(mag.data(), n, binHz, tim.data(), tim.size(), prevA, f);   // prime prev
+        for (auto& v : prevA) v *= 0.7f;
+        prevB = prevA;
+        computeSpectralFeatures(mag.data(), n, binHz, tim.data(), tim.size(), prevA, f);
+        // reference
+        const float* lut = FastLog10::dbTable();
+        const size_t b250 = std::min(n, static_cast<size_t>(250.0 / binHz) + 1), b4k = std::min(n, static_cast<size_t>(4000.0 / binHz) + 1);
+        double total = 0, weighted = 0, sumMag = 0, logSum = 0, bass = 0, mid = 0, high = 0, rise = 0;
+        for (size_t k = 0; k < n; ++k) {
+            const float m = mag[k];
+            const double pw = static_cast<double>(m) * m;
+            total += pw; weighted += pw * static_cast<double>(k); sumMag += m;
+            logSum += FastLog10::scaled(std::max(m, 1e-12f), lut);
+            if (k < b250) bass += pw; else if (k < b4k) mid += pw; else high += pw;
+            const float dd = m - prevB[k]; if (dd > 0.0f) rise += dd;
+        }
+        double acc = 0; size_t kr = 0;
+        for (; kr < n; ++kr) { acc += static_cast<double>(mag[kr]) * mag[kr]; if (acc >= 0.85 * total) break; }
+        CHECK_NEAR(f.centroidHz, weighted / total * binHz, 1e-3 * weighted / total * binHz);
+        CHECK_NEAR(f.rolloffHz, std::min(kr, n - 1) * binHz, binHz * 1.01);
+        const double geo = std::pow(10.0, (logSum / n) / 10.0);
+        CHECK_NEAR(f.flatness, std::clamp(geo / (total / n), 0.0, 1.0), 1e-4);
+        CHECK_NEAR(f.flux, rise / sumMag, 1e-5);
+        CHECK_NEAR(f.bassDb, 10.0 * std::log10(bass), 1e-3);
+        CHECK_NEAR(f.midDb, 10.0 * std::log10(mid), 1e-3);
+        CHECK_NEAR(f.highDb, 10.0 * std::log10(high), 1e-3);
+        double s2 = 0; for (float x : tim) s2 += static_cast<double>(x) * x;
+        CHECK_NEAR(f.rmsDb, 20.0 * std::log10(std::sqrt(s2 / tim.size())), 1e-3);
+    }
+}
+
 // v2.11: the output sample count through the real pipeline, for every bins mode. Fixed must give exactly
 // Output Bins - also far above the rfft's N/2+1 (the zero-pad + interpolation use case); Auto and Raw
 // give N/2+1 of the transform actually run; Raw is bit-identical to the rfft magnitude; Zero-Padding off
@@ -2085,6 +2282,7 @@ int main()
     test_equal_loudness();
     test_v210_rate_helpers();
     test_output_bin_modes();
+    test_v212_simd_kernels();
     test_warp_aggregation();
     test_ingest_cursor();
     test_spectral_features();
