@@ -889,6 +889,123 @@ private:
 
 /*
 ===========================================================================
+ 1b. LOCK-FREE SAMPLE RING (SampleRing, v2.13)
+===========================================================================
+WHAT: one channel's input history, written by the cook thread and read IN PLACE by the analysis
+      worker. It replaces "FIFOBuffer + copy the whole window into the job" on the plugin's path:
+      the cook now copies only the samples that are new this cook (~735 at 44.1 kHz / 60 fps), and
+      the worker windows its frames straight out of the ring.
+
+WHY: the copy grew with the window. Measured (2026-11-07, i9-13900H): FIFO + window copy 0.38 us
+      per channel at 3175 samples but 4.4 us at 32768 - and Multi-FFT needs 32768, on the one thread
+      TouchDesigner waits for. With the ring the cook-thread cost no longer depends on the window
+      at all. The ring also never resizes, so changing the window length (or toggling Multi-FFT)
+      keeps the history instead of restarting from silence.
+
+THE PROTOCOL (single producer = cook thread, single consumer = the pipeline owner), a seqlock:
+      writer  write(x, n):  reserved = w + n   (relaxed), release fence,
+                            copy x into slots (w .. w+n) & mask,
+                            written = w + n    (release)
+      reader  job carries end = written() at publish time;
+              read slots (end - len .. end) & mask, acquire fence,
+              valid iff reserved - (end - len) <= capacity
+      If the writer has lapped the reader (the worker stalled for more than capacity - len samples:
+      0.74 s at 44.1 kHz with the largest Multi-FFT window), the frame is reported torn and the
+      pipeline drops it (jobs_dropped) instead of analysing a mix of two moments.
+      The sample loads/stores themselves are plain floats, not atomics, as in every seqlock: the
+      fences make a torn read detectable, and a detected torn read is never used.
+
+LAYOUT: capacity is a power of two (kCapacity = 2 x kMaxWinSamples), positions are 64-bit totals
+      that never wrap in practice, and slot = position & mask. Positions before the first sample
+      read as zero (the ring starts zeroed), which reproduces the FIFO's right-aligned zero padding.
+*/
+class SampleRing {
+public:
+    static constexpr size_t kCapacity = 131072;     // 2 x Parameters::kMaxWinSamples (65536)
+    static constexpr size_t kMask = kCapacity - 1;
+    static_assert((kCapacity & kMask) == 0, "SampleRing capacity must be a power of two");
+
+    SampleRing() : m_data(kCapacity, 0.0f) {}
+    SampleRing(const SampleRing&) = delete;
+    SampleRing& operator=(const SampleRing&) = delete;
+
+    // Producer (cook thread). Appends n samples; never allocates, never blocks.
+    void write(const float* x, size_t n) noexcept {
+        if (!x || n == 0) return;
+        const uint64_t endPos = m_written.load(std::memory_order_relaxed) + n;
+        if (n > kCapacity) { x += n - kCapacity; n = kCapacity; }   // only the newest kCapacity survive anyway
+        const uint64_t start = endPos - n;
+        m_reserved.store(endPos, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        const size_t s0 = static_cast<size_t>(start & kMask);
+        const size_t first = std::min(n, kCapacity - s0);
+        std::memcpy(m_data.data() + s0, x, first * sizeof(float));
+        if (n > first) std::memcpy(m_data.data(), x + first, (n - first) * sizeof(float));
+        m_written.store(endPos, std::memory_order_release);
+    }
+    // Total samples written so far (the "end" a job captures).
+    uint64_t written() const noexcept { return m_written.load(std::memory_order_acquire); }
+
+    // Consumer. Writes the `len` samples ending at position `end` into dst, multiplied by coef
+    // (coef == nullptr: a plain copy). Returns false when the writer lapped the read (torn).
+    bool readTail(uint64_t end, size_t len, const float* coef, float* dst) const noexcept {
+        if (len == 0) return true;
+        if (len > kCapacity) return false;
+        size_t lead = 0;                                       // samples before position 0: zeros
+        if (end < len) { lead = static_cast<size_t>(len - end); }
+        if (lead) {
+            std::memset(dst, 0, lead * sizeof(float));
+            if (lead == len) return true;
+        }
+        const uint64_t start = end - (len - lead);
+        const size_t n = len - lead;
+        const size_t s0 = static_cast<size_t>(start & kMask);
+        const size_t first = std::min(n, kCapacity - s0);
+        copySeg(m_data.data() + s0, coef ? coef + lead : nullptr, dst + lead, first);
+        if (n > first) copySeg(m_data.data(), coef ? coef + lead + first : nullptr, dst + lead + first, n - first);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return m_reserved.load(std::memory_order_relaxed) - start <= kCapacity;
+    }
+
+private:
+    static void copySeg(const float* __restrict src, const float* __restrict coef, float* __restrict dst, size_t n) noexcept {
+        if (!coef) { std::memcpy(dst, src, n * sizeof(float)); return; }
+        size_t i = 0;
+#if defined(__AVX2__)
+        for (; i + 15 < n; i += 16) {
+            _mm256_storeu_ps(dst + i,     _mm256_mul_ps(_mm256_loadu_ps(src + i),     _mm256_loadu_ps(coef + i)));
+            _mm256_storeu_ps(dst + i + 8, _mm256_mul_ps(_mm256_loadu_ps(src + i + 8), _mm256_loadu_ps(coef + i + 8)));
+        }
+        for (; i + 7 < n; i += 8) _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_loadu_ps(src + i), _mm256_loadu_ps(coef + i)));
+#endif
+        for (; i < n; ++i) dst[i] = src[i] * coef[i];
+    }
+
+    std::vector<float> m_data;
+    alignas(64) std::atomic<uint64_t> m_reserved{ 0 };    // written first: the end the writer is about to reach
+    alignas(64) std::atomic<uint64_t> m_written{ 0 };     // written last: the end the writer has reached
+};
+
+// Reads the newest `len` samples of a linear window (newest sample last), multiplied by coef, into
+// dst. A window shorter than len is zero-padded at the front (still filling). The tests and the bench
+// hand the pipeline linear windows; the plugin hands it SampleRings.
+inline void readLinearTail(const float* win, size_t winLen, size_t len, const float* coef, float* dst) noexcept {
+    size_t lead = 0;
+    if (winLen < len) { lead = len - winLen; std::memset(dst, 0, lead * sizeof(float)); }
+    const size_t n = len - lead;
+    const float* src = win + (winLen - n);
+    const float* c = coef ? coef + lead : nullptr;
+    float* d = dst + lead;
+    if (!c) { std::memcpy(d, src, n * sizeof(float)); return; }
+    size_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 7 < n; i += 8) _mm256_storeu_ps(d + i, _mm256_mul_ps(_mm256_loadu_ps(src + i), _mm256_loadu_ps(c + i)));
+#endif
+    for (; i < n; ++i) d[i] = src[i] * c[i];
+}
+
+/*
+===========================================================================
  2. DIRECT FORM II TRANSPOSED BIQUAD EQUALIZER (RBJ shelves)
 ===========================================================================
 WHAT: Two second-order IIR filters in series - a high shelf and a low shelf - with the coefficients
@@ -994,6 +1111,14 @@ public:
         sec.a1 = static_cast<float>(a1 / a0);
         sec.a2 = static_cast<float>(a2 / a0);
         sec.active = true;
+        // v2.13 (audit F10): a design that overflowed (a scripted gain far outside the slider) would
+        // turn z1/z2 into inf/NaN on the first sample, and that state used to survive until Reset.
+        // Such a shelf is switched off and its state cleared instead; the next finite design re-enables it.
+        if (!std::isfinite(sec.b0) || !std::isfinite(sec.b1) || !std::isfinite(sec.b2) ||
+            !std::isfinite(sec.a1) || !std::isfinite(sec.a2)) {
+            sec = BiquadSection{};
+        }
+        if (!std::isfinite(sec.z1) || !std::isfinite(sec.z2)) sec.reset();
     }
 
     // Re-designs both shelves if any of the five shaping parameters changed, and answers the one
@@ -2691,8 +2816,10 @@ public:
         // with it) must not go away while a planner thread is still running inside the library.
         abandonBackground();
         reapGraveyard(true);
+        std::lock_guard<std::mutex> lock(plannerMutex());
+        for (RetiredPlan& r : m_retired) if (r.destroy && r.plan) r.destroy(r.plan);
+        m_retired.clear();
         if (m_plan) {
-            std::lock_guard<std::mutex> lock(plannerMutex());
             if (m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
             m_plan = nullptr;
         }
@@ -2761,6 +2888,8 @@ public:
     // process-wide latch would let whichever backend went first suppress the other's import. Only
     // meaningful for a backend that reports wisdom support; oneMKL accepts the calls but has nothing
     // to save, and says so through hasWisdom().
+    // v2.13: always called with plannerMutex() already held by the caller (prepare() takes it before it
+    // touches any plan), so the import itself no longer locks - std::mutex is not recursive.
     bool importWisdomOnce(const FftApi& api, PlanLog* log) {
         static std::once_flag once[kMaxBackends];
         static bool ok[kMaxBackends] = {};
@@ -2786,10 +2915,7 @@ public:
         std::call_once(once[slot], [this, &api, log, slot, &info] {
             std::string path = wisdomPathFor(info);
             if (path.empty()) return;
-            {
-                std::lock_guard<std::mutex> lock(plannerMutex());   // wisdom import touches planner state
-                ok[slot] = api.importWisdom(path.c_str()) != 0;
-            }
+            ok[slot] = api.importWisdom(path.c_str()) != 0;   // planner state: the caller holds plannerMutex()
             if (log) log->log(std::string("[FFT Plugin] [").append(tag()) + "] wisdom " + (ok[slot] ? "loaded from " : "not found at ") + path, ok[slot]);
         });
         return ok[slot];
@@ -2827,12 +2953,15 @@ public:
         abandonBackground();
         reapGraveyard(false);
         if (m_plan) {
-            std::lock_guard<std::mutex> lock(plannerMutex());
-            if (m_backend.api.destroyPlan)
-                m_backend.api.destroyPlan(m_plan);
+            // v2.13 (audit F4): never wait for the planner here either. When another node's measurement
+            // holds the lock, the plan is retired and destroyed by a later reap, by its own library.
+            std::unique_lock<std::mutex> lock(plannerMutex(), std::try_to_lock);
+            if (lock.owns_lock()) { if (m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan); }
+            else m_retired.push_back(RetiredPlan{ m_backend.api.destroyPlan, m_plan });
             m_plan = nullptr;
         }
         m_fft_size = 0;
+        m_pending = false;
         m_planStatus = std::string(tag()) + " (Uninitialized)";
     }
 
@@ -2847,6 +2976,25 @@ public:
     // can fail to create one (rare), in which case the pipeline must surface the failure rather than
     // silently cooking zeros.
     bool hasPlan() const noexcept override { return m_plan != nullptr; }
+    // v2.13 (audit F4): prepare() found the process-wide planner lock taken (another measurement is
+    // running) and returned without touching the live plan. The caller retries on its next job, holds
+    // its previous result meanwhile, and reports the wait; nothing blocks. Cleared by the next prepare()
+    // that gets the lock.
+    bool planPending() const noexcept { return m_pending; }
+    size_t pendingSize() const noexcept { return m_pending ? m_pendingSize : 0; }
+    // The plan is built for exactly this size and is not waiting for the planner.
+    bool readyFor(size_t fft_size) const noexcept { return m_plan != nullptr && !m_pending && m_fft_size == fft_size; }
+    // Plans retired while the planner lock was taken, not yet destroyed (telemetry).
+    size_t retiredPlans() const noexcept { return m_retired.size(); }
+    // v2.13: hold back the background MEASURE/PATIENT upgrade while a caller plans several sizes in one
+    // batch (Multi-FFT), so the second size's ESTIMATE plan is not stuck behind the first size's
+    // measurement. releaseBackgroundHold() starts every upgrade that was held, if Async allows it.
+    void holdBackground() noexcept { m_bg_hold = true; }
+    void releaseBackgroundHold() {
+        m_bg_hold = false;
+        if (m_bg_allowed && m_wants_upgrade && m_plan && !m_pending && !upgradeInProgress() && m_fft_size != 0)
+            startBackgroundMeasure(m_fft_size, m_bg_rigor);
+    }
     // True while the background measurement is running. Read by the Info DAT to show an upgrade in
     // progress; it is an atomic load precisely because the reader is the cook thread and the writer
     // is the planner thread.
@@ -2882,13 +3030,40 @@ public:
         // Re-planning is not free even when nothing looks changed: it destroys the plan under the
         // process-wide planner lock, and a synchronous policy then re-measures and re-exports wisdom.
         // So the early-out compares the policy and the backend too, and returns before any of that.
-        if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy && m_backend.info == want)
+        if (m_fft_size == fft_size && m_plan != nullptr && m_policy == policy && m_backend.info == want && !m_pending)
             return;
+        if (fft_size == 0) { destroyPlan(); return; }
+
+        // v2.13 (audit F4): the planner lock is taken with try_lock. A FFTW_PATIENT measurement (this
+        // node's or another's) can hold it for seconds, and the old blocking lock made whoever re-planned
+        // wait that long - the worker (the spectrum froze) or, with Async off, TouchDesigner's cook. Now
+        // the live plan is left exactly as it is, the status says why, and the caller retries on its next
+        // job. Everything that must not run under the lock (reaping, which try_locks itself) runs first.
+        abandonBackground();
+        reapGraveyard(false);
+        std::unique_lock<std::mutex> plannerLock(plannerMutex(), std::try_to_lock);
+        if (!plannerLock.owns_lock()) {
+            if (!m_pending && log)
+                log->log(std::string("[FFT Plugin] [") + tag() + "] plan N=" + std::to_string(fft_size) +
+                         " waiting: the FFT planner is busy with another measurement (retrying every job, "
+                         "nothing blocks; the previous spectrum is held)");
+            m_pending = true;
+            m_pendingSize = fft_size;
+            m_planStatus = std::string(tag()) + " (waiting for the FFT planner: another plan is being measured, N=" +
+                           std::to_string(fft_size) + ")";
+            return;
+        }
+        m_pending = false;
 
         // Destroy the outgoing plan with the outgoing library, before switching. A plan belongs to
         // the library that created it; passing it to the other library's destroy_plan is undefined.
-        destroyPlan();
-        if (fft_size == 0) return;
+        // The planner lock is already held, so the destroy happens right here.
+        if (m_plan) {
+            if (m_backend.api.destroyPlan) m_backend.api.destroyPlan(m_plan);
+            m_plan = nullptr;
+        }
+        m_fft_size = 0;
+        m_planStatus = std::string(tag()) + " (Uninitialized)";
 
         // Selecting a backend costs nothing after the first time: the library is loaded once per
         // process and cached, so this only re-points at it. Toggling back and forth re-plans, which
@@ -2927,7 +3102,7 @@ public:
         m_policy = policy;
         m_log = log;
 
-        importWisdomOnce(api, log);
+        importWisdomOnce(api, log);   // under plannerLock (see importWisdomOnce)
 
         auto t0 = std::chrono::high_resolution_clock::now();
         const char* used = "FFTW_ESTIMATE";
@@ -2938,7 +3113,7 @@ public:
         // already the measured one.
         m_wants_upgrade = false;
         {
-            std::lock_guard<std::mutex> lock(plannerMutex());
+            // plannerLock (taken above) covers plan creation, the wisdom export and the wisdom import.
             Buffers b(api, fft_size);
             if (!b.ok()) { m_planStatus = std::string(tag()) + " (allocation failed)"; return; }
             if (!want->honoursPolicy) {
@@ -2984,6 +3159,7 @@ public:
                 used = "FFTW_ESTIMATE (fallback)";
             }
         }
+        plannerLock.unlock();   // the log lines and the backend description below do not need it
         // Say what actually happened, not what the policy would have liked: with Async off there is no
         // background thread to measure on, so the status must not keep claiming "measuring in
         // background". That string is what the Info DAT and the plan row show, and a user reading it
@@ -3019,7 +3195,10 @@ public:
         }
         if (start_background) {
             m_wants_upgrade = true;
-            if (!defer_upgrade) {
+            m_bg_rigor = bg_rigor;   // remembered for a deferred start (it used to keep the previous rigor)
+            if (!defer_upgrade && m_bg_hold) {
+                // held for a batch (Multi-FFT): releaseBackgroundHold() starts it, nothing to log yet
+            } else if (!defer_upgrade) {
                 startBackgroundMeasure(fft_size, bg_rigor);
             } else if (log) {
                 // Async is off, so the node is deliberately single-threaded: the measured upgrade is
@@ -3217,7 +3396,7 @@ public:
     void setBackgroundAllowed(bool allowed) override {
         if (allowed == m_bg_allowed) return;
         m_bg_allowed = allowed;
-        if (allowed && m_wants_upgrade && m_plan && !upgradeInProgress() && m_fft_size != 0)
+        if (allowed && !m_bg_hold && !m_pending && m_wants_upgrade && m_plan && !upgradeInProgress() && m_fft_size != 0)
             startBackgroundMeasure(m_fft_size, m_bg_rigor);
     }
 
@@ -3234,6 +3413,14 @@ private:
     // tasks that are already done, and only if the planner lock is free right now - cost when there is
     // nothing to do is one empty() check. block = true (teardown): waits for every one of them.
     void reapGraveyard(bool block) noexcept {
+        if (!m_retired.empty()) {
+            std::unique_lock<std::mutex> lock(plannerMutex(), std::defer_lock);
+            if (block) lock.lock(); else (void)lock.try_lock();
+            if (lock.owns_lock()) {
+                for (RetiredPlan& r : m_retired) if (r.destroy && r.plan) r.destroy(r.plan);
+                m_retired.clear();
+            }
+        }
         if (m_graveyard.empty()) return;
         for (size_t i = 0; i < m_graveyard.size();) {
             BgTask& t = *m_graveyard[i];
@@ -3274,6 +3461,12 @@ private:
     // The live plan is an ESTIMATE that a rigour policy wanted upgraded, but the measurement has not
     // been taken (yet). Set in prepare(), and the trigger for the re-arm in setBackgroundAllowed().
     bool m_wants_upgrade{ false };
+    // v2.13 (audit F4) - the planner-lock containment state (see prepare() and destroyPlan()).
+    bool m_pending{ false };               // the last prepare() found the planner lock taken
+    size_t m_pendingSize{ 0 };             // the size it wanted (status)
+    bool m_bg_hold{ false };               // background upgrades held for a batch (holdBackground)
+    struct RetiredPlan { void (*destroy)(fftwf_plan); fftwf_plan plan; };
+    std::vector<RetiredPlan> m_retired;    // destroyed by reapGraveyard() when the lock is free
 };
 
 } // namespace FFTDSP

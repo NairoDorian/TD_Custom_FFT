@@ -2255,6 +2255,336 @@ static void test_output_bin_modes()
     CHECK(r.spectra[0].size() == 32768);
 }
 
+// ------------------------------------------------------------------------------------------
+// ===================== v2.13: Multi-FFT, SampleRing, LayerPool, audit fixes =====================
+// ------------------------------------------------------------------------------------------
+
+// A deterministic test signal: two tones plus a little LCG noise, `n` samples, newest last.
+static AlignedVector multiTestSignal(size_t n, double sr)
+{
+    AlignedVector s(n);
+    uint32_t lcg = 12345u;
+    for (size_t i = 0; i < n; ++i) {
+        lcg = lcg * 1664525u + 1013904223u;
+        const double noise = (static_cast<double>(lcg >> 8) / 16777216.0 - 0.5) * 0.02;
+        s[i] = static_cast<float>(0.4 * std::sin(2.0 * PI_D * 440.0 * i / sr) + 0.2 * std::sin(2.0 * PI_D * 3150.0 * i / sr) + noise);
+    }
+    return s;
+}
+
+static AnalysisResult runOnce(AnalysisPipeline& pipe, const Parameters::Values& p, double sr, int winSamples,
+                              const std::vector<AlignedVector>& windows, const std::vector<uint32_t>& silentRun = {})
+{
+    AnalysisJob job;
+    job.numChannels = static_cast<int>(windows.size()); job.sampleRate = sr; job.winSamples = winSamples;
+    job.dtMs = 1000.0 / 60.0; job.reset = true; job.p = p; job.windows = windows;
+    job.silent.assign(windows.size(), 0);
+    job.silentRun = silentRun;
+    AnalysisResult res;
+    pipe.process(job, res);
+    return res;
+}
+
+static double maxAbs(const AlignedVector& v) { double m = 0.0; for (float x : v) m = std::max(m, static_cast<double>(std::abs(x))); return m; }
+
+// THE SPECIFICATION TEST. out == (1/L) * sum_k single_k / 2^(k-1), where single_k is the ordinary
+// single-window pipeline at window 1024 * 2^k with the same pad and the same output grid. Pinned with
+// interpolation (Warp Aggregation Off), where grouping is mathematically exact, at 1 and 3 threads.
+static void test_multi_fft_spec()
+{
+    section("v2.13 Multi-FFT: output == (1/L) sum_k M_k / 2^(k-1) (Coherent Gain), == (1/L) sum_k M_k (Full Scale)");
+    const double sr = 44100.0;
+    const AlignedVector sig = multiTestSignal(32768, sr);
+    for (int norm = 0; norm < 2; ++norm) {
+        Parameters::Values p;
+        p.planner = Parameters::Planner::Fast;
+        p.binsMode = Parameters::BinsMode::Fixed; p.bins = 16385;      // one grid for the single runs and the multi run
+        p.warpAggregate = Parameters::WarpAggregate::Off;
+        p.magNorm = norm ? Parameters::MagNorm::FullScale : Parameters::MagNorm::CoherentGain;
+        p.loudness = Parameters::Loudness::Off; p.ballEnable = false;
+        AlignedVector expect(16385, 0.0f);
+        for (int k = 0; k < 6; ++k) {
+            PlanLog log; AnalysisPipeline pipe(&log);
+            Parameters::Values ps = p;
+            const int w = 1024 << k;
+            AnalysisResult r = runOnce(pipe, ps, sr, w, { sig });
+            CHECK(r.spectra[0].size() == 16385);
+            const double g = norm ? (1.0 / 6.0) : (1.0 / 6.0) / static_cast<double>(1 << k);
+            for (size_t i = 0; i < expect.size(); ++i) expect[i] += static_cast<float>(g * r.spectra[0][i]);
+        }
+        const double ref = maxAbs(expect);
+        for (int threads : { 1, 3 }) {
+            PlanLog log; AnalysisPipeline pipe(&log);
+            Parameters::Values pm = p; pm.multiFft = true; pm.multiLayers = 6; pm.multiThreads = threads; pm.async = true;
+            AnalysisResult r = runOnce(pipe, pm, sr, 32768, { sig });
+            CHECK(r.spectra[0].size() == 16385);
+            double err = 0.0;
+            for (size_t i = 0; i < expect.size(); ++i) err = std::max(err, std::abs(static_cast<double>(r.spectra[0][i]) - expect[i]));
+            std::printf("  %s, %d thread(s): max |multi - spec| = %.3g (peak %.4g)\n", norm ? "Full Scale" : "Coherent Gain", threads, err, ref);
+            CHECK(err <= 1e-5 * ref);
+            const AnalysisPipeline::Status st = pipe.status();
+            CHECK(st.multi && st.layers == 6 && st.groups == 2);      // 16K pad: {1024..16384 @ N16384}, {32768 @ N32768}
+            CHECK(st.fftSize == 32768);
+            CHECK(st.layerThreads == threads);
+        }
+    }
+}
+
+// Every layer on one scale: a bin-centred sine reads the same normalised peak in all six layers
+// (Coherent Gain: A * 1024/2 after the 1/2^(k-1); Full Scale: A), and the average reads it too.
+static void test_multi_fft_scale()
+{
+    section("v2.13 Multi-FFT: every layer on the 1024 layer's scale (bin-centred sine)");
+    const double sr = 44100.0, A = 0.5;
+    const double f = 512.0 * sr / 32768.0;                           // bin-centred for N 16384 and 32768
+    AlignedVector sig(32768);
+    for (size_t i = 0; i < sig.size(); ++i) sig[i] = static_cast<float>(A * std::sin(2.0 * PI_D * f * i / sr));
+    for (int norm = 0; norm < 2; ++norm) {
+        Parameters::Values p;
+        p.planner = Parameters::Planner::Fast; p.rawBins = true;
+        p.magNorm = norm ? Parameters::MagNorm::FullScale : Parameters::MagNorm::CoherentGain;
+        const double target = norm ? A : A * 512.0;
+        for (int k = 0; k < 6; ++k) {
+            PlanLog log; AnalysisPipeline pipe(&log);
+            AnalysisResult r = runOnce(pipe, p, sr, 1024 << k, { sig });
+            const double layerPeak = r.peakMag * (norm ? 1.0 : 1.0 / static_cast<double>(1 << k));
+            CHECK_NEAR(20.0 * std::log10(layerPeak / target), 0.0, 0.5);
+        }
+        PlanLog log; AnalysisPipeline pipe(&log);
+        Parameters::Values pm = p; pm.multiFft = true;
+        AnalysisResult r = runOnce(pipe, pm, sr, 32768, { sig });
+        std::printf("  %s: multi peak %.4f vs %.4f (%.3f dB) at %.1f Hz\n", norm ? "Full Scale" : "Coherent Gain", r.peakMag, target,
+                    20.0 * std::log10(r.peakMag / target), r.peakHz);
+        CHECK_NEAR(20.0 * std::log10(r.peakMag / target), 0.0, 0.5);
+        CHECK_NEAR(r.peakHz, f, sr / 32768.0);
+        CHECK(r.spectra[0].size() == 16385);                         // Raw = the largest layer's N/2+1
+    }
+}
+
+// A layer whose whole window is digital silence is skipped, and skipping is exact: the same output as
+// computing it (an all-zero window contributes ~1e-15 per bin).
+static void test_multi_fft_silence_skip()
+{
+    section("v2.13 Multi-FFT: per-layer silence skip is exact");
+    const double sr = 44100.0;
+    AlignedVector sig = multiTestSignal(32768, sr);
+    for (size_t i = sig.size() - 2048; i < sig.size(); ++i) sig[i] = 0.0f;   // the newest 2048 samples are silent
+    Parameters::Values p; p.planner = Parameters::Planner::Fast; p.multiFft = true; p.async = false;
+    PlanLog log; AnalysisPipeline a(&log), b(&log);
+    AnalysisResult computed = runOnce(a, p, sr, 32768, { sig }, { 0u });
+    AnalysisResult skipped = runOnce(b, p, sr, 32768, { sig }, { 2048u });
+    CHECK(b.layersSilent() == 2);                                    // 1024 and 2048 cover only silence
+    CHECK(b.layersComputed() == 4);
+    const double ref = maxAbs(computed.spectra[0]);
+    double err = 0.0;
+    for (size_t i = 0; i < computed.spectra[0].size(); ++i) err = std::max(err, std::abs(static_cast<double>(computed.spectra[0][i]) - skipped.spectra[0][i]));
+    std::printf("  2 of 6 layers silent: max |skipped - computed| = %.3g (peak %.4g)\n", err, ref);
+    CHECK(err <= 1e-6 * ref + 1e-9);
+    // all silent: the linear short-circuit gives exact zeros
+    AnalysisResult z = runOnce(b, p, sr, 32768, { AlignedVector(32768, 0.0f) }, { 1u << 20 });
+    CHECK(maxAbs(z.spectra[0]) == 0.0);
+}
+
+// Hop-Scaled refresh on a stationary signal: the re-used long layers equal recomputed ones.
+static void test_multi_fft_hop_scaled()
+{
+    section("v2.13 Multi-FFT: Hop-Scaled refresh (stationary signal == Every Frame)");
+    const double sr = 44100.0;
+    const AlignedVector sig = multiTestSignal(32768, sr);
+    Parameters::Values p; p.planner = Parameters::Planner::Fast; p.multiFft = true; p.async = false;
+    Parameters::Values ph = p; ph.multiRefresh = Parameters::MultiRefresh::HopScaled;
+    CHECK(layerRefreshDivisor(ph, 2) == 1 && layerRefreshDivisor(ph, 3) == 2 && layerRefreshDivisor(ph, 4) == 4 && layerRefreshDivisor(ph, 5) == 8);
+    CHECK(layerRefreshDivisor(p, 5) == 1);
+    PlanLog log; AnalysisPipeline every(&log), hop(&log);
+    AnalysisJob job;
+    job.numChannels = 1; job.sampleRate = sr; job.winSamples = 32768; job.windows = { sig }; job.silent = { 0 };
+    double worst = 0.0, ref = 0.0;
+    for (int j = 0; j < 12; ++j) {
+        job.seq = static_cast<uint64_t>(j + 1); job.reset = (j == 0);
+        AnalysisResult re, rh;
+        job.p = p; every.process(job, re);
+        job.p = ph; hop.process(job, rh);
+        ref = maxAbs(re.spectra[0]);
+        for (size_t i = 0; i < re.spectra[0].size(); ++i) worst = std::max(worst, std::abs(static_cast<double>(re.spectra[0][i]) - rh.spectra[0][i]));
+    }
+    CHECK(worst <= 1e-6 * ref);
+}
+
+// SampleRing: in-place reads equal the linear history, the zero lead-in, wrap-around, and a lapped
+// read is reported torn (never used).
+static void test_sample_ring()
+{
+    section("v2.13 SampleRing (lock-free input history)");
+    auto ring = std::make_unique<SampleRing>();
+    std::vector<float> all;
+    uint32_t lcg = 7u;
+    // lead-in: fewer samples than the window -> zeros first
+    std::vector<float> blk(735);
+    auto feed = [&](size_t n) {
+        blk.resize(n);
+        for (float& x : blk) { lcg = lcg * 1664525u + 1013904223u; x = static_cast<float>(lcg >> 9) / 8388608.0f - 1.0f; }
+        ring->write(blk.data(), n);
+        all.insert(all.end(), blk.begin(), blk.end());
+    };
+    feed(735);
+    AlignedVector out(1024), coef(1024, 2.0f);
+    CHECK(ring->readTail(ring->written(), 1024, nullptr, out.data()));
+    bool ok = true;
+    for (size_t i = 0; i < 1024 - 735; ++i) ok = ok && out[i] == 0.0f;
+    for (size_t i = 0; i < 735; ++i) ok = ok && out[1024 - 735 + i] == all[i];
+    CHECK(ok);
+    // many cooks, crossing the end of the ring several times
+    for (int c = 0; c < 600; ++c) feed(735 + static_cast<size_t>(c % 7));
+    AlignedVector w(32768);
+    CHECK(ring->readTail(ring->written(), 32768, coef.size() == 32768 ? coef.data() : nullptr, w.data()));
+    ok = true;
+    for (size_t i = 0; i < 32768; ++i) ok = ok && w[i] == all[all.size() - 32768 + i];
+    CHECK(ok);
+    AlignedVector c2(32768, 0.5f);
+    CHECK(ring->readTail(ring->written(), 32768, c2.data(), w.data()));
+    ok = true;
+    for (size_t i = 0; i < 32768; ++i) ok = ok && w[i] == all[all.size() - 32768 + i] * 0.5f;
+    CHECK(ok);
+    // torn: the job captured `end`, then the writer ran more than (capacity - window) ahead
+    const uint64_t end = ring->written();
+    for (int c = 0; c < 140; ++c) feed(735);                         // 102900 > 131072 - 32768
+    CHECK(!ring->readTail(end, 32768, nullptr, w.data()));
+    CHECK(ring->readTail(ring->written(), 32768, nullptr, w.data()));   // the current end is fine
+    // an oversized write keeps only the newest kCapacity samples, and positions still advance by n
+    const uint64_t before = ring->written();
+    std::vector<float> big(SampleRing::kCapacity + 1000, 0.25f);
+    big.back() = 0.75f;
+    ring->write(big.data(), big.size());
+    CHECK(ring->written() == before + big.size());
+    CHECK(ring->readTail(ring->written(), 1, nullptr, w.data()) && w[0] == 0.75f);
+}
+
+// The plugin's job path (rings) and the tests' path (linear windows) give the same spectrum.
+static void test_ring_pipeline_path()
+{
+    section("v2.13 pipeline: SampleRing job path == linear window path (single and Multi-FFT)");
+    const double sr = 48000.0;
+    const AlignedVector sig = multiTestSignal(40000, sr);
+    auto ring = std::make_unique<SampleRing>();
+    for (size_t i = 0; i < sig.size(); i += 800) ring->write(sig.data() + i, std::min<size_t>(800, sig.size() - i));
+    for (int multi = 0; multi < 2; ++multi) {
+        Parameters::Values p; p.planner = Parameters::Planner::Fast; p.multiFft = multi != 0; p.async = false; p.features = true;
+        const int win = maxWindowSamples(p, sr);
+        AlignedVector tail(sig.end() - win, sig.end());
+        PlanLog log; AnalysisPipeline a(&log), b(&log);
+        AnalysisResult lin = runOnce(a, p, sr, win, { tail });
+        AnalysisJob job;
+        job.numChannels = 1; job.sampleRate = sr; job.winSamples = win; job.reset = true; job.p = p;
+        job.rings = { ring.get() }; job.ringEnd = { ring->written() }; job.silentRun = { 0u }; job.silent = { 0 };
+        AnalysisResult rr;
+        CHECK(b.process(job, rr));
+        double err = 0.0;
+        for (size_t i = 0; i < lin.spectra[0].size(); ++i) err = std::max(err, std::abs(static_cast<double>(lin.spectra[0][i]) - rr.spectra[0][i]));
+        CHECK(err == 0.0);
+        CHECK(rr.hasFeatures && std::abs(rr.features.rmsDb - lin.features.rmsDb) < 1e-4);
+    }
+}
+
+// Output counts, layer model and the v2.13 rate helpers.
+static void test_multi_fft_rate_model()
+{
+    section("v2.13 Multi-FFT rate model + audit helpers (F2 audio dt, F3 rate)");
+    std::printf("  sizeof(Parameters::Values) = %zu\n", sizeof(Parameters::Values));
+    const double sr = 44100.0;
+    Parameters::Values p; p.multiFft = true;
+    CHECK(layerCount(p) == 6);
+    CHECK(layerWindowSamples(p, sr, 0) == 1024 && layerWindowSamples(p, sr, 5) == 32768);
+    CHECK(maxWindowSamples(p, sr) == 32768);
+    CHECK(outputBinCountFrom(p, sr) == 16385);                       // D1: Auto = the largest layer's N/2+1 at pad 16K
+    CHECK(referenceWindowSamples(p, sr) == 1024);
+    CHECK_NEAR(layerGain(p, 0), 1.0 / 6.0, 1e-12);
+    CHECK_NEAR(layerGain(p, 5), 1.0 / (6.0 * 32.0), 1e-12);
+    Parameters::Values pf = p; pf.magNorm = Parameters::MagNorm::FullScale;
+    CHECK_NEAR(layerGain(pf, 5), 1.0 / 6.0, 1e-12);                  // D3: equal weights in Full Scale
+    Parameters::Values p4 = p; p4.multiLayers = 4;
+    CHECK(maxWindowSamples(p4, sr) == 8192 && outputBinCountFrom(p4, sr) == 8193);
+    Parameters::Values pz = p; pz.zeroPad = false;
+    CHECK(outputBinCountFrom(pz, sr) == 16385 && fftSizeFrom(pz, 1024) == 1024);
+    Parameters::Values single;
+    CHECK(layerCount(single) == 1 && maxWindowSamples(single, sr) == 3175 && outputBinCountFrom(single, sr) == 8193);
+    CHECK_NEAR(layerGain(single, 0), 1.0, 0.0);
+    // F3
+    CHECK(sanitizeCookRate(std::nan("")) == 60.0 && sanitizeCookRate(INFINITY) == 60.0 && sanitizeCookRate(0.0) == 60.0 &&
+          sanitizeCookRate(1e9) == 60.0 && sanitizeCookRate(120.0) == 120.0);
+    // F2: audio time, bounded by the frame time
+    CHECK_NEAR(audioFrameMs(735.0, 44100.0, 16.67), 16.667, 0.01);
+    CHECK_NEAR(audioFrameMs(1470.0, 44100.0, 33.3), 33.333, 0.01);   // a dropped frame: the audio that arrived
+    CHECK_NEAR(audioFrameMs(0.0, 44100.0, 16.67), 16.67, 1e-9);      // no audio: the frame time
+    CHECK_NEAR(audioFrameMs(441000.0, 44100.0, 16.67), 4.0 * 16.67, 1e-9);   // a re-delivered 10 s buffer: bounded
+    // F1 helper
+    Parameters::Values a{}, b{};
+    CHECK(!Parameters::paramsDiffer(a, b));
+    b.warp = 0.5;
+    CHECK(Parameters::paramsDiffer(a, b));
+}
+
+// LayerPool: balanced assignment and a run that touches every task exactly once, at 1..4 threads.
+static void test_layer_pool()
+{
+    section("v2.13 LayerPool (balance + run)");
+    std::vector<double> cost = { 48, 22, 22, 22, 22, 22 };
+    std::vector<std::vector<int>> bins;
+    LayerPool::balance(cost, 3, bins);
+    CHECK(bins.size() == 3);
+    double load0 = 0.0; for (int t : bins[0]) load0 += cost[t];
+    for (auto& b : bins) { double l = 0.0; for (int t : b) l += cost[t]; CHECK(l <= load0 + 1e-9); }
+    for (int threads = 1; threads <= 4; ++threads) {
+        LayerPool pool; pool.resize(threads - 1);
+        std::vector<double> c(37, 1.0);
+        LayerPool::balance(c, threads, bins);
+        std::vector<std::atomic<int>> hits(37);
+        for (int round = 0; round < 200; ++round)
+            pool.run(bins, [](void* ctx, int t) noexcept { (*static_cast<std::vector<std::atomic<int>>*>(ctx))[t].fetch_add(1); }, &hits);
+        bool ok = true;
+        for (auto& h : hits) ok = ok && h.load() == 200;
+        CHECK(ok);
+    }
+}
+
+// F5: Async off reaches the engine before its first plan - no background measurement thread starts.
+static void test_async_off_first_plan()
+{
+    section("v2.13 audit F5: Async off applies to the first plan");
+    Parameters::Values p; p.async = false; p.planner = Parameters::Planner::Patient; p.padSize = 4096;
+    PlanLog log; AnalysisPipeline pipe(&log);
+    AlignedVector sig(3175, 0.1f);
+    runOnce(pipe, p, 44100.0, 3000 + 77, { sig });                  // an odd window: N 4096 (likely not in wisdom)
+    CHECK(!pipe.status().planUpgrading);
+    Parameters::Values pm = p; pm.multiFft = true;
+    runOnce(pipe, pm, 44100.0, 32768, { multiTestSignal(32768, 44100.0) });
+    CHECK(!pipe.status().planUpgrading);
+}
+
+// The steady state allocates nothing in Multi-FFT either, serial and with the layer threads.
+static void test_multi_fft_allocation_gate()
+{
+    section("v2.13 Multi-FFT allocation gate");
+    auto run = [&](int channels, int threads) {
+        Parameters::Values p;
+        p.planner = Parameters::Planner::Fast; p.multiFft = true; p.multiThreads = threads; p.async = threads > 1;
+        p.loudness = Parameters::Loudness::Db; p.ballEnable = true; p.features = true;
+        PlanLog log; AnalysisPipeline pipe(&log);
+        AnalysisJob job;
+        job.numChannels = channels; job.sampleRate = 48000.0; job.winSamples = 32768; job.p = p;
+        job.windows.assign(static_cast<size_t>(channels), multiTestSignal(32768, 48000.0));
+        job.silent.assign(static_cast<size_t>(channels), 0);
+        AnalysisResult res;
+        for (int i = 0; i < 20; ++i) pipe.process(job, res);
+        long long n;
+        { AllocWindow w; for (int i = 0; i < 200; ++i) pipe.process(job, res); n = w.count(); }
+        std::printf("  %d channel(s), %d layer thread(s): %lld allocations over 200 jobs, %.1f us per job\n", channels, threads, n, pipe.lastUs());
+        return n;
+    };
+    CHECK(run(1, 1) == 0);
+    CHECK(run(1, 3) == 0);
+    CHECK(run(4, 3) == 0);
+}
+
 int main()
 {
     // Unbuffered stdout, for the same reason as the bench: piped output is block-buffered by the MSVC
@@ -2305,6 +2635,16 @@ int main()
     test_allocation_gate();
     test_async_analysis();
     test_planner_graveyard();
+    test_multi_fft_rate_model();
+    test_sample_ring();
+    test_layer_pool();
+    test_multi_fft_spec();
+    test_multi_fft_scale();
+    test_multi_fft_silence_skip();
+    test_multi_fft_hop_scaled();
+    test_ring_pipeline_path();
+    test_async_off_first_plan();
+    test_multi_fft_allocation_gate();
     // The line the header's "the check count is a signal" section is about. Exit code is 0 only when
     // every check passed, which is what ctest --output-on-failure keys off.
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

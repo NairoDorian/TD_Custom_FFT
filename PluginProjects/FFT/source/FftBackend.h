@@ -77,6 +77,7 @@ library symbol directly. That indirection is the whole mechanism, and section 1 
 #include <cstdio>
 #include <cstdlib>      // std::free - for the string fftwf_sprint_plan hands back (see section 4)
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #ifdef _WIN32
@@ -712,8 +713,10 @@ inline BackendCache& backendCache()
 // Note for a reader: this is currently not called from the plugin, tests/dsp_tests.cpp or
 // bench/bench.cpp - nothing in the repository references it today. It is kept as the documented way
 // to force a re-resolve, and the comment above states what it does and does not do.
+inline std::mutex& backendCacheMutex();
 inline void resetBackendCache()
 {
+    std::lock_guard<std::mutex> lock(backendCacheMutex());
     backendCache() = BackendCache();
 }
 
@@ -728,8 +731,21 @@ inline void resetBackendCache()
 // guarantee goes away and FFTWEngine::m_backend would be the first thing to break.
 // CALLED BY: FFTWEngine::prepare() in DSPModules.h (twice - once for the requested backend, once for
 // the default when the requested one failed to load).
+// THREAD SAFETY (v2.13, audit F6): several FFT nodes plan on their own workers, so two of them can
+// select a backend for the first time in the same frame - the normal case when a project loads. The
+// table holds std::string members and a slot count, so an unsynchronised first load could hand one
+// node a half-written FftBackend. One process-wide mutex serialises the lookup; it is taken once per
+// prepare(), never per cook, and the returned reference stays valid because an occupied slot is never
+// rewritten.
+inline std::mutex& backendCacheMutex()
+{
+    static std::mutex m;
+    return m;
+}
+
 inline const FftBackend& cachedBackend(const FftBackendInfo& info)
 {
+    std::lock_guard<std::mutex> lock(backendCacheMutex());
     BackendCache& cache = backendCache();
     for (int i = 0; i < cache.count; ++i) {
         if (cache.key[i]->id && info.id && std::strcmp(cache.key[i]->id, info.id) == 0)

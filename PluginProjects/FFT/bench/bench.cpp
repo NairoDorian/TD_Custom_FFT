@@ -102,6 +102,10 @@ struct Args {
     int info = 0;              // > 0: also measure the info-callback access cost for this many cooks
     PlannerPolicy planner = PlannerPolicy::Auto;
     int backend = 0;           // registry index: 0 = FFTW3, 1 = oneMKL (see FftBackend.h)
+    // v2.13 Multi-FFT: --multi 1 turns it on for --cook; --threads N = Multi-FFT Layer Threads;
+    // --refresh 1 = Hop-Scaled; --layers N. --multi-ab R runs the interleaved comparison of the
+    // Multi-FFT configurations (R rounds) and exits.
+    int multi = 0, threads = 3, refresh = 0, layers = 6, multiAb = 0;
 };
 
 // ===================== INFO-CALLBACK ACCESS COST (--info N) =====================
@@ -264,11 +268,18 @@ static Parameters::Values pluginParamsFrom(const Args& a)
     p.backend = a.backend ? Parameters::Backend::OneMkl : Parameters::Backend::Fftw3;
     p.displayMax = a.fmax;
     p.preset = static_cast<Parameters::Preset>(std::clamp(a.preset, 0, 3));
+    p.multiFft = a.multi != 0;
+    p.multiThreads = std::clamp(a.threads, 1, 6);
+    p.multiLayers = std::clamp(a.layers, 2, 6);
+    p.multiRefresh = a.refresh ? Parameters::MultiRefresh::HopScaled : Parameters::MultiRefresh::EveryFrame;
     applyPreset(p);
     return p;
 }
 
-static CookStats runCooks(Parameters::Values p, bool async, Parameters::WorkerWake wake, int cooks, int paceMs, bool evict)
+// legacyCopy: the pre-2.13 ingest (FIFO + a copy of the whole window into every job) instead of the
+// SampleRing the plugin uses now - kept so the cook-thread saving can be A/B'd on any machine.
+static CookStats runCooks(Parameters::Values p, bool async, Parameters::WorkerWake wake, int cooks, int paceMs, bool evict,
+                          bool legacyCopy = false)
 {
     const double sr = 44100.0;
     const size_t block = 735;                                        // 44.1 kHz @ 60 fps
@@ -278,9 +289,11 @@ static CookStats runCooks(Parameters::Values p, bool async, Parameters::WorkerWa
     AnalysisPipeline pipe(&log);
     AsyncAnalysis an(pipe, log);
     an.configure(async, wake, Parameters::WorkerPriority::Highest);
-    const int win = windowSamplesFrom(p, sr);
+    const int win = maxWindowSamples(p, sr);
     const size_t bins = static_cast<size_t>(outputBinCountFrom(p, sr));
     FIFOBuffer fifo(static_cast<size_t>(win));
+    auto ring = std::make_unique<SampleRing>();
+    size_t silentRun = 0;
     std::vector<float> inL(block), inR(block);
     for (size_t i = 0; i < block; ++i) { inL[i] = static_cast<float>(0.3 * std::sin(i * 0.1)); inR[i] = static_cast<float>(0.2 * std::sin(i * 0.37)); }
     AlignedVector mixed(block), out(bins);
@@ -293,12 +306,20 @@ static CookStats runCooks(Parameters::Values p, bool async, Parameters::WorkerWa
         std::memcpy(mixed.data(), inL.data(), block * sizeof(float));
         addInto(mixed.data(), inR.data(), mixed.data(), block);
         scaleInPlace(mixed.data(), block, 0.5f);
-        fifo.add(mixed.data(), block);
         AnalysisJob& j = an.jobSlot();
         j.seq = ++seq; j.numChannels = 1; j.sampleRate = sr; j.winSamples = win; j.dtMs = 1000.0 / 60.0; j.p = p; j.reset = false;
-        if (j.windows.size() != 1) j.windows.resize(1);
         if (j.silent.size() != 1) j.silent.assign(1, 0);
-        fifo.get(j.windows[0]);
+        if (legacyCopy) {
+            fifo.add(mixed.data(), block);
+            if (j.windows.size() != 1) j.windows.resize(1);
+            fifo.get(j.windows[0]);
+        } else {
+            // what FFT::ingest + fillJob do since v2.13: silence tracking, append the new block, name the ring
+            if (blockIsSilent(mixed.data(), block)) silentRun += block; else silentRun = 0;
+            ring->write(mixed.data(), block);
+            if (j.rings.size() != 1) { j.rings.assign(1, nullptr); j.ringEnd.assign(1, 0); j.silentRun.assign(1, 0); }
+            j.rings[0] = ring.get(); j.ringEnd[0] = ring->written(); j.silentRun[0] = static_cast<uint32_t>(silentRun);
+        }
         an.publish();
         an.acquireResult();
         const AnalysisResult& r = an.result();
@@ -383,16 +404,19 @@ static bool readBaseline(const char* path, std::vector<std::pair<std::string, do
     return true;
 }
 
-static double pipelineP50(Parameters::Values p, int iters)
+// keepAsync: leave p.async as given (Multi-FFT Layer Threads only run with Async on); otherwise the
+// pipeline is measured single-threaded, as before.
+static double pipelineP50(Parameters::Values p, int iters, bool keepAsync = false, int channels = 1)
 {
-    p.async = false;
+    if (!keepAsync) p.async = false;
     PlanLog log;
     AnalysisPipeline pipe(&log);
     AnalysisJob job;
-    job.numChannels = 1; job.sampleRate = 44100.0; job.winSamples = windowSamplesFrom(p, 44100.0); job.p = p; job.dtMs = 16.7;
-    job.windows.assign(1, AlignedVector(static_cast<size_t>(job.winSamples)));
-    for (size_t i = 0; i < job.windows[0].size(); ++i) job.windows[0][i] = static_cast<float>(0.3 * std::sin(i * 0.1) + 0.1 * std::sin(i * 1.7));
-    job.silent.assign(1, 0);
+    job.numChannels = channels; job.sampleRate = 44100.0; job.winSamples = maxWindowSamples(p, 44100.0); job.p = p; job.dtMs = 16.7;
+    job.windows.assign(static_cast<size_t>(channels), AlignedVector(static_cast<size_t>(job.winSamples)));
+    for (auto& w : job.windows)
+        for (size_t i = 0; i < w.size(); ++i) w[i] = static_cast<float>(0.3 * std::sin(i * 0.1) + 0.1 * std::sin(i * 1.7));
+    job.silent.assign(static_cast<size_t>(channels), 0);
     AnalysisResult res;
     for (int i = 0; i < 50; ++i) pipe.process(job, res);
     std::vector<double> t(static_cast<size_t>(iters));
@@ -428,6 +452,12 @@ static int perfGate(const Args& a)
     m.emplace_back("pipeline_fullchain_p50_us", best([&] { return pipelineP50(full, 800); }));
     m.emplace_back("cook_async_poll_p50_us", best([&] { return runCooks(def, true, Parameters::WorkerWake::Poll, 200, 4, false).p50; }));
     m.emplace_back("cook_sync_p50_us", best([&] { return runCooks(def, false, Parameters::WorkerWake::Poll, 200, 4, false).p50; }));
+    // v2.13 Multi-FFT (the specification: 6 layers, shared 16K pad), serial and the default 3 threads
+    Parameters::Values mu = def; mu.multiFft = true; mu.multiThreads = 1;
+    Parameters::Values mu3 = mu; mu3.multiThreads = 3; mu3.async = true;
+    m.emplace_back("pipeline_multi_p50_us", best([&] { return pipelineP50(mu, 300); }));
+    m.emplace_back("pipeline_multi_3threads_p50_us", best([&] { return pipelineP50(mu3, 300, true); }));
+    m.emplace_back("cook_async_multi_p50_us", best([&] { return runCooks(mu3, true, Parameters::WorkerWake::Poll, 200, 4, false).p50; }));
 
     if (a.update) {
         FILE* f = std::fopen(a.gate.c_str(), "wb");
@@ -456,6 +486,63 @@ static int perfGate(const Args& a)
     if (compared == 0) { std::printf("gate: the baseline has no metrics - run with --update 1 once on this machine\n"); return 0; }
     std::printf("gate: %d regression(s)\n", fails);
     return fails ? 1 : 0;
+}
+
+// ===================== MULTI-FFT A/B (--multi-ab R) =====================
+// Interleaved rounds (each configuration once per round, the order rotating), median of each
+// configuration's per-round p50 - the protocol every v2.12/v2.13 perf decision was taken with. The
+// rows are the Multi-FFT options against the single-window default, plus the cook-thread cost of the
+// old FIFO-copy ingest vs the SampleRing at the 32768-sample history Multi-FFT needs.
+static int multiAb(const Args& a)
+{
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+    Parameters::Values def = pluginParamsFrom(a);
+    def.multiFft = false;
+    def.planner = Parameters::Planner::Measured;
+    struct Cfg { const char* name; Parameters::Values p; bool async; int ch; };
+    std::vector<Cfg> cfg;
+    auto multi = [&](int threads, bool hop, bool zeropad, int layers) {
+        Parameters::Values p = def; p.multiFft = true; p.multiThreads = threads; p.multiLayers = layers;
+        p.multiRefresh = hop ? Parameters::MultiRefresh::HopScaled : Parameters::MultiRefresh::EveryFrame; p.zeroPad = zeropad;
+        p.async = threads > 1;
+        return p;
+    };
+    cfg.push_back({ "single default (3175 win, N 16384)", def, false, 1 });
+    cfg.push_back({ "multi 6, 1 thread (spec)", multi(1, false, true, 6), false, 1 });
+    cfg.push_back({ "multi 6, 2 threads", multi(2, false, true, 6), true, 1 });
+    cfg.push_back({ "multi 6, 3 threads", multi(3, false, true, 6), true, 1 });
+    cfg.push_back({ "multi 6, 4 threads", multi(4, false, true, 6), true, 1 });
+    cfg.push_back({ "multi 6, 1 thread, Hop-Scaled", multi(1, true, true, 6), false, 1 });
+    cfg.push_back({ "multi 6, 3 threads, Hop-Scaled", multi(3, true, true, 6), true, 1 });
+    cfg.push_back({ "multi 6, 1 thread, Zero-Padding off", multi(1, false, false, 6), false, 1 });
+    cfg.push_back({ "multi 5 layers (no 32K), 1 thread", multi(1, false, true, 5), false, 1 });
+    cfg.push_back({ "multi 6, 4 ch, 1 thread (channel par)", multi(1, false, true, 6), false, 4 });
+    cfg.push_back({ "multi 6, 4 ch, 4 threads (ch x layer)", multi(4, false, true, 6), true, 4 });
+    const int rounds = std::max(1, a.multiAb);
+    std::vector<std::vector<double>> r(cfg.size());
+    for (int round = 0; round < rounds; ++round)
+        for (size_t i = 0; i < cfg.size(); ++i) {
+            const size_t c = (i + static_cast<size_t>(round)) % cfg.size();
+            r[c].push_back(pipelineP50(cfg[c].p, 300, cfg[c].async, cfg[c].ch));
+        }
+    auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    const double base = med(r[0]);
+    std::printf("\nMulti-FFT pipeline per job (median of %d interleaved rounds of p50 over 300 jobs, %s):\n", rounds,
+                def.backend == Parameters::Backend::OneMkl ? "oneMKL" : "FFTW3");
+    for (size_t i = 0; i < cfg.size(); ++i)
+        std::printf("  %-40s %8.1f us  (%.2fx the single default)\n", cfg[i].name, med(r[i]), med(r[i]) / base);
+    Parameters::Values mc = multi(3, false, true, 6);
+    std::vector<double> legacy, ringv;
+    for (int round = 0; round < rounds; ++round) {
+        legacy.push_back(runCooks(mc, true, Parameters::WorkerWake::Poll, 200, 4, false, true).p50);
+        ringv.push_back(runCooks(mc, true, Parameters::WorkerWake::Poll, 200, 4, false, false).p50);
+    }
+    std::printf("\ncook thread, Multi-FFT on (32768-sample history), Async + Poll, p50 per cook:\n");
+    std::printf("  FIFO + window copy (pre-2.13)            %8.2f us\n", med(legacy));
+    std::printf("  SampleRing (v2.13)                       %8.2f us\n", med(ringv));
+    return 0;
 }
 
 // ===================== ARGUMENT PARSING =====================
@@ -493,6 +580,11 @@ static Args parse(int argc, char** argv)
         else if (k == "--update") a.update = std::atoi(v);
         else if (k == "--private-wisdom") a.privateWisdom = std::atoi(v);
         else if (k == "--info") a.info = std::atoi(v);
+        else if (k == "--multi") a.multi = std::atoi(v);
+        else if (k == "--threads") a.threads = std::atoi(v);
+        else if (k == "--refresh") a.refresh = std::atoi(v);
+        else if (k == "--layers") a.layers = std::atoi(v);
+        else if (k == "--multi-ab") a.multiAb = std::atoi(v);
         else if (k == "--planner") {
             std::string p = v;
             a.planner = (p == "fast") ? PlannerPolicy::Fast : (p == "measured") ? PlannerPolicy::Measured
@@ -537,6 +629,7 @@ int main(int argc, char** argv)
     // Private wisdom by default: a bench run must neither depend on nor rewrite the user's plan cache.
     if (a.privateWisdom) FFTWEngine::wisdomPathOverride() = "fft_bench_wisdom.txt";
     if (!a.gate.empty()) return perfGate(a);
+    if (a.multiAb > 0) return multiAb(a);
     const double sr = 44100.0;                                       // the input rate the whole run is modelled at
     const size_t N = static_cast<size_t>(a.fft), win = static_cast<size_t>(a.win), bins = static_cast<size_t>(a.bins);
     std::printf("FFT bench: channels=%d fft=%zu win=%zu bins=%zu scale=%d db=%d iters=%d (AVX2 %s)\n",

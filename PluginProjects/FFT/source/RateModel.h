@@ -172,13 +172,80 @@ inline double mainLobeHalfWidthBins(const Parameters::Values& p)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// v2.13 Multi-FFT layer model (Parameters.h, MultiRefresh, has the specification)
+// ---------------------------------------------------------------------------------------------
+// How many analysis layers run: 1 in single mode, Multi-FFT Layers (2..6) otherwise.
+inline int layerCount(const Parameters::Values& p)
+{
+	return p.multiFft ? std::clamp(p.multiLayers, 1, Parameters::kMultiMaxLayers) : 1;
+}
+// Layer k's window (k = 0 is layer 1): 1024 * 2^k in Multi-FFT, the Window Sampling window otherwise.
+inline int layerWindowSamples(const Parameters::Values& p, double sampleRate, int k)
+{
+	return p.multiFft ? (Parameters::kMultiBaseWindow << std::clamp(k, 0, Parameters::kMultiMaxLayers - 1))
+	                  : windowSamplesFrom(p, sampleRate);
+}
+// The longest window any layer reads: the history the input ring must hold for one job.
+inline int maxWindowSamples(const Parameters::Values& p, double sampleRate)
+{
+	return layerWindowSamples(p, sampleRate, layerCount(p) - 1);
+}
+// Layer k's amplitude gain, folded into its window coefficients (|FFT(x w g)| = g |FFT(x w)|, so this
+// costs nothing per bin). Coherent Gain: a sine reads A*w/2, so dividing layer k by 2^k (= w_k/1024)
+// puts every layer on the 1024 layer's scale - the user's specification. Full Scale already reads A
+// for every length, so there the layers are only averaged (design decision D3). Single mode: 1.
+inline double layerGain(const Parameters::Values& p, int k)
+{
+	if (!p.multiFft) return 1.0;
+	const double avg = 1.0 / static_cast<double>(layerCount(p));
+	return (p.magNorm == Parameters::MagNorm::FullScale) ? avg : avg / static_cast<double>(1 << std::clamp(k, 0, 30));
+}
+// The window length the dBFS reference is taken from: the output's scale is the 1024 layer's in
+// Multi-FFT (Coherent Gain reads A * 1024 / 2 there), the window itself otherwise.
+inline int referenceWindowSamples(const Parameters::Values& p, double sampleRate)
+{
+	return p.multiFft ? Parameters::kMultiBaseWindow : windowSamplesFrom(p, sampleRate);
+}
+// Hop-Scaled refresh: layer k is recomputed when (job % div) == phase. Layers 1-3 every job, then 2, 4,
+// 8 with phases 0, 1, 3 so the three long layers never land on the same job.
+inline int layerRefreshDivisor(const Parameters::Values& p, int k)
+{
+	if (!p.multiFft || p.multiRefresh != Parameters::MultiRefresh::HopScaled || k < 3) return 1;
+	return 1 << std::min(k - 2, 3);
+}
+inline int layerRefreshPhase(int k) { return k == 3 ? 0 : (k == 4 ? 1 : (k >= 5 ? 3 : 0)); }
+
 // The rfft's own bin count for these parameters: N/2+1 of the transform actually run (the zero-padded
 // length, or the window with Zero-Padding off). Output Bins Mode = Auto and Raw RFFT Bins output
 // exactly this many samples. Needs the input rate because a window in ms is converted with it.
+// Multi-FFT: the LARGEST layer's N/2+1 - the finest grid any layer computed (design decision D1).
 inline int rfftBinCount(const Parameters::Values& p, double sampleRate)
 {
 	const double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-	return static_cast<int>(fftSizeFrom(p, windowSamplesFrom(p, sr)) / 2 + 1);
+	return static_cast<int>(fftSizeFrom(p, maxWindowSamples(p, sr)) / 2 + 1);
+}
+
+// v2.13 (audit F3): me.time.rate as TouchDesigner reports it can be 0, inf or absurd for a moment (a
+// component with Component Time, a project loading). It feeds info->sampleRate = bins x rate, and a
+// bad declared rate made a downstream CHOP attempt huge allocations elsewhere. Finite and 1..1000, or 60.
+inline double sanitizeCookRate(double rate)
+{
+	return (std::isfinite(rate) && rate >= 1.0 && rate <= 1000.0) ? rate : 60.0;
+}
+
+// v2.13 (audit F2): the ballistics / AGC frame time, in AUDIO time. The coefficients are converted
+// from ms with this, so the same settings mean the same time constant at any frame rate and through a
+// dropped frame. freshSamples: audio that arrived since the last published job (summed over held
+// cooks); frameMs: TouchDesigner's own deltaMS summed over the same cooks, the fallback when no audio
+// arrived and the sanity bound otherwise (an input that re-delivers its whole buffer every cook would
+// otherwise claim seconds per frame).
+inline double audioFrameMs(double freshSamples, double sampleRate, double frameMs)
+{
+	const double fallback = (frameMs > 0.0 && frameMs < 5000.0) ? frameMs : 1000.0 / 60.0;
+	if (!(freshSamples > 0.0) || !(sampleRate > 0.0)) return fallback;
+	const double audioMs = freshSamples / sampleRate * 1000.0;
+	return std::clamp(audioMs, 0.25 * fallback, 4.0 * fallback);
 }
 
 // Applies a Quality Preset on top of the individual parameters (called by Parameters::eval; pure, so

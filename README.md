@@ -218,6 +218,9 @@ tells TouchDesigner which parameters the current settings make inert (`setEnable
 | Spectrum | Window Length Mode | Menu | Samples | Samples or Milliseconds |
 | Spectrum | Window Sampling | Int | 3175 | analysis window in samples (= 72 ms @ 44.1 kHz; slider 1…32768, hard limit 65536) |
 | Spectrum | Window Length ms | Float | 72 | used when mode = Milliseconds (slider 1…1000, accepted 0.1…5000) |
+| Spectrum | Multi-FFT (layers 1024..32768, averaged) | Toggle | Off | On = `Multi-FFT Layers` windows of 1024·2^(k−1) samples, averaged on one output grid (see *Multi-FFT* below). Takes over the three window parameters above (greyed out, values kept) |
+| Spectrum | Multi-FFT Layers | Int | 6 | 2…6 (6 = 1024…32768). Greyed out with Multi-FFT off |
+| Spectrum | Multi-FFT Long-Layer Refresh | Menu | Every Frame | Every Frame = every layer every job (exact) · Hop-Scaled = layer 4 every 2nd job, 5 every 4th, 6 every 8th (previous magnitude re-used in between) |
 | Spectrum | Zero-Padding | Toggle | **On** | Off = the FFT runs on the window itself (N = window length rounded up to even, so the last bin is exactly Nyquist); Zero-Pad Len is greyed out. A power-of-two window is the fast case (the default 3175 → 3176 = 8·397 plans a slower FFT) |
 | Spectrum | Zero-Pad Len | Menu | 16384 | FFT size with Zero-Padding on (1K…64K; auto-grown to ≥ next pow2 of the window). Overridden by a Quality Preset |
 | Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes faster than a MEASURE plan (9.70 against 11.55 µs at N = 16384, i9-13900H). The PATIENT search has no time limit: about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread (see *Threading*); the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
@@ -242,7 +245,8 @@ tells TouchDesigner which parameters the current settings make inert (`setEnable
 | Performance | FFT Backend (off: FFTW3 / on: Intel oneMKL) | Toggle | **Off** | Off = the vendored FFTW3 3.3.11 AVX2 build. On = Intel oneMKL's FFTW3 interface (`mkl_rt.3.dll`), which runs the FFT 18–27 % faster on the i9-13900H (see *FFTW3 vs Intel oneMKL*) but has to be installed by the user. Missing DLL = logs and falls back to FFTW3, never a planless node. A toggle rather than a menu because there are two libraries; the registry in `FftBackend.h` and the `static_assert`s in `Parameters.cpp` are what a third would extend |
 | Performance | Worker Wake | Menu | Poll | Poll = the worker checks the job slot every 2 ms (no kernel call on the cook thread; pickup 0–2 ms) · Signal = the cook wakes it every cook (one `SetEvent`, ~5–25 µs on the cook thread; pickup ~0.02 ms). The worker goes dormant after 500 ms idle either way. Greyed out with Async off |
 | Performance | Worker Priority | Menu | Highest | Highest = `THREAD_PRIORITY_HIGHEST` · MMCSS Pro Audio = registered with the Multimedia Class Scheduler, which schedules it ahead of normal threads and exempts it from power throttling (for 120+ fps projects on a busy machine). Applied at thread start; greyed out with Async off |
-| Performance | Spectral Features (Info CHOP) | Toggle | Off | On = eight `feature_*` Info CHOP channels (centroid, rolloff, flatness, flux, RMS dB, bass / mid / high dB), computed on the worker from the linear magnitude. ~3.5 µs per analysis at 8193 bins (i9-13900H) |
+| Performance | Spectral Features (Info CHOP) | Toggle | Off | On = eight `feature_*` Info CHOP channels (centroid, rolloff, flatness, flux, RMS dB, bass / mid / high dB), computed on the worker from the linear magnitude. ~3.5 µs per analysis at 8193 bins (i9-13900H). In Multi-FFT they come from layer 1 (1024 samples) |
+| Performance | Multi-FFT Layer Threads | Int | 3 | Threads one Multi-FFT job is split over (1 = the worker alone). Helpers run at the worker's priority and exist only with Multi-FFT and Async on. 1 → 3 threads: 167 → 80 µs per job (i9-13900H) |
 
 With the defaults (Coherent Gain, Frame Peak, Samples, Coefficient, Kaiser β 15 Manual; EQ and Ballistics
 **off**) the node outputs N/2+1 of the padded FFT (8193 samples at the default pad) and output bins that cover
@@ -337,6 +341,43 @@ it is (`hz_per_sample` does, since the same band is split into more or fewer ste
 
 `getInfoPopupString` (middle-click the node) prints the rate, the axis and the measured throughput, plus the
 cook delta the throughput was measured over.
+
+## Multi-FFT
+
+Six analyses at once (v2.13): short windows react fast, long windows resolve close tones, and the
+node outputs their average.
+
+- **Layers.** Layer k (k = 1…L, L = Multi-FFT Layers) windows the newest 1024·2^(k−1) samples:
+  1024, 2048, 4096, 8192, 16384, 32768.
+- **Output.** `out = (1/L) · Σ M_k / 2^(k−1)` with Coherent Gain normalisation (the default). A sine of
+  amplitude A reads A·w/2 there, so the division brings every layer to the 1024 layer's scale, and a steady
+  sine reads the same in every layer. With Full Scale, which already reads A at every length, the layers are
+  simply averaged. The gain is folded into each layer's window coefficients, so it costs nothing per bin.
+- **One output grid.** The output frequencies do not depend on the FFT size, so all layers land on exactly
+  the same Hz values. Layers that share an FFT size (with the default 16K Zero-Pad Len, layers 1–5 run at
+  N 16384 and layer 6 at N 32768) are summed on their linear grid and warped once.
+  - Output Bins Mode = Auto gives N/2+1 of the largest layer's FFT: **16385** at the default pad.
+  - Fixed gives Output Bins exactly.
+  - Raw RFFT Bins gives the largest layer's rfft grid.
+- **Applied once, to the average:** weighting, dB and ballistics. 0 dBFS = the 1024 layer's coherent
+  gain (512), or 1 in Full Scale.
+- **What it looks like.** A steady tone gives a sharp spike (from the long layers) on a pedestal (the
+  1024 layer's main lobe). In time it acts as a built-in multi-time-constant envelope: an onset adds about
+  1/6 of its level as each layer's window centre reaches it (11.6 ms … 371 ms at 44.1 kHz). Noise grows
+  with √w rather than w, so after normalisation the long layers' noise floor is lower than the short ones'.
+- **Exactness and cost.**
+  - A layer whose whole window is digital silence is skipped, exactly.
+  - Hop-Scaled refresh saves ~45 % on one thread.
+  - Layer Threads splits a job over helper threads at the worker's priority (results identical at any
+    thread count).
+  - Measured on the i9-13900H (`fft_bench --multi-ab 5`, FFTW3): **167 µs per job on one thread, 80 µs on
+    the default 3**, against 26 µs for the single-window default.
+- **Info.** Info CHOP `multi_*`, `layer_threads` and `layers_computed`, and the Info DAT `multi_fft` row.
+  `analysis_latency_ms` is the mean of the layers' window centres.
+
+The input history is a lock-free ring the worker reads in place (`SampleRing`, `DSPModules.h` §1b). The
+cook copies only the new samples whatever the window: 6.8 µs per cook with Multi-FFT on, against 18.4 µs
+for the previous copy-the-window design.
 
 ## Performance
 

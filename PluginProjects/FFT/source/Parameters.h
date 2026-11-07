@@ -92,6 +92,8 @@ file that is and what happens silently if you forget it.
 
 #include "CHOP_CPlusPlusBase.h"
 
+#include <cstring>
+
 namespace Parameters {
 
 // ---------------------------------------------------------------------------
@@ -287,6 +289,23 @@ enum class WorkerWake : int { Poll = 0, Signal, COUNT };
 // power throttling - the setting for 120+ fps projects on a busy machine.
 enum class WorkerPriority : int { Highest = 0, Mmcss, COUNT };
 
+// ---- v2.13 Multi-FFT ---------------------------------------------------------------------------
+// Multi-FFT runs Multilayers analysis layers with windows 1024, 2048, ... (1024 * 2^(k-1), up to
+// 32768 at 6 layers) and outputs their average on one shared output grid:
+//     out = (1/L) * sum_k M_k / 2^(k-1)      (Coherent Gain; the /2^(k-1) puts every layer on the
+//                                            1024-layer scale, because a sine reads A*w/2)
+//     out = (1/L) * sum_k M_k                (Full Scale: the layers are already scale-equal)
+// Window Length Mode / Window Sampling / Window Length ms are taken over (greyed out, stored values
+// kept). Everything else applies to every layer. See AnalysisPipeline.cpp, "Multi-FFT".
+//
+// Long-Layer Refresh. EveryFrame = every layer is recomputed every job (the exact specification).
+// HopScaled = layers 1-3 every job, layer 4 every 2nd, layer 5 every 4th, layer 6 every 8th (with
+// phase offsets so no two long layers share a job); a layer that is not due re-uses its previous
+// magnitude. Its window is 186-743 ms long, so it barely moves in 2-8 frames: ~40 % less work.
+enum class MultiRefresh : int { EveryFrame = 0, HopScaled, COUNT };
+inline constexpr int kMultiBaseWindow = 1024;   // layer 1's window, in samples
+inline constexpr int kMultiMaxLayers  = 6;      // 1024 .. 32768
+
 // Zero-padded FFT transform lengths, indexed by the "Pad" menu (menu order in Parameters.cpp)
 //
 // WHAT: the seven zero-pad lengths offered by the Zero-Pad Len menu, in samples. The menu stores
@@ -429,6 +448,11 @@ constexpr char WorkerprioName[]   = "Workerprio";   constexpr char WorkerprioLab
 // v2.11
 constexpr char RawbinsName[]      = "Rawbins";      constexpr char RawbinsLabel[]      = "Raw RFFT Bins (no interpolation)";
 constexpr char ZeropadName[]      = "Zeropad";      constexpr char ZeropadLabel[]      = "Zero-Padding";
+// v2.13
+constexpr char MultifftName[]     = "Multifft";     constexpr char MultifftLabel[]     = "Multi-FFT (layers 1024..32768, averaged)";
+constexpr char MultilayersName[]  = "Multilayers";  constexpr char MultilayersLabel[]  = "Multi-FFT Layers";
+constexpr char MultirefreshName[] = "Multirefresh"; constexpr char MultirefreshLabel[] = "Multi-FFT Long-Layer Refresh";
+constexpr char MultithreadsName[] = "Multithreads"; constexpr char MultithreadsLabel[] = "Multi-FFT Layer Threads";
 
 // ---------------------------------------------------------------------------
 // Snapshot of every parameter for one cook
@@ -527,7 +551,38 @@ struct Values {
     bool           zeroPad       = true;
     WorkerWake     workerWake    = WorkerWake::Poll;
     WorkerPriority workerPriority = WorkerPriority::Highest;
+    // v2.13 Multi-FFT (see MultiRefresh above). multiThreads: threads the layers of one job are split
+    // over (1 = the pipeline owner alone). Helper threads exist only while Multi-FFT and Async are on.
+    bool           multiFft      = false;
+    int            multiLayers   = kMultiMaxLayers;
+    MultiRefresh   multiRefresh  = MultiRefresh::EveryFrame;
+    int            multiThreads  = 3;
 };
+
+// v2.13 (audit F1): whether two snapshots differ. A stale cook (no new audio) publishes a job only when
+// the parameters changed, so a parameter edit still reaches a static input. Field by field: a byte
+// compare of the whole struct is NOT sound - MSVC does not zero the padding of a value-initialized
+// struct with default member initializers (measured: two `Values{}` compared unequal).
+// ADDING A FIELD TO Values: add it here too. The sizeof pin in Parameters.cpp fails the build when the
+// struct's size changes, as the reminder.
+inline bool paramsDiffer(const Values& a, const Values& b) noexcept
+{
+    auto d = [](double x, double y) { return std::memcmp(&x, &y, sizeof(double)) != 0; };   // NaN-stable
+    return a.chanMode != b.chanMode || a.scale != b.scale || d(a.displayMax, b.displayMax) || a.bins != b.bins ||
+           d(a.warp, b.warp) || a.warpInterp != b.warpInterp || d(a.logFloor, b.logFloor) || a.winMode != b.winMode ||
+           a.winSamples != b.winSamples || d(a.winMs, b.winMs) || a.padIndex != b.padIndex || a.padSize != b.padSize ||
+           a.planner != b.planner || a.eqEnable != b.eqEnable || a.highShelf != b.highShelf || a.lowShelf != b.lowShelf ||
+           d(a.gainDb, b.gainDb) || d(a.cutoffHz, b.cutoffHz) || d(a.lowGainDb, b.lowGainDb) || d(a.lowCutoffHz, b.lowCutoffHz) ||
+           d(a.q, b.q) || d(a.amount, b.amount) || a.window != b.window || d(a.kaiserBeta, b.kaiserBeta) ||
+           a.weighting != b.weighting || a.magNorm != b.magNorm || a.loudness != b.loudness || a.dbRef != b.dbRef ||
+           d(a.dbRange, b.dbRange) || a.ballEnable != b.ballEnable || a.ballMode != b.ballMode || d(a.attack, b.attack) ||
+           d(a.release, b.release) || d(a.attackMs, b.attackMs) || d(a.releaseMs, b.releaseMs) || a.async != b.async ||
+           a.backend != b.backend || a.preset != b.preset || a.binsMode != b.binsMode || a.warpAggregate != b.warpAggregate ||
+           a.betaMode != b.betaMode || a.ingestMode != b.ingestMode || a.features != b.features || a.rawBins != b.rawBins ||
+           a.zeroPad != b.zeroPad || a.workerWake != b.workerWake || a.workerPriority != b.workerPriority ||
+           a.multiFft != b.multiFft || a.multiLayers != b.multiLayers || a.multiRefresh != b.multiRefresh ||
+           a.multiThreads != b.multiThreads;
+}
 
 // ---------------------------------------------------------------------------
 // The two phases: setup() once at load, eval() once per cook

@@ -50,6 +50,25 @@ list(GET _fft_ver 2 FFT_VERSION_PATCH)
 target_compile_definitions(FFT PRIVATE FFT_VERSION_MAJOR=${FFT_VERSION_MAJOR} FFT_VERSION_MINOR=${FFT_VERSION_MINOR} FFT_VERSION_PATCH=${FFT_VERSION_PATCH})
 message(STATUS "FFT plugin version ${FFT_VERSION} (plugin.json)")
 
+# Build identity for the popup's `Plugin:` line and the Info DAT `build` row (v2.13): the git commit the
+# tree was configured from, "+dirty" when it had uncommitted changes. Configure-time only; the exact
+# build is identified at run time by the loaded image's link time (FFT.cpp, loadedImageStamp).
+find_package(Git QUIET)
+set(FFT_GIT_HASH "nogit")
+if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    OUTPUT_VARIABLE _fft_hash OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _fft_hash_rc)
+    if(_fft_hash_rc EQUAL 0 AND _fft_hash)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                        OUTPUT_VARIABLE _fft_dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        set(FFT_GIT_HASH "${_fft_hash}")
+        if(_fft_dirty)
+            set(FFT_GIT_HASH "${_fft_hash}+dirty")
+        endif()
+    endif()
+endif()
+target_compile_definitions(FFT PRIVATE "FFT_GIT_HASH=\"${FFT_GIT_HASH}\"")
+
 # Vendored FFTW 3.3.11 built from source with AVX2+FMA codelets; see 3rdParty/fftw3/README.md and
 # 3rdParty/fftw3/VERSION for the provenance of every artifact. VERSION pins the exact tag, so the
 # library, the header and the deployed runtime DLL all carry the version in their names and a second

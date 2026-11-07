@@ -100,8 +100,9 @@ void AsyncAnalysis::publish()
 void AsyncAnalysis::runJob(const AnalysisJob& job)
 {
     AnalysisResult& res = myResults.back();
+    bool produced = false;
     try {
-        myPipeline.process(job, res);
+        produced = myPipeline.process(job, res);
     } catch (...) {
         // Not published: the previous result stays visible. Lifetime count for the Info DAT, live flag
         // for the error string (set on failure, cleared by the next success - nothing else clears it).
@@ -111,8 +112,13 @@ void AsyncAnalysis::runJob(const AnalysisJob& job)
         return;
     }
     myPlanFailed.store(myPipeline.planFailed(), std::memory_order_relaxed);
-    res.seq = job.seq;
-    myResults.publish();
+    // v2.13: no result for this job (a plan waiting for the planner, or a torn ring read): nothing is
+    // published, so the cook keeps showing the previous spectrum; the status below still moves on, so
+    // the Info DAT can say why.
+    if (produced) {
+        res.seq = job.seq;
+        myResults.publish();
+    }
     myPipelineFailing.store(false, std::memory_order_relaxed);
     myDspUs.store(myPipeline.lastUs(), std::memory_order_relaxed);
     myAxisRate.store(myPipeline.outputSampleRate(), std::memory_order_relaxed);

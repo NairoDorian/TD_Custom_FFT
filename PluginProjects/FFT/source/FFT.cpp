@@ -70,6 +70,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <execution>
 #include <numeric>
@@ -95,7 +96,7 @@ const char* kOpIcon    = "FFT";
 // remember the popup's `Plugin:` line is the only place in TouchDesigner that names the build.
 #ifndef FFT_VERSION_MAJOR
 #define FFT_VERSION_MAJOR 2
-#define FFT_VERSION_MINOR 10
+#define FFT_VERSION_MINOR 13
 #define FFT_VERSION_PATCH 0
 #endif
 // Generated from PluginProjects/FFT/plugin.json by CMakeLists.txt (FFT_VERSION_* definitions), so the
@@ -144,6 +145,86 @@ inline double usSince(clk::time_point t0) { return std::chrono::duration<double,
 
 // (The worker thread's naming, priority, MMCSS registration and power-throttling opt-out moved to
 // AsyncAnalysis.cpp together with the worker itself.)
+
+// ---- build identity (v2.13, plan X1b) --------------------------------------------------------
+// The popup used to name the DLL's path and a hand-maintained version, so a node running an older
+// build than the one on disk looked exactly like the new one (that is how a whole debugging session
+// was spent on a stale v2.12.0). The loaded image's own link time (PE header TimeDateStamp, read from
+// memory) identifies the build that is RUNNING; the same field read from the file at pluginPath
+// identifies the build that is ON DISK. Different = Reload Plugin.
+#ifndef FFT_GIT_HASH
+#define FFT_GIT_HASH "nogit"
+#endif
+#ifdef _WIN32
+uint32_t peStamp(const unsigned char* base, size_t size)
+{
+	if (size < sizeof(IMAGE_DOS_HEADER)) return 0;
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+	    static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS) > size) return 0;
+	const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+	return nt->Signature == IMAGE_NT_SIGNATURE ? nt->FileHeader.TimeDateStamp : 0;
+}
+uint32_t loadedImageStamp()
+{
+	HMODULE h = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                        reinterpret_cast<LPCWSTR>(&loadedImageStamp), &h) || !h) return 0;
+	return peStamp(reinterpret_cast<const unsigned char*>(h), 4096);
+}
+uint32_t fileImageStamp(const char* utf8Path)
+{
+	if (!utf8Path || !*utf8Path) return 0;
+	wchar_t wpath[MAX_PATH * 2] = {};
+	if (!MultiByteToWideChar(CP_UTF8, 0, utf8Path, -1, wpath, MAX_PATH * 2)) return 0;
+	HANDLE f = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+	                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	unsigned char buf[4096];
+	DWORD got = 0;
+	const BOOL ok = ReadFile(f, buf, sizeof(buf), &got, nullptr);
+	CloseHandle(f);
+	return ok ? peStamp(buf, got) : 0;
+}
+#else
+uint32_t loadedImageStamp() { return 0; }
+uint32_t fileImageStamp(const char*) { return 0; }
+#endif
+// "2026-11-07 14:02" (local time) or "unknown".
+std::string stampText(uint32_t t)
+{
+	if (!t) return "unknown";
+	std::time_t tt = static_cast<std::time_t>(t);
+	std::tm lt{};
+#ifdef _WIN32
+	if (localtime_s(&lt, &tt) != 0) return "unknown";
+#else
+	if (!localtime_r(&tt, &lt)) return "unknown";
+#endif
+	char b[32];
+	std::strftime(b, sizeof(b), "%Y-%m-%d %H:%M", &lt);
+	return b;
+}
+
+// Window-centre latency of the layers, in ms: { mean, min, max }. What the spectrum lags the audio by
+// because the taper weights the window's centre most (half a window of history per layer).
+struct CentreMs { double mean{ 0.0 }, lo{ 0.0 }, hi{ 0.0 }; };
+CentreMs layerCentres(const AnalysisPipeline::Status& s, double sr)
+{
+	CentreMs c;
+	if (!(sr > 0.0)) return c;
+	const int L = std::clamp(s.layers, 1, Parameters::kMultiMaxLayers);
+	if (!s.multi) { c.mean = c.lo = c.hi = 0.5 * static_cast<double>(s.capacity) / sr * 1000.0; return c; }
+	double sum = 0.0;
+	c.lo = 1e30; c.hi = 0.0;
+	for (int k = 0; k < L; ++k) {
+		const double ms = 0.5 * static_cast<double>(s.layerWindow[k]) / sr * 1000.0;
+		sum += ms; c.lo = std::min(c.lo, ms); c.hi = std::max(c.hi, ms);
+	}
+	c.mean = sum / L;
+	if (c.lo > c.hi) c.lo = c.hi;
+	return c;
+}
 
 } // namespace
 
@@ -221,6 +302,9 @@ FFT::FFT(const OP_NodeInfo* info)
 		myLog.log("[FFT Plugin] ERROR: " + myErrorText);
 	}
 	myLog.setDeferred(true);   // the worker must never call into Python; the cook thread flushes
+	myImageStamp = loadedImageStamp();
+	myDiskStamp = fileImageStamp(info ? info->pluginPath : nullptr);
+	myDiskCheckedAt = std::chrono::steady_clock::now();
 	myPipeline = std::make_unique<AnalysisPipeline>(&myLog);
 	myAsync = std::make_unique<AsyncAnalysis>(*myPipeline, myLog);
 }
@@ -395,7 +479,7 @@ FFT::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* reserve
 	// bins * this, so read it here: getOutputInfo needs it now, and it also publishes it for the
 	// Info CHOP/DAT callbacks, which never receive an OP_Inputs of their own.
 	if (const OP_TimeInfo* ti = inputs->getTimeInfo()) {
-		if (ti->rate > 0.0) myCookRate.store(ti->rate, std::memory_order_relaxed);
+		myCookRate.store(sanitizeCookRate(ti->rate), std::memory_order_relaxed);   // audit F3
 	}
 	const OP_CHOPInput* cinput = (inputs->getNumInputs() > 0) ? inputs->getInputCHOP(0) : nullptr;
 	const Parameters::Values& p = myParams;
@@ -485,26 +569,21 @@ FFT::zeroOutputSafe(CHOP_Output* output) noexcept
 //
 // CALLED BY: execute(), step 2, once per cook. Cook thread only - it writes the FIFOs, and
 // fillJob() reads them on the same thread.
-void
-FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChannels, const Parameters::Values& p, size_t capacity)
+size_t
+FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChannels, const Parameters::Values& p)
 {
-	if (static_cast<int>(myIngest.size()) != numChannels) myIngest.resize(static_cast<size_t>(numChannels));
-	// Housekeeping over every state, not just the ones this cook will use: the loop is a
-	// capacity compare in the steady state, and doing it for all of them means a state left over
-	// from a previous, larger channel count is already consistent if the count grows back.
-	for (auto& st : myIngest) {
-		// A capacity change means a different window length, i.e. a different FFT. The FIFO is
-		// reset rather than carried over because its contents describe a window that no longer
-		// exists; silent_run restarts with it for the same reason.
-		if (st.fifo.capacity() != capacity) { st.fifo.resize(capacity); st.silent_run = 0; }
-		// The EQ's coefficients are sample-rate dependent, so it is told the current rate every
-		// cook (it is a cheap no-op when the rate has not changed).
-		st.eq.setSampleRate(mySampleRate);
-	}
+	// v2.13: grow only. A job in flight on the worker holds pointers to these rings, so a ring is never
+	// destroyed while the node lives; a channel that goes away simply stops being written.
+	if (static_cast<int>(myIngest.size()) < numChannels) myIngest.resize(static_cast<size_t>(numChannels));
+	// The EQ's coefficients are sample-rate dependent, so it is told the current rate every cook (a
+	// cheap no-op when the rate has not changed). The ring needs no housekeeping: it never resizes, so
+	// a window change (or Multi-FFT on/off) keeps the history instead of restarting from silence.
+	for (auto& st : myIngest) st.eq.setSampleRate(mySampleRate);
 	// Nothing to ingest: no input connected, or a CHOP with no channels, or a cook with no samples
-	// in it. Returning here leaves the FIFOs untouched, which is deliberate - the spectrum keeps
+	// in it. Returning here leaves the rings untouched, which is deliberate - the spectrum keeps
 	// showing the last real audio rather than falling to zero on a momentary gap.
-	if (!cinput || cinput->numChannels <= 0 || cinput->numSamples <= 0) return;
+	if (!cinput || cinput->numChannels <= 0 || cinput->numSamples <= 0) return 0;
+	const size_t capacity = FFTDSP::SampleRing::kCapacity;
 
 	const size_t n = static_cast<size_t>(cinput->numSamples);
 	// How many of this block's samples are NEW (IngestMode::Auto, v2.10). Before 2.10 every cook's whole
@@ -518,8 +597,8 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 	const size_t fresh = (p.ingestMode == Parameters::IngestMode::Auto)
 		? myIngestCursor.fresh(cinput->startIndex, n, cinput->totalCooks)   // RateModel.h, unit-tested
 		: n;
-	if (fresh == 0) return;
-	const size_t keep = std::min(fresh, capacity);             // only samples that will still be inside the window
+	if (fresh == 0) return 0;
+	const size_t keep = std::min(fresh, capacity);             // only samples the ring can still hold
 	const int inChans = cinput->numChannels;
 
 	for (int ch = 0; ch < numChannels; ++ch) {
@@ -558,7 +637,9 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 		// been silent for a whole window's worth of samples", because that is the point at which the
 		// spectrum is genuinely flat rather than merely quiet. The counter is capped at 2*capacity so
 		// it cannot grow without bound over a long silence and overflow its int.
-		if (FFTDSP::blockIsSilent(blk, keep)) st.silent_run = std::min(st.silent_run + keep, capacity * 2);
+		// (v2.13: the pipeline compares it per layer - a 1024 layer is skipped as soon as 1024 silent
+		// samples arrived, while the 32768 layer still sees the tail of the sound.)
+		if (FFTDSP::blockIsSilent(blk, keep)) st.silent_run = std::min(st.silent_run + keep, capacity);
 		else st.silent_run = 0;
 
 		// --- EQ on the new samples only (stateful, time order) ---
@@ -569,8 +650,9 @@ FFT::ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChanne
 		if (p.eqEnable && st.eq.updateAndCheckActive(p.gainDb, p.cutoffHz, p.lowGainDb, p.lowCutoffHz, p.q, p.amount)) {
 			st.eq.processBlockInPlace(blk, keep, p.amount);
 		}
-		st.fifo.add(blk, keep);
+		st.ring->write(blk, keep);
 	}
+	return fresh;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -601,13 +683,20 @@ FFT::fillJob(AnalysisJob& job, int numChannels, int winSamples, double dtMs)
 	job.p = myParams;                 // the pipeline never reads live UI state; see pollParameters()
 	job.reset = myResetPending;       // consumes the Reset pulse; cleared at the end of this function
 	const size_t n = static_cast<size_t>(numChannels);
-	if (job.windows.size() != n) job.windows.resize(n);     // no allocation after the first cooks
+	// v2.13: no samples are copied. The job names each channel's ring and the position it ends at; the
+	// worker windows every layer straight out of the ring (SampleRing, DSPModules.h 1b).
+	if (job.rings.size() != n) job.rings.resize(n);         // no allocation after the first cooks
+	if (job.ringEnd.size() != n) job.ringEnd.resize(n);
+	if (job.silentRun.size() != n) job.silentRun.resize(n);
 	if (job.silent.size() != n) job.silent.resize(n);
 	for (int ch = 0; ch < numChannels; ++ch) {
-		myIngest[ch].fifo.get(job.windows[ch]);             // newest `capacity` samples, oldest first
-		// One whole window of digital silence: not "quiet", but exactly zero, and long enough that
-		// the spectrum is genuinely flat. The pipeline uses this to skip work it can prove is wasted.
-		job.silent[ch] = myIngest[ch].silent_run >= myCapacity ? 1 : 0;
+		const IngestState& st = myIngest[static_cast<size_t>(ch)];
+		job.rings[ch] = st.ring.get();
+		job.ringEnd[ch] = st.ring->written();
+		// Trailing digital silence, in samples: the pipeline skips exactly the layers whose whole window
+		// it covers (their contribution is exactly zero).
+		job.silentRun[ch] = static_cast<uint32_t>(std::min<size_t>(st.silent_run, UINT32_MAX));
+		job.silent[ch] = st.silent_run >= myCapacity ? 1 : 0;
 	}
 	myResetPending = false;
 }
@@ -749,19 +838,30 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	// while `rate` is only the target - they differ whenever a frame runs long. deltaMS is sanity
 	// checked against 5000 ms (a plausible pause or a first cook, where the frame delta can be
 	// enormous and would otherwise collapse every ballistics coefficient to zero).
+	// v2.13: this is the TouchDesigner frame time, used for telemetry and as the fallback / sanity bound
+	// of the ballistics clock; the clock itself is audio time (RateModel audioFrameMs, audit F2). The
+	// rate is sanitised (audit F3): a non-finite or absurd me.time.rate falls back to 60.
 	double dt_ms = 1000.0 / 60.0;
 	if (const OP_TimeInfo* ti = inputs->getTimeInfo()) {
+		const double rate = sanitizeCookRate(ti->rate);
 		if (ti->deltaMS > 0.0 && ti->deltaMS < 5000.0) dt_ms = ti->deltaMS;
-		else if (ti->rate > 0.0) dt_ms = 1000.0 / ti->rate;
-		if (ti->rate > 0.0) myCookRate.store(ti->rate, std::memory_order_relaxed);
+		else dt_ms = 1000.0 / rate;
+		myCookRate.store(rate, std::memory_order_relaxed);
 	}
 	myCookDtMs.store(dt_ms, std::memory_order_relaxed);    // outputBandwidth() reads it (Info callbacks)
 
-	// The FIFO/window length for this cook, derived from the parameters and the sample rate by the
-	// shared model in RateModel.h (the same function the bench and the tests use, so the CHOP and
-	// the offline measurements cannot disagree about what a given setting means).
-	const int win_samples = windowSamplesFrom(p, mySampleRate);
+	// The history one job reads: the window (single mode) or the largest Multi-FFT layer, from the
+	// shared model in RateModel.h (the same function the bench and the tests use).
+	const int win_samples = maxWindowSamples(p, mySampleRate);
 	myCapacity = static_cast<size_t>(win_samples);
+
+	// Reset (audit F11): pulsePressed() only sets the flag; the state it clears is the cook's.
+	if (myResetRequested.exchange(false, std::memory_order_acq_rel)) {
+		for (auto& st : myIngest) st.eq.reset();
+		myIngestCursor.reset();
+		myResetPending = true;
+		if (myCpuOk) myErrorText.clear();
+	}
 
 	// --- 2. ingest ---
 	// How many spectra to produce. Two independent caps apply and the smaller wins: what the input
@@ -771,7 +871,9 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	myExecStage = 2;
 	const int num_channels = std::min(analysisChannelCount(cinput, p.chanMode), std::max(1, output->numChannels));
 	myAnalysisChannels = num_channels;
-	ingest(cinput, p.chanMode, num_channels, p, myCapacity);
+	const size_t fresh = ingest(cinput, p.chanMode, num_channels, p);
+	myPendingFresh += static_cast<double>(fresh);
+	myPendingFrameMs += dt_ms;
 
 	// --- 3. analysis job ---
 	myExecStage = 3;
@@ -781,10 +883,27 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	myAsync->configure(p.async, p.workerWake, p.workerPriority);   // no-op unless the mode changed
 	myAsyncActive = myAsync->async();
 
-	// Every cook publishes a job. With Async on the worker picks it up (poll or signal, see WorkerWake);
-	// with Async off publish() runs the analysis right here, so this cook shows its own samples.
-	fillJob(myAsync->jobSlot(), num_channels, win_samples, dt_ms);
-	myAsync->publish();
+	// v2.13 (audit F1): a job is published when there is something new to analyse - new audio, a
+	// parameter change, a reset, a new channel count or input rate, or the very first cook. A stale cook
+	// (the input did not advance) used to re-analyse the same window: flux read 0 on those frames and
+	// ballistics / AGC advanced by a frame that carried no audio. Now it holds the previous spectrum,
+	// and its frame time is carried into the next job. With Async on the worker picks the job up (poll
+	// or signal, see WorkerWake); with Async off publish() runs the analysis right here.
+	const bool publishJob = !myHaveJob || fresh > 0 || myResetPending || num_channels != myLastJobChannels ||
+	                        mySampleRate != myLastJobRate || Parameters::paramsDiffer(p, myLastJobParams);
+	if (publishJob) {
+		const double jobDtMs = audioFrameMs(myPendingFresh, mySampleRate, myPendingFrameMs);
+		fillJob(myAsync->jobSlot(), num_channels, win_samples, jobDtMs);
+		myAsync->publish();
+		myHaveJob = true;
+		myLastJobParams = p;
+		myLastJobChannels = num_channels;
+		myLastJobRate = mySampleRate;
+		myPendingFresh = 0.0;
+		myPendingFrameMs = 0.0;
+	} else {
+		++myStaleCooks;
+	}
 
 	// --- 4. output (hold the previous spectrum when nothing new has been published) ---
 	// Note it asks for the NEWEST published result, which in async mode is usually the previous
@@ -876,7 +995,7 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 	// First callback of the chain in every cook: refresh the cached Info DAT rows and popup text here
 	// (a timestamp compare in the steady state - see renderInfoCache).
 	renderInfoCache(false);
-	return 36;
+	return 45;
 }
 
 // One Info CHOP channel, by index. THE COUNT IS A CONTRACT: this switch must cover every index below
@@ -899,8 +1018,15 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 //  13 param_reads          number of parameter lookups         |
 //  14 jobs_dropped         async jobs overwritten untaken      |
 //  15 analysis_channels    spectra produced per cook           |
-//  16 hold_frames          cooks behind the analysis is        |
-//  17 linear_grid          output grid == linear FFT grid      |
+//  16 hold_frames          cooks behind the analysis is        |  v2.13 (appended, indices above unchanged):
+//  17 linear_grid          output grid == linear FFT grid      |  36 multi_fft            1 when Multi-FFT is on
+//                                                              |  37 multi_layers         layers that run (1 in single mode)
+//                                                              |  38/39 multi_latency_min_ms / _max_ms  window centres
+//                                                              |  40 layer_threads        threads one job is split over
+//                                                              |  41 layers_computed      (channel, layer) frames that contributed
+//                                                              |  42 ring_torn_drops      frames dropped: the input ring was lapped
+//                                                              |  43 planner_held_jobs    jobs held while a plan waited for the planner
+//                                                              |  44 stale_cooks          cooks with no new audio (held, not re-analysed)
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
@@ -937,10 +1063,10 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 	case 24: set("pickup_p99_us", myAsyncActive ? myAsync->pickup().p99Us : 0.0); break;
 	case 25: set("pickup_late", static_cast<double>(myAsync->pickup().late)); break;
 	case 26: {
-		// What the spectrum lags the audio by: the window's centre (half a window of history), plus one
-		// frame when the analysis runs on the worker (the cook shows the previous job's result), plus the
-		// worker's median pickup. The number to compensate audio-reactive visuals against.
-		const double win_ms = s.capacity > 0 && mySampleRate > 0 ? 0.5 * static_cast<double>(s.capacity) / mySampleRate * 1000.0 : 0.0;
+		// What the spectrum lags the audio by: the window's centre (half a window of history; the mean of
+		// the layers' centres in Multi-FFT), plus one frame when the analysis runs on the worker (the cook
+		// shows the previous job's result), plus the worker's median pickup.
+		const double win_ms = layerCentres(s, mySampleRate).mean;
 		const double async_ms = myAsyncActive ? myCookDtMs.load(std::memory_order_relaxed) + myAsync->pickup().p50Us / 1000.0 : 0.0;
 		set("analysis_latency_ms", win_ms + async_ms);
 		break;
@@ -954,6 +1080,15 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 	case 33: set("feature_bass_db", fOn ? f.bassDb : 0.0); break;
 	case 34: set("feature_mid_db", fOn ? f.midDb : 0.0); break;
 	case 35: set("feature_high_db", fOn ? f.highDb : 0.0); break;
+	case 36: set("multi_fft", s.multi ? 1.0 : 0.0); break;
+	case 37: set("multi_layers", s.layers); break;
+	case 38: set("multi_latency_min_ms", layerCentres(s, mySampleRate).lo); break;
+	case 39: set("multi_latency_max_ms", layerCentres(s, mySampleRate).hi); break;
+	case 40: set("layer_threads", s.layerThreads); break;
+	case 41: set("layers_computed", myAsync->pipeline().layersComputed()); break;
+	case 42: set("ring_torn_drops", static_cast<double>(myAsync->pipeline().ringTornDrops())); break;
+	case 43: set("planner_held_jobs", static_cast<double>(myAsync->pipeline().plannerHeldJobs())); break;
+	case 44: set("stale_cooks", static_cast<double>(myStaleCooks)); break;
 	default: break;
 	}
 }
@@ -987,7 +1122,8 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 // when the status / log changed); this only hands the cached strings over.
 //
 //   0 execute_count          8 window_resolution      16 hz_per_sample          22 resolution
-//   1 mode                   9 spectral_peak_freq     17 output_bandwidth_sps   23+ plan_log_* (newest 32)
+//   1 mode                   9 spectral_peak_freq     17 output_bandwidth_sps   23 multi_fft, 24 build
+//                                                                               25+ plan_log_* (newest 32)
 //   2 fft_size              10 simd_acceleration      18 channel_fanout
 //   3 linear_bins           11 fft_engine             19 info_callback_calls  <- read this one first
 //   4 window_samples        12 cook_time              20 worker_pickup
@@ -1045,7 +1181,10 @@ FFT::renderInfoCache(bool force)
 	snprintf(b, sizeof(b), "%s, %d analysis channel(s)", myAsyncActive ? "async (worker thread)" : "sync (cook thread)", myAnalysisChannels); row("mode", b);
 	snprintf(b, sizeof(b), "%zu", s.fftSize); row("fft_size", b);
 	snprintf(b, sizeof(b), "%zu of %zu computed", s.magnitudeBins, s.linearBins); row("linear_bins", b);
-	snprintf(b, sizeof(b), "%zu", s.capacity); row("window_samples", b);
+	// Multi-FFT takes Window Sampling over: the row says so instead of showing a value nothing uses.
+	if (s.multi) snprintf(b, sizeof(b), "Multi-FFT %d layers %zu..%zu", s.layers, s.layerWindow[0], s.capacity);
+	else snprintf(b, sizeof(b), "%zu", s.capacity);
+	row("window_samples", b);
 	snprintf(b, sizeof(b), "%.1f Hz", mySampleRate); row("input_sample_rate", b);
 	{
 		// The frequency axis itself (axisBottom .. axisRate/2, last bin on the top). This - not the
@@ -1106,11 +1245,45 @@ FFT::renderInfoCache(bool force)
 		snprintf(b, sizeof(b), "n/a (Async off: the analysis runs inside the cook)");
 	row("worker_pickup", b);
 	{
-		const double win_ms = s.capacity > 0 && mySampleRate > 0 ? 0.5 * static_cast<double>(s.capacity) / mySampleRate * 1000.0 : 0.0;
+		const CentreMs cm = layerCentres(s, mySampleRate);
+		const double win_ms = cm.mean;
 		const double frame_ms = myAsyncActive ? myCookDtMs.load(std::memory_order_relaxed) : 0.0;
-		snprintf(b, sizeof(b), "%.1f ms = window centre %.1f + async frame %.1f + pickup %.2f", win_ms + frame_ms + (myAsyncActive ? pk.p50Us / 1000.0 : 0.0),
-		         win_ms, frame_ms, myAsyncActive ? pk.p50Us / 1000.0 : 0.0);
+		snprintf(b, sizeof(b), "%.1f ms = window centre %.1f%s + async frame %.1f + pickup %.2f", win_ms + frame_ms + (myAsyncActive ? pk.p50Us / 1000.0 : 0.0),
+		         win_ms, s.multi ? " (mean of the layers)" : "", frame_ms, myAsyncActive ? pk.p50Us / 1000.0 : 0.0);
 		row("analysis_latency", b);
+	}
+	{
+		// v2.13 Multi-FFT: the layers, their FFT sizes and gains, how they were scheduled this job.
+		const AnalysisPipeline& pl = myAsync->pipeline();
+		if (s.multi) {
+			std::string& v = myDatValue[r];
+			myDatName[r] = "multi_fft";
+			snprintf(b, sizeof(b), "on, %d layers, %d FFT size(s), %d thread(s), refresh %s, %d frames computed / %d silent; layers:",
+			         s.layers, s.groups, s.layerThreads, p.multiRefresh == Parameters::MultiRefresh::HopScaled ? "Hop-Scaled" : "Every Frame",
+			         pl.layersComputed(), pl.layersSilent());
+			v = b;
+			for (int k = 0; k < s.layers && k < Parameters::kMultiMaxLayers; ++k) {
+				snprintf(b, sizeof(b), " %zu@N%zu x%.4g%s", s.layerWindow[k], s.layerFft[k], s.layerGain[k],
+				         s.refreshDiv[k] > 1 ? (s.refreshDiv[k] == 2 ? "/2" : (s.refreshDiv[k] == 4 ? "/4" : "/8")) : "");
+				v += b;
+			}
+			++r;
+		} else {
+			row("multi_fft", "off (single window: Window Sampling)");
+		}
+	}
+	{
+		// Build identity (X1b): which build runs, which is on disk. Re-checked every 5 s (one 4 KB read).
+		const auto nowc = std::chrono::steady_clock::now();
+		if (std::chrono::duration<double>(nowc - myDiskCheckedAt).count() > 5.0) {
+			myDiskStamp = fileImageStamp(myNodeInfo ? myNodeInfo->pluginPath : nullptr);
+			myDiskCheckedAt = nowc;
+		}
+		const bool stale = myDiskStamp && myImageStamp && myDiskStamp != myImageStamp;
+		snprintf(b, sizeof(b), "v%d.%d.%d %s, linked %s%s%s", kMajorVersion, kMinorVersion, kPatchVersion, FFT_GIT_HASH,
+		         stampText(myImageStamp).c_str(), stale ? " | STALE: the DLL on disk was linked " : " | the DLL on disk is this build",
+		         stale ? (stampText(myDiskStamp) + " - Reload Plugin").c_str() : "");
+		row("build", b);
 	}
 	{
 		static const char* aggNames[] = { "off (interpolate)", "peak", "rms" };
@@ -1133,7 +1306,13 @@ FFT::renderInfoCache(bool force)
 	std::string& text = myPopupText;
 	text.clear();
 	text += "Node: "; text += nodePath; text += " ("; text += kOpType; text += ", CHOP)\n";
-	snprintf(b, sizeof(b), "Plugin: TouchDesigner Custom FFT v%d.%d.%d\n", kMajorVersion, kMinorVersion, kPatchVersion); text += b;
+	{
+		// The build that RUNS (its link time), and a STALE mark when the DLL on disk is a different build.
+		const bool stale = myDiskStamp && myImageStamp && myDiskStamp != myImageStamp;
+		snprintf(b, sizeof(b), "Plugin: TouchDesigner Custom FFT v%d.%d.%d (%s, linked %s)%s\n", kMajorVersion, kMinorVersion, kPatchVersion,
+		         FFT_GIT_HASH, stampText(myImageStamp).c_str(), stale ? " STALE: newer DLL on disk, Reload Plugin" : "");
+		text += b;
+	}
 	text += "Binary: "; text += dllPath; text += "\n";
 	snprintf(b, sizeof(b), "Mode: %s, %d analysis channel(s)\n", myAsyncActive ? "async worker" : "sync", myAnalysisChannels); text += b;
 	auto add = [&text](const char* line) {
@@ -1143,7 +1322,14 @@ FFT::renderInfoCache(bool force)
 		if (text.size() + line.size() <= kMaxPopupChars) text += line;
 	};
 	addStr("Engine: " + s.plan + "\n");
-	snprintf(b, sizeof(b), "FFT: N=%zu, window %zu, %zu magnitude bins\n", s.fftSize, s.capacity, s.magnitudeBins); add(b);
+	// The FFT line is rewritten in place for Multi-FFT (never an extra line: the popup length rule).
+	if (s.multi)
+		snprintf(b, sizeof(b), "FFT: Multi-FFT %d layers %zu..%zu, N=%zu..%zu, %d thread(s)%s\n", s.layers, s.layerWindow[0], s.capacity,
+		         s.layerFft[0], s.fftSize, s.layerThreads, s.plannerWaiting ? ", waiting for planner" : "");
+	else
+		snprintf(b, sizeof(b), "FFT: N=%zu, window %zu, %zu magnitude bins%s\n", s.fftSize, s.capacity, s.magnitudeBins,
+		         s.plannerWaiting ? ", waiting for planner" : "");
+	add(b);
 	snprintf(b, sizeof(b), "Axis: %d bins @ %.2f Hz, %.1f-%.1f Hz (input %.1f Hz, %s)\n", myOutputBins, hzPerSample(p, mySampleRate),
 	         s.axisBottom, outputAxisRate(p, mySampleRate) * 0.5, mySampleRate, s.linearGrid ? "linear grid, no resample" : "warped grid"); add(b);
 	{
@@ -1178,8 +1364,13 @@ FFT::getInfoPopupString(OP_String* info, void* reserved1)
 void
 FFT::getWarningString(OP_String* warning, void* reserved1)
 {
-	if (myAsyncActive && myHoldFrames > 3) {
-		warning->setString("Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins, or use a Visual preset.");
+	// v2.13: a plan waiting for the process-wide FFT planner (another node's measurement) also holds the
+	// spectrum, and it is not load - say which one it is (audit F4).
+	const AnalysisPipeline::Status& s = statusSnapshot();
+	if (s.plannerWaiting) {
+		warning->setString("Waiting for the FFT planner (another FFT node is measuring a plan); the previous spectrum is held, nothing blocks.");
+	} else if (myAsyncActive && myHoldFrames > 3) {
+		warning->setString("Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins, use a Visual preset, or (Multi-FFT) raise Layer Threads / use Hop-Scaled refresh.");
 	}
 }
 
@@ -1223,12 +1414,7 @@ FFT::setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* state,
 void
 FFT::pulsePressed(const char* name, void* reserved1)
 {
-	if (!strcmp(name, Parameters::ResetName))
-	{
-		for (auto& st : myIngest) st.eq.reset();
-		myIngestCursor.reset();
-		myResetPending = true;
-		// An explicit Reset acknowledges a previous exception - but not the CPU check, which is a fact.
-		if (myCpuOk) myErrorText.clear();
-	}
+	// v2.13 (audit F11): only a flag. The next cook resets the EQ and the ingest cursor, requests the
+	// pipeline reset and acknowledges a previous exception (but not the CPU check, which is a fact).
+	if (!strcmp(name, Parameters::ResetName)) myResetRequested.store(true, std::memory_order_release);
 }

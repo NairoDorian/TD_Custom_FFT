@@ -48,6 +48,150 @@ below still name as history, were retired 2026-09-23; see git history.)
 
 ---
 
+## [v2.13.0] - 2026-11-08 — Multi-FFT, a lock-free input ring, layer threads, and the audit fixes
+
+### Added
+- **Multi-FFT** (Spectrum page, `Multifft`, default off). Runs `Multi-FFT Layers` (2..6, default 6) analysis
+  layers with windows 1024, 2048, … 32768 samples and outputs their average on one shared grid:
+  `out = (1/L) · Σ M_k / 2^(k−1)` in Coherent Gain. A sine reads A·w/2 there, so the division puts every layer
+  on the 1024 layer's scale. In Full Scale the layers already read A at every length, so they are only
+  averaged (design decision D3).
+  - Window Length Mode, Window Sampling and Window Length ms are greyed out and not read. Their stored values
+    are kept, so switching Multi-FFT off restores your window (D2).
+  - Every other parameter applies to every layer: window type and β, Zero-Pad Len (shared, D4), Scale and
+    Display Max, Output Bins, aggregation. Weighting, dB, ballistics and AGC run once, on the average.
+  - **Output Bins Mode = Auto is N/2+1 of the largest layer's FFT**, 16385 at the default 16K pad (D1).
+    Switching Multi-FFT on therefore changes the Auto width from 8193 to 16385. Raw RFFT Bins is that
+    layer's grid.
+  - 0 dBFS is the 1024 layer's coherent gain (512), or 1 in Full Scale.
+  - Spectral Features come from layer 1, the most reactive one (D6). The band levels are corrected for its
+    1/L gain.
+- **Multi-FFT Long-Layer Refresh** (`Multirefresh`): Every Frame (default, exact) or Hop-Scaled. Hop-Scaled
+  recomputes layer 4 every 2nd job, layer 5 every 4th and layer 6 every 8th, with phase offsets, and re-uses
+  each layer's previous magnitude in between.
+- **Multi-FFT Layer Threads** (Performance page, `Multithreads`, 1..6, default 3). Splits one job's
+  (channel × layer) transforms over a dedicated pool (`source/LayerPool.h`):
+  - Helpers run at the worker's priority (HIGHEST, EcoQoS off), unlike `std::execution::par`, which runs on
+    the normal-priority Windows pool below the worker that waits for it.
+  - Work is assigned statically, longest-first: no shared counter, no per-job allocation.
+  - Helpers exist only while Multi-FFT and Async are both on. Async off still means one thread for the node.
+  - Results are bit-identical at any thread count (tested).
+- **Info CHOP** channels 36–44, appended so existing indices do not move: `multi_fft`, `multi_layers`,
+  `multi_latency_min_ms`, `multi_latency_max_ms`, `layer_threads`, `layers_computed`, `ring_torn_drops`,
+  `planner_held_jobs`, `stale_cooks`.
+- **Info DAT** rows `multi_fft` (layers, FFT sizes, gains, refresh, threads) and `build`. Fixed rows 23 → 25;
+  `plan_log_*` now starts at row 25.
+- **Build identity.** The popup's `Plugin:` line shows the git commit the tree was configured from and the
+  loaded DLL's own link time (its PE header). It adds **STALE** when the DLL on disk at `pluginPath` was
+  linked at a different time, so a node running an old build can no longer pass for the new one. That
+  confusion cost a debugging session on v2.12.0 (plan X1/X1b). The line is rewritten in place; no line was
+  added to the popup.
+- `fft_bench --multi-ab R` runs an interleaved A/B of the Multi-FFT options and of the cook-thread ingest
+  (FIFO copy against the ring). Also new: `--multi`, `--threads`, `--refresh`, `--layers`, and three gate
+  metrics (`pipeline_multi_p50_us`, `pipeline_multi_3threads_p50_us`, `cook_async_multi_p50_us`).
+
+### Changed
+- **The input history is a lock-free `SampleRing`** (`DSPModules.h` §1b), not a FIFO whose whole window was
+  copied into every job.
+  - The cook copies only the new samples. The worker windows each layer straight out of the ring.
+  - A seqlock check turns a lapped read into a dropped frame (`ring_torn_drops`), never a torn spectrum. The
+    margin is 98304 samples of a stalled worker at the largest window.
+  - The ring never resizes, so a window change or Multi-FFT on/off keeps the history instead of restarting
+    from silence.
+- **Silence is skipped per layer, exactly.** A layer whose whole window is digital zero contributes exactly 0
+  and is not computed. In single mode this also means a silent window in a dB mode now shows the floor, not
+  the ~1e-15 rounding spectrum that Frame Peak used to normalise to 0 dB.
+- `AnalysisPipeline::process()` returns `false` when it has no result for a job: a plan waiting for the
+  planner, or a torn ring read. `AsyncAnalysis` then publishes nothing and the cook holds the previous
+  spectrum.
+- `eval()` reads one parameter more at the defaults (`Multifft`). With Multi-FFT on it skips the
+  window-length reads.
+
+### Fixed (AUDIT_AND_PLAN.md F1–F7, F10, F11)
+- **F1, stale cooks re-analysed the same window.** A job is now published only for new audio, a parameter
+  change, a reset, a new channel count or input rate, or the first cook. Flux no longer reads 0 on held
+  frames, and ballistics no longer advance on frames with no audio. Held cooks are counted (`stale_cooks`).
+- **F2, ballistics ran on TouchDesigner's frame time.** Attack, release and AGC are clocked by audio time:
+  the samples since the last job, summed over held cooks (`audioFrameMs`). It is bounded to 0.25–4× the
+  frame time, so an input that re-delivers its whole buffer cannot claim seconds per frame.
+- **F3, me.time.rate was not sanitised.** A non-finite rate, or one outside 1..1000, now reads as 60 at both
+  reads (`sanitizeCookRate`). `info->sampleRate = bins × rate` can no longer become infinite.
+- **F4, a re-plan waited on the process-wide planner lock.** An unbounded PATIENT measurement could hold it.
+  `prepare()` and `destroyPlan()` now `try_lock`:
+  - the live plan is kept, the status and the warning say "waiting for the FFT planner", and the next job
+    retries;
+  - a plan that cannot be destroyed yet is retired and freed later by its own library;
+  - the wisdom import now runs under the lock `prepare()` already holds;
+  - only teardown still waits, as it must.
+- **F4 extended, several FFT sizes in one batch.** Multi-FFT plans every size first and only then starts
+  their MEASURE/PATIENT upgrades. Otherwise the second size would find the lock taken by the first size's
+  measurement.
+- **F5, Async off was ignored on the first plan.** The engine gets the Async toggle before its first
+  `prepare()`, so a node created or loaded with Async off no longer starts a background measurement.
+  Related: a deferred upgrade remembers its rigour (a deferred PATIENT used to re-arm as MEASURE).
+- **F6, the backend cache was not thread-safe.** `cachedBackend()` takes a process-wide mutex. Two nodes
+  selecting a backend for the first time in the same frame could tear an `FftBackend` copy.
+- **F7, a Quality Preset ignored dB Range Floor.** With Loudness Off, a preset's Auto β was always designed
+  for 80 dB, because the read was gated on the stored Kaiser Beta Mode instead of the preset's.
+- **F10.**
+  - Log Floor is held at or below half of Display Max. At or above Display Max, the Log grid collapsed onto
+    one frequency.
+  - EQ gains are clamped to ±60 dB.
+  - A shelf whose design is non-finite is switched off and its state cleared. NaN state used to survive
+    until Reset.
+- **F11, Reset acted from the pulse callback.** It is now a flag; the next cook resets the EQ and the ingest
+  cursor.
+
+### Verified (i9-13900H, on AC, 2026-11-08)
+- `fft_tests`: **853 checks, 0 failures**; 748 before, so every earlier check still runs. New checks:
+  - **The specification:** the Multi-FFT output equals (1/6)·Σ single-mode outputs at w_k (÷2^(k−1) in
+    Coherent Gain), with interpolation. Max error 4.6e-5 against a peak of 201 (2.3e-7 relative) in Coherent
+    Gain, 8.9e-8 against 0.39 in Full Scale. The output is identical at 1 and 3 threads.
+  - **Scale:** a bin-centred sine reads the same normalised peak in all six layers, and in the average,
+    within 0.5 dB. Measured 0.000 dB in both normalisations.
+  - **Silence skip is exact:** 2 of 6 layers silent gives a max difference of 0.
+  - Hop-Scaled equals Every Frame on a stationary signal.
+  - The ring path gives the same spectrum as the linear-window path, bit for bit, in single and Multi-FFT.
+  - SampleRing lead-in, wrap-around, coefficients, torn detection and oversized writes.
+  - LayerPool balance, and every task run exactly once at 1–4 threads.
+  - F2, F3 and F5, and the Multi-FFT rate model (Auto 16385, layer gains, the D1/D3 rules).
+  - The steady state allocates nothing in Multi-FFT: 1 channel serial, 1 channel at 3 threads, and 4 channels
+    at 3 threads.
+- `fft_bench --multi-ab 5` (FFTW3, MEASURE plans; median of 5 interleaved rounds of the p50 over 300 jobs):
+
+  | Configuration | µs per job | × single default |
+  |---|---|---|
+  | single default (3175 window, N 16384) | 26.1 | 1.00 |
+  | Multi-FFT 6 layers, 1 thread (the spec) | 166.7 | 6.39 |
+  | … 2 threads | 95.0 | 3.64 |
+  | … **3 threads (default)** | **79.8** | 3.06 |
+  | … 4 threads | 74.2 | 2.84 |
+  | … 1 thread, Hop-Scaled | 88.8 | 3.40 |
+  | … 3 threads, Hop-Scaled | 71.8 | 2.75 |
+  | … 1 thread, Zero-Padding off | 116.2 | 4.45 |
+  | 5 layers (no 32K), 1 thread | 89.0 | 3.41 |
+  | 4 channels, 1 thread (channel `par`) | 222.9 | 8.54 |
+  | 4 channels, 4 threads (channel × layer) | 189.3 | 7.25 |
+
+  The cook-thread p50 with Multi-FFT on (32768-sample history, Async + Poll) is **18.40 µs with the old FIFO
+  copy and 6.80 µs with the ring**.
+- The 3-thread default was chosen from this table. 2 → 3 threads still saves 15 µs; 3 → 4 saves 5.6 µs for
+  one more woken thread.
+
+### Notes / Still open
+- **Not yet observed in TouchDesigner.** Everything above was measured headless. The DLL was deployed to
+  `__Plugins__/FFT` by the build; the Documents copy needs Install Plugin.
+- Multi-FFT acts as a built-in multi-time-constant attack/release. An onset adds about 1/6 of its final
+  level per layer as each layer's window centre reaches it: 11.6 ms … 371 ms at 44.1 kHz. Broadband noise
+  grows with √w rather than w, so after the tonal normalisation the long layers' noise floor sits lower and
+  long-layer tones stand out. Both follow from the specification; neither is a defect.
+- Peak/RMS aggregation is applied to the averaged spectrum (one warp per FFT size), not averaged per layer
+  (D5). With interpolation the two are identical.
+- The decimated "Octave" Multi-FFT (plan §3.6 E) is not implemented. That is the next step if the 32K layer's
+  cost matters on a slower machine.
+
+---
+
 ## [v2.12.1] - 2026-09-23 — FFT Planner = Patient has no time limit
 
 ### Changed

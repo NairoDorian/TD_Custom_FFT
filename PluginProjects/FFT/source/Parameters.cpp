@@ -87,6 +87,7 @@ more accurate.
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------------------------
 // Menu value <-> backend registry: the compile-time half of the contract.
@@ -278,6 +279,8 @@ const char* kWorkerwakeNames[] = { "Poll", "Signal" };
 const char* kWorkerwakeLabels[]= { "Poll (2 ms timer, no cook-thread kernel call)", "Signal (wake every cook, lowest latency)" };
 const char* kWorkerprioNames[] = { "Highest", "Mmcss" };
 const char* kWorkerprioLabels[]= { "Highest (thread priority)", "MMCSS Pro Audio (OS multimedia scheduler)" };
+const char* kMultirefreshNames[]  = { "Everyframe", "Hopscaled" };
+const char* kMultirefreshLabels[] = { "Every Frame (every layer, every job: exact)", "Hop-Scaled (layer 4 every 2nd job, 5 every 4th, 6 every 8th)" };
 const char* kPadNames[]        = { "1024", "2048", "4096", "8192", "16384", "32768", "65536" };
 const char* kPadLabels[]       = { "1K Bins", "2K Bins", "4K Bins", "8K Bins", "16K Bins", "32K Bins", "64K Bins" };
 
@@ -300,6 +303,13 @@ static_assert(sizeof(kIngestNames) / sizeof(kIngestNames[0]) == static_cast<size
 static_assert(sizeof(kKaisermodeNames) / sizeof(kKaisermodeNames[0]) == static_cast<size_t>(BetaMode::COUNT), "BetaMode menu/enum mismatch");
 static_assert(sizeof(kWorkerwakeNames) / sizeof(kWorkerwakeNames[0]) == static_cast<size_t>(WorkerWake::COUNT), "WorkerWake menu/enum mismatch");
 static_assert(sizeof(kWorkerprioNames) / sizeof(kWorkerprioNames[0]) == static_cast<size_t>(WorkerPriority::COUNT), "WorkerPriority menu/enum mismatch");
+static_assert(sizeof(kMultirefreshNames) / sizeof(kMultirefreshNames[0]) == static_cast<size_t>(MultiRefresh::COUNT), "MultiRefresh menu/enum mismatch");
+// paramsDiffer() (Parameters.h) lists every field of Values by hand. This pin breaks the build when
+// the struct changes size, so a new field cannot be forgotten there silently (x64 MSVC layout).
+static_assert(std::is_trivially_copyable<Values>::value, "Values must stay trivially copyable");
+#if defined(_MSC_VER) && defined(_WIN64)
+static_assert(sizeof(Values) == 264, "Values changed: add the new field to paramsDiffer() in Parameters.h, then update this pin");
+#endif
 
 } // namespace
 
@@ -366,6 +376,11 @@ void setup(TD::OP_ParameterManager* manager)
 	appendMenu (manager, "Spectrum", WinmodeName,    WinmodeLabel,    kWinmodeNames, kWinmodeLabels, static_cast<int>(WinMode::Samples));
 	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768);
 	appendFloat(manager, "Spectrum", WinmsName,      WinmsLabel,      72.0, 1.0, 1000.0);
+	// v2.13 Multi-FFT: takes over the three window-length parameters above (they are greyed out and
+	// keep their stored values, so switching it off restores the user's window).
+	appendToggle(manager, "Spectrum", MultifftName,  MultifftLabel,   false);
+	appendInt  (manager, "Spectrum", MultilayersName, MultilayersLabel, kMultiMaxLayers, 2, kMultiMaxLayers);
+	appendMenu (manager, "Spectrum", MultirefreshName, MultirefreshLabel, kMultirefreshNames, kMultirefreshLabels, static_cast<int>(MultiRefresh::EveryFrame));
 	// The Pad menu opens on INDEX 4, not on a length: the menu stores an index into kPadValues
 	// (Parameters.h), which is where the actual sample counts live. Index 4 is 16384 == kPadDefault,
 	// and the two must stay equal - eval() falls back to kPadDefault for an out-of-range index, so a
@@ -469,6 +484,9 @@ void setup(TD::OP_ParameterManager* manager)
 	// Spectral features go to the Info CHOP (feature_* channels), computed on the worker from the linear
 	// magnitude. Off by default: ~2-4 us per analysis when on.
 	appendToggle(manager, "Performance", FeaturesName,    FeaturesLabel,    false);
+	// v2.13: how many threads one Multi-FFT job is split over (1 = the analysis worker alone). The
+	// helpers run at the worker's priority and exist only while Multi-FFT and Async are both on.
+	appendInt  (manager, "Performance", MultithreadsName, MultithreadsLabel, 3, 1, kMultiMaxLayers);
 	// (v2.7.0) "Update Every N Cooks" / "Parameter Poll Every N Cooks" removed: both made the node
 	// strictly worse. Update Every N Cooks halved the spectrum's effective update rate to save a cost
 	// that the async worker already took off the cook thread; Parameter Poll Every N Cooks saved
@@ -536,7 +554,7 @@ because the DSP branches on the toggle first.
 */
 Values eval(const TD::OP_Inputs* inputs, int* reads)
 {
-	Values v;
+	Values v{};   // value-initialized: padding is zero, so two snapshots can be compared byte for byte (paramsDiffer)
 	if (!inputs) return v;
 	int n = 0;
 	auto getI = [&](const char* name) { ++n; return inputs->getParInt(name); };
@@ -570,12 +588,20 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	v.warpInterp = menu(WarpInterp::Linear, WarpinterpName);
 	v.warpAggregate = menu(WarpAggregate::Peak, WarpaggName);
 	v.logFloor   = std::max(1.0, getD(LogfloorName));
-	v.winMode    = menu(WinMode::Samples, WinmodeName);
-	if (v.winMode == WinMode::Milliseconds) {
-		v.winMs = std::clamp(getD(WinmsName), 0.1, 5000.0);   // the hard range is WIDER than the slider (1..1000 ms) on both ends
+	// v2.13 Multi-FFT: when on, the window-length parameters are taken over and not even read (they
+	// keep their stored values; the Values fields keep their defaults, which nothing consults).
+	v.multiFft   = getI(MultifftName) != 0;
+	if (v.multiFft) {
+		v.multiLayers  = std::clamp(getI(MultilayersName), 1, kMultiMaxLayers);
+		v.multiRefresh = menu(MultiRefresh::EveryFrame, MultirefreshName);
 	} else {
-		int ws = getI(WinsamplesName);
-		v.winSamples = (ws <= 0) ? 3175 : std::clamp(ws, 1, kMaxWinSamples);   // 3175 is the default window (72 ms at 44.1 kHz); only the lower bound is a clamp, so a huge typed value still stops at kMaxWinSamples
+		v.winMode    = menu(WinMode::Samples, WinmodeName);
+		if (v.winMode == WinMode::Milliseconds) {
+			v.winMs = std::clamp(getD(WinmsName), 0.1, 5000.0);   // the hard range is WIDER than the slider (1..1000 ms) on both ends
+		} else {
+			int ws = getI(WinsamplesName);
+			v.winSamples = (ws <= 0) ? 3175 : std::clamp(ws, 1, kMaxWinSamples);   // 3175 is the default window (72 ms at 44.1 kHz); only the lower bound is a clamp, so a huge typed value still stops at kMaxWinSamples
+		}
 	}
 	v.zeroPad    = getI(ZeropadName) != 0;
 	v.padIndex   = getI(PadName);
@@ -594,9 +620,11 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	if (v.eqEnable) {
 		v.highShelf   = getI(HighshelfName) != 0;
 		v.lowShelf    = getI(LowshelfName) != 0;
-		v.gainDb      = v.highShelf ? getD(GaindbName) : 0.0;
+		// v2.13 (audit F10): the gains are clamped to +/-60 dB (the slider is +/-24): a typed gain in
+		// the thousands of dB overflowed the shelf design to inf.
+		v.gainDb      = v.highShelf ? std::clamp(getD(GaindbName), -60.0, 60.0) : 0.0;
 		v.cutoffHz    = v.highShelf ? getD(CutoffhzName) : 1000.0;
-		v.lowGainDb   = v.lowShelf ? getD(LowgaindbName) : 0.0;
+		v.lowGainDb   = v.lowShelf ? std::clamp(getD(LowgaindbName), -60.0, 60.0) : 0.0;
 		v.lowCutoffHz = v.lowShelf ? getD(LowcutoffhzName) : 200.0;
 		v.q           = getD(QName);        // no clamp and no bounds check: the slider (0.1..4.0) is the only limit
 		v.amount      = getD(AmountName);   // likewise; the slider reaches 5.0 and the DSP treats it as a plain multiplier
@@ -625,7 +653,11 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	}
 	// dB Range Floor is also what Kaiser Beta Mode = Auto designs the window for (the sidelobes only need
 	// to sit below the floor the display shows), so it is read whenever either consumer is live.
-	if (v.loudness != Loudness::Off || (v.window == WindowType::Kaiser && v.betaMode == BetaMode::Auto)) {
+	// v2.13 (audit F7): a Quality Preset forces Kaiser Beta Mode = Auto (applyPreset, below), so the
+	// gate has to see the preset's mode, not only the stored one - with Loudness Off the preset's Auto
+	// beta was always designed for the 80 dB default while the enabled dB Range Floor did nothing.
+	const bool betaAutoEffective = v.betaMode == BetaMode::Auto || v.preset != Preset::Custom;
+	if (v.loudness != Loudness::Off || (v.window == WindowType::Kaiser && betaAutoEffective)) {
 		v.dbRange = std::max(1e-3, getD(DbrangeName));   // lower guard only: DecibelConverter takes 1/top_db
 	}
 
@@ -654,6 +686,7 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 	v.workerWake  = menu(WorkerWake::Poll, WorkerwakeName);
 	v.workerPriority = menu(WorkerPriority::Highest, WorkerprioName);
 	v.features    = getI(FeaturesName) != 0;
+	if (v.multiFft) v.multiThreads = std::clamp(getI(MultithreadsName), 1, kMultiMaxLayers);
 
 	// A Quality Preset overrides the parameters it owns (RateModel.h, applyPreset) - applied last, on
 	// top of what was just read, so the individual parameters keep their stored values for Custom.
@@ -698,9 +731,14 @@ void setEnableStates(const TD::OP_Inputs* inputs, TD::OP_ParEnableState* state)
 	en(BinsmodeName, !raw);
 	en(BinsName, !raw && !binsAuto);
 	en(KaisermodeName, custom && kaiser);
-	// window length: the unit that is not selected
-	en(WinsamplesName, !winMs);
-	en(WinmsName, winMs);
+	// window length: the unit that is not selected; Multi-FFT takes all three over (values kept)
+	const bool multi = inputs->getParInt(MultifftName) != 0;
+	en(WinmodeName, !multi);
+	en(WinsamplesName, !multi && !winMs);
+	en(WinmsName, !multi && winMs);
+	en(MultilayersName, multi);
+	en(MultirefreshName, multi);
+	en(MultithreadsName, multi && async);
 	// Kaiser beta only for a manual Kaiser window
 	en(KaiserName, kaiser && custom && !betaAuto);
 	// dB group: Loudness on, or the Auto beta designs from the dB floor

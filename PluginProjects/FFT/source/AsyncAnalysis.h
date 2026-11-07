@@ -68,6 +68,8 @@ public:
     double axisRate() const noexcept { return myAxisRate.load(std::memory_order_relaxed); }
     bool parallelActive() const noexcept { return myPipeline.parallelActive(); }
     const FFTDSP::FftBackendInfo& backendInfo() const noexcept { return myPipeline.backendInfo(); }
+    // The pipeline's relaxed per-job telemetry (layers computed / silent, torn ring reads, planner holds).
+    const AnalysisPipeline& pipeline() const noexcept { return myPipeline; }
     Pickup pickup() const noexcept;
     // Copies the pipeline status into `out` only if it changed since `seenVersion` (then updates it).
     // Steady state: one acquire load, no lock, no allocation.

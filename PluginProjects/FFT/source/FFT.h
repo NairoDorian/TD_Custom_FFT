@@ -107,11 +107,14 @@ using namespace TD;
 // not put anything here that is shared between channels or between threads - this struct is touched
 // only by the cook thread, and only one channel's copy at a time.
 // USED BY: FFT::ingest() and FFT::fillJob() in FFT.cpp. See also the note on myIngest below.
+// v2.13: the history is a SampleRing (DSPModules.h 1b) the worker reads in place, instead of a FIFO
+// whose whole window was copied into every job. The ring is heap-allocated once and never destroyed or
+// moved while the node lives (myIngest only grows), because an in-flight job holds a pointer to it.
 struct IngestState {
-    FFTDSP::FIFOBuffer fifo;
+    std::unique_ptr<FFTDSP::SampleRing> ring{ std::make_unique<FFTDSP::SampleRing>() };
     FFTDSP::BiquadEQ eq;
     FFTDSP::AlignedVector block;       // scratch for the incoming block (mix / EQ)
-    size_t silent_run{ 0 };            // consecutive silent samples ingested
+    size_t silent_run{ 0 };            // consecutive silent samples ingested (capped at the ring capacity)
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -229,7 +232,8 @@ private:
 	int  analysisChannelCount(const OP_CHOPInput* cinput, Parameters::ChanMode mode) const;
 	// ingest: step 2 - mix or pick channels, run the EQ, push samples into each FIFO. Called once per
 	// cook, on the cook thread, and it must stay allocation-free in the steady state.
-	void ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChannels, const Parameters::Values& p, size_t capacity);
+	// Returns how many samples were new this cook (0 = a stale cook: the input did not advance).
+	size_t ingest(const OP_CHOPInput* cinput, Parameters::ChanMode mode, int numChannels, const Parameters::Values& p);
 	// fillJob: builds the AnalysisJob for this cook - per channel, the window of samples, plus the
 	// rates and parameters the pipeline needs. Note it reads from the FIFOs that ingest() just wrote.
 	void fillJob(AnalysisJob& job, int numChannels, int winSamples, double dtMs);
@@ -326,6 +330,23 @@ private:
 	// it into job.reset. It is a flag rather than an action because a pulse can arrive between cooks
 	// and the state it clears belongs to the pipeline owner thread.
 	bool				myResetPending{ false };
+	// v2.13 (audit F11): what pulsePressed() actually sets. The next cook turns it into the EQ / cursor
+	// reset and myResetPending, so Reset touches cook-thread state only on the cook thread.
+	std::atomic<bool>	myResetRequested{ false };
+	// v2.13 (audit F1/F2): stale cooks (no new audio) do not publish a job unless the parameters changed.
+	// The audio and the frame time of the held cooks accumulate into the next job's dtMs.
+	Parameters::Values	myLastJobParams{};
+	bool				myHaveJob{ false };
+	int					myLastJobChannels{ -1 };
+	double				myLastJobRate{ 0.0 };
+	double				myPendingFresh{ 0.0 };     // samples since the last published job
+	double				myPendingFrameMs{ 0.0 };   // TouchDesigner frame time since the last published job
+	uint64_t			myStaleCooks{ 0 };         // cooks that held instead of publishing (telemetry)
+	// Build identity (X1b): the link time of the loaded image, and of the file on disk at pluginPath
+	// (re-read every few seconds) - a newer file on disk means the node runs a stale DLL.
+	uint32_t			myImageStamp{ 0 };
+	uint32_t			myDiskStamp{ 0 };
+	std::chrono::steady_clock::time_point myDiskCheckedAt{};
 
 	// --- ingest (cook thread) ---
 	// myIngest: one IngestState per analysis channel - the FIFOs, EQs and silence counters that carry
@@ -495,7 +516,7 @@ private:
 	// when their inputs change. The info callbacks run inside every cook, so formatting ~20 rows and the
 	// popup on each one was steady-state allocation on the cook thread; now the steady state is a
 	// timestamp compare and setString() of strings that already exist.
-	static constexpr int	kInfoFixedRows = 23;
+	static constexpr int	kInfoFixedRows = 25;   // v2.13: + multi_fft, build
 	static constexpr double	kInfoRenderMs = 250.0;
 	std::string			myDatName[kInfoFixedRows];
 	std::string			myDatValue[kInfoFixedRows];
