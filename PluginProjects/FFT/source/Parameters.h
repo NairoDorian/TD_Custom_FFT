@@ -492,11 +492,11 @@ struct Values {
     WarpInterp warpInterp   = WarpInterp::Linear;  // interpolation kernel when an output bin falls between FFT bins (see WarpInterp above)
     double     logFloor     = 20.0;                // Hz, the bottom of a Log or Mel+Log axis. Ignored by Chroma, which uses a fixed 20 Hz floor of its own (see computeTargetHzGrid)
     WinMode    winMode      = WinMode::Samples;    // which of the two fields below is live; the other keeps its default (see WinMode above)
-    int        winSamples   = 3175;                // samples. LOAD-BEARING: 3175 is also the default FIFO capacity written in DSPModules.h, AnalysisPipeline.h and FFT.h, and Parameters.cpp registers it again as the slider default and the fallback - four other copies
+    int        winSamples   = 3175;                // samples. LOAD-BEARING: Parameters.cpp registers 3175 again as the slider default and the eval() fallback, and AnalysisJob::winSamples / FFT::myCapacity start at it (v2.13: the SampleRing has a fixed capacity, so no buffer is sized from this any more)
     double     winMs        = 72.0;                // ms. LOAD-BEARING with winSamples: 72 ms IS 3175 samples at 44.1 kHz, so the two defaults describe the same window and moving one without the other makes the mode switch change the analysis
     int        padIndex     = 4;          // index into kPadValues (16384); the menu stores an index, not a length
     int        padSize      = kPadDefault;         // samples, resolved from padIndex by eval(). The invariant is padSize == kPadValues[padIndex] - nothing recomputes it from the index at use sites
-    Planner    planner      = Planner::Auto;       // must stay INDEX-ALIGNED with FFTDSP::PlannerPolicy (source/DSPModules.h): AnalysisPipeline casts the two, and nothing asserts it
+    Planner    planner      = Planner::Auto;       // must stay INDEX-ALIGNED with FFTDSP::PlannerPolicy (source/DSPModules.h): AnalysisPipeline casts the two, and a static_assert in AnalysisPipeline.cpp pins it
     // EQ
     // An optional biquad shelf pair applied to the audio BEFORE the window (see the EQ section of
     // Parameters.cpp for why it is off by default). Gains are dB, cutoffs are Hz, and the whole

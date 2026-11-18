@@ -58,21 +58,22 @@
  *     to preserve when editing: no allocation, no lock and no print on this path, ever.
  *   The AnalysisPipeline (FFT engine, tables, per-channel DSP state) is entered by ONE
  *   thread at a time: the worker when Async is on, the cook thread when it is off. That is
- *   ownership, not single-threadedness — inside one process() the channel loop fans out over
- *   std::execution::par, and each thread then touches only its own channel's DspState plus
- *   read-only tables.
+ *   ownership, not single-threadedness — inside one process() the work may fan out (Multi-FFT
+ *   layers over the LayerPool, or several channels over std::execution::par), and each task then
+ *   touches only its own buffers plus read-only tables.
  *   Telemetry strings are refreshed by the pipeline owner only when they change and
  *   are read by the Info CHOP/DAT callbacks under their own mutex.
  *
  *   Mono first: "Channels = Mono Mix" (default) averages every input channel
  *   into a single analysis channel, so a stereo input costs one FFT.
  *
- *   Threads: the node itself owns exactly one background thread (the async analysis worker
- *   above), and that is the whole of its threading. With more than one analysis channel the
- *   channel loop is also the only intra-cook parallelism, so it runs on std::execution::par
- *   (unconditionally — a one-channel cook has nothing to fan out and stays serial). FFTW cannot
- *   split a single 1-D transform: measured, nthreads > 1 makes one transform 13-51 % slower, not
- *   faster, which is why there is no FFT-threads control and no reason to want one.
+ *   Threads: the node owns one background thread (the async analysis worker above). Inside one
+ *   job the work can fan out two ways: Multi-FFT spreads its (channel x layer) tasks over the
+ *   LayerPool helpers (Multi-FFT Layer Threads; worker priority; LayerPool.h), and a single-window
+ *   job with several analysis channels runs its channel loop on std::execution::par (a one-channel
+ *   cook has nothing to fan out and stays serial). A background FFT planner thread exists only
+ *   while a plan is being measured. FFTW cannot split a single 1-D transform: measured, nthreads > 1
+ *   makes one transform 13-51 % slower, not faster, which is why there is no FFT-threads control.
  * ===========================================================================
  */
 
@@ -135,12 +136,14 @@ struct IngestState {
 //   1. Bookkeeping and parameters. Measure the gap since the last cook, poll the parameters (or
 //      reuse the ones getOutputInfo already polled), read the input sample rate and the timeline
 //      rate.                                        -> FFT.cpp (executeImpl, getOutputInfo, pollParameters)
-//   2. Ingest. Mix or select channels, apply the EQ, push the new samples into each channel's FIFO.
-//                                                   -> FFT.cpp (ingest), using FFTDSP::FIFOBuffer and
+//   2. Ingest. Mix or select channels, apply the EQ, append ONLY the new samples to each channel's
+//      SampleRing (v2.13; the old FIFO + whole-window copy is gone from the plugin's path).
+//                                                   -> FFT.cpp (ingest), using FFTDSP::SampleRing and
 //                                                      FFTDSP::BiquadEQ from DSPModules.h
-//   3. Hand the work off. Build an AnalysisJob from each channel's window and publish it through a
-//      lock-free triple buffer; wake the worker only if it had gone dormant. With Async off, run it
-//      inline on the cook thread instead.
+//   3. Hand the work off. Build an AnalysisJob that names each channel's ring and the position this
+//      job ends at (no samples are copied), and publish it through a lock-free triple buffer; wake
+//      the worker only if it had gone dormant. A stale cook (no new audio, no parameter change)
+//      publishes nothing and holds. With Async off, run it inline on the cook thread instead.
 //                                                   -> FFT.cpp (fillJob, runJob, startWorker,
 //                                                      stopWorker, workerLoop), using
 //                                                      FFTDSP::TripleBuffer and FFTDSP::WorkerSignal
@@ -346,6 +349,7 @@ private:
 	// (re-read every few seconds) - a newer file on disk means the node runs a stale DLL.
 	uint32_t			myImageStamp{ 0 };
 	uint32_t			myDiskStamp{ 0 };
+	uint64_t			myDiskWriteTime{ 0 };     // last-write time of pluginPath when myDiskStamp was read (v2.13.1)
 	std::chrono::steady_clock::time_point myDiskCheckedAt{};
 
 	// --- ingest (cook thread) ---

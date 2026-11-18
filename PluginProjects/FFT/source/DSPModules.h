@@ -312,20 +312,23 @@ CALLED BY: FillCHOPPluginInfo() in FFT.cpp, once per process, when TouchDesigner
 */
 inline bool cpuSupportsAVX2() noexcept {
 #if defined(_WIN32)
-    // PF_AVX2_INSTRUCTIONS_AVAILABLE == 40 (Windows 10+)
-    // Preferred when available: it is the OS's own answer and already accounts for the
-    // OS/hypervisor having enabled the register state, which is the part CPUID cannot see.
-    if (IsProcessorFeaturePresent(40)) return true;
-    // Fallback for systems where that query is unavailable. CPUID leaf 7 / sub-leaf 0, EBX bit 5
-    // is AVX2; leaf 1 ECX bit 27 is OSXSAVE (the OS can save YMM state) and bit 12 is FMA.
+    // CPUID leaf 1: ECX bit 12 is FMA, bit 27 is OSXSAVE (the OS can save YMM state).
     int info[4] = { 0, 0, 0, 0 };
     __cpuid(info, 0);
-    if (info[0] < 7) return false;   // leaf 7 does not exist, so AVX2 cannot either
-    __cpuidex(info, 7, 0);
-    const bool avx2 = (info[1] & (1 << 5)) != 0;
+    const int maxLeaf = info[0];
     __cpuid(info, 1);
     const bool osxsave = (info[2] & (1 << 27)) != 0;
     const bool fma = (info[2] & (1 << 12)) != 0;
+    // PF_AVX2_INSTRUCTIONS_AVAILABLE == 40 (Windows 10+). Preferred for AVX2 itself: it is the OS's own
+    // answer and already accounts for the OS/hypervisor having enabled the register state, which is the
+    // part CPUID cannot see. v2.13.1: it says nothing about FMA, and this used to return true on it alone,
+    // so FMA was never checked on Windows 10+ - a VM that masks FMA (but exposes AVX2) would fault on the
+    // first _mm256_fmadd_ps. FMA is now required on both paths.
+    if (IsProcessorFeaturePresent(40)) return fma;
+    // Fallback for systems where that query is unavailable. CPUID leaf 7 / sub-leaf 0, EBX bit 5 is AVX2.
+    if (maxLeaf < 7) return false;   // leaf 7 does not exist, so AVX2 cannot either
+    __cpuidex(info, 7, 0);
+    const bool avx2 = (info[1] & (1 << 5)) != 0;
     if (!avx2 || !osxsave || !fma) return false;
     // OSXSAVE says the OS *can* save the state; XCR0 says it actually enabled XMM (bit 1) and
     // YMM (bit 2). Both bits must be set or the 256-bit kernels must not run.
@@ -2149,52 +2152,38 @@ inline float peakMagnitude(const float* __restrict data, size_t n) noexcept {
 // Peak value and index (data 32-byte aligned). The first bin wins a tie (strict >), which is what
 // makes the reported peak index stable frame to frame when two bins hold the same value.
 //
-// HOW: four independent (running max, index-of-max) vector pairs over 32 bins per step. Per lane a
-// strict > keeps the earliest index, and the final 32-way reduction breaks value ties on the lower
-// index, so the result is exactly the scalar "first maximum". No data-dependent branch and no
-// loop-carried latency chain (four chains hide the compare+blend latency), so the cost no longer
-// depends on the data: the previous "filter, then rescan the chunk" form cost 0.85 us on a noisy
-// spectrum but 4.5 us on a rising one (every chunk a new maximum); this is ~0.9 us for both at 16384
-// bins (i9-13900H P-core). peak_idx is always written (0 for an empty range).
+// HOW (v2.13.1, two passes): (1) the maximum value with peakMagnitude()'s four independent max chains
+// - loads and maxps only, no index bookkeeping; (2) the FIRST index holding that value: 32 floats per
+// step, four compares OR-ed into one movemask, stop at the first block that contains it, then the
+// exact index within the block. That is exactly the scalar "first maximum" (test_cpu_check_and_peak_v2131
+// pins value and index against it). The v2.12 one-pass form carried a (value, index) pair per lane with
+// a compare + max + blendv + index add per vector, ~20 uops per 32 floats.
+// MEASURED (min of 40 rounds x 3 reps, interleaved, one P-core, i9-13900H), one-pass -> two-pass:
+//   16384 bins: noise 0.90 -> 0.62 us, audio-like 0.93 -> 0.45 us, falling 0.86 -> 0.41 us, and the
+//   worst case for the scan - a rising spectrum, peak in the last bin - 0.95 -> 0.93 us (never slower);
+//   8193 bins: 0.45-0.49 -> 0.21-0.42 us. peak_idx is always written (0 for an empty range).
+// (A NaN maximum - which no stage produces - finds no equal element and reports index 0.)
 inline float findPeakWithIndex(const float* __restrict data, size_t n, size_t& peak_idx) noexcept {
     peak_idx = 0;
     if (n == 0) return 0.0f;
-    float max_val = data[0];
-    size_t i = 0;
 #if defined(__AVX2__)
     if (n >= 32) {
-        __m256 m0 = _mm256_load_ps(data), m1 = _mm256_load_ps(data + 8), m2 = _mm256_load_ps(data + 16), m3 = _mm256_load_ps(data + 24);
-        const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-        __m256i c0 = lane, c1 = _mm256_add_epi32(lane, _mm256_set1_epi32(8)),
-                c2 = _mm256_add_epi32(lane, _mm256_set1_epi32(16)), c3 = _mm256_add_epi32(lane, _mm256_set1_epi32(24));
-        __m256i x0 = c0, x1 = c1, x2 = c2, x3 = c3;
-        const __m256i step = _mm256_set1_epi32(32);
-        auto upd = [](__m256& m, __m256i& x, __m256 v, __m256i c) noexcept {
-            const __m256 gt = _mm256_cmp_ps(v, m, _CMP_GT_OQ);
-            m = _mm256_max_ps(m, v);
-            x = _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(x), _mm256_castsi256_ps(c), gt));
-        };
-        for (i = 32; i + 31 < n; i += 32) {
-            c0 = _mm256_add_epi32(c0, step); c1 = _mm256_add_epi32(c1, step);
-            c2 = _mm256_add_epi32(c2, step); c3 = _mm256_add_epi32(c3, step);
-            upd(m0, x0, _mm256_load_ps(data + i), c0);
-            upd(m1, x1, _mm256_load_ps(data + i + 8), c1);
-            upd(m2, x2, _mm256_load_ps(data + i + 16), c2);
-            upd(m3, x3, _mm256_load_ps(data + i + 24), c3);
+        const float m = peakMagnitude(data, n);
+        const __m256 vm = _mm256_set1_ps(m);
+        size_t i = 0;
+        for (; i + 31 < n; i += 32) {
+            const __m256 e0 = _mm256_cmp_ps(_mm256_load_ps(data + i), vm, _CMP_EQ_OQ);
+            const __m256 e1 = _mm256_cmp_ps(_mm256_load_ps(data + i + 8), vm, _CMP_EQ_OQ);
+            const __m256 e2 = _mm256_cmp_ps(_mm256_load_ps(data + i + 16), vm, _CMP_EQ_OQ);
+            const __m256 e3 = _mm256_cmp_ps(_mm256_load_ps(data + i + 24), vm, _CMP_EQ_OQ);
+            if (_mm256_movemask_ps(_mm256_or_ps(_mm256_or_ps(e0, e1), _mm256_or_ps(e2, e3)))) break;
         }
-        alignas(32) float mv[32];
-        alignas(32) int32_t iv[32];
-        _mm256_store_ps(mv, m0); _mm256_store_ps(mv + 8, m1); _mm256_store_ps(mv + 16, m2); _mm256_store_ps(mv + 24, m3);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(iv), x0);      _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 8), x1);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 16), x2); _mm256_store_si256(reinterpret_cast<__m256i*>(iv + 24), x3);
-        max_val = mv[0]; peak_idx = static_cast<size_t>(iv[0]);
-        for (int l = 1; l < 32; ++l) {
-            const size_t li = static_cast<size_t>(iv[l]);
-            if (mv[l] > max_val || (mv[l] == max_val && li < peak_idx)) { max_val = mv[l]; peak_idx = li; }
-        }
+        for (; i < n; ++i) if (data[i] == m) { peak_idx = i; return m; }
+        return m;
     }
 #endif
-    for (; i < n; ++i) {
+    float max_val = data[0];
+    for (size_t i = 1; i < n; ++i) {
         if (data[i] > max_val) { max_val = data[i]; peak_idx = i; }
     }
     return max_val;
@@ -2839,6 +2828,25 @@ public:
     // letting a test run overwrite the user's real wisdom cache.
     static std::string& wisdomPathOverride() { static std::string s; return s; }
 
+    // v2.13.1 - Auto escalates to FFTW_PATIENT. Measured (fft_bench, 8193 output bins, N=16384, 3
+    // interleaved rounds, i9-13900H): the FFT stage is 12.6 us with MEASURE wisdom and 10.5 us with PATIENT
+    // wisdom (-16 %, -15 % per job). So Auto no longer stops at MEASURE: once the live MEASURE plan has
+    // been stable for autoPatientDelayMs() (2 s) it measures a PATIENT plan on the background thread, swaps it in
+    // and writes it to wisdom; from then on Auto finds the PATIENT plan in wisdom instantly. Bounded:
+    //   * only sizes <= kAutoPatientMaxN (a PATIENT measure of 65536 takes many seconds),
+    //   * only with Async on (background work allowed), never during a Multi-FFT planning batch,
+    //   * once per size per machine (wisdom), and the stability delay keeps it off while settings move.
+    // Planner = Measured opts out (MEASURE only, never PATIENT). The switch exists for the headless tests
+    // and the bench, which need plans that do not change under them; the plugin leaves it on.
+    static std::atomic<bool>& autoPatientEscalation() { static std::atomic<bool> on{ true }; return on; }
+    static constexpr size_t kAutoPatientMaxN = 32768;
+    // The stability delay (ms). A function-local static like the switch, so the escalation test can shorten it.
+    static std::atomic<double>& autoPatientDelayMs() { static std::atomic<double> ms{ 2000.0 }; return ms; }
+    static std::chrono::steady_clock::time_point escalationDueAt() {
+        return std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                   std::chrono::duration<double, std::milli>(autoPatientDelayMs().load(std::memory_order_relaxed)));
+    }
+
     // Where the wisdom file lives by default: %LOCALAPPDATA%\TD_Custom_FFT\fftwf_wisdom.txt.
     // WHY LOCALAPPDATA AND NOT THE PLUGIN FOLDER: wisdom is a cache of measured plans for *this*
     // machine's CPU, and it is written by a background thread that may not have write access to the
@@ -3005,11 +3013,14 @@ public:
     /*
       Planner policies
         Fast     : FFTW_ESTIMATE only (never stalls, generic plan).
-        Measured : FFTW_MEASURE synchronously (best plan; ~0.4 s once per size per machine, then cached in wisdom).
-        Auto     : if wisdom already holds a measured plan for this size (FFTW_MEASURE | FFTW_WISDOM_ONLY) use it
-                   instantly; otherwise use an ESTIMATE plan right away and measure a better one on a background
-                   thread, swap it in on the next cook (pollBackgroundPlan) and save it to wisdom. Real-time is never
-                   interrupted and the second run of any size is already optimal.
+        Measured : FFTW_MEASURE synchronously (~0.4 s once per size per machine, then cached in wisdom). Never
+                   escalates to PATIENT - the opt-out from Auto's escalation below.
+        Auto     : if wisdom already holds a PATIENT plan for this size use it instantly; else a MEASURE plan from
+                   wisdom; otherwise an ESTIMATE plan right away and a MEASURE measured on a background thread,
+                   swapped in on a later job (pollBackgroundPlan) and saved to wisdom. v2.13.1: for N <= 32768,
+                   once the MEASURE plan has been stable for 2 s a PATIENT plan is measured in the background
+                   too (-15 % per job measured at N=16384), so from the next session on Auto starts on PATIENT.
+                   Real-time is never interrupted.
         Patient  : same scheme with FFTW_PATIENT, no time limit (measured: 10-15 % faster execute than MEASURE at
                    16K/32K; ~2.7 s of planning at N = 32768 on an i9-13900H, longer on slower machines, once per
                    size per machine). The cook thread is never blocked in the steady state - planning happens on
@@ -3112,6 +3123,7 @@ public:
         // stale true here would let setBackgroundAllowed() re-arm a measurement for a plan that is
         // already the measured one.
         m_wants_upgrade = false;
+        m_escalate = false;
         {
             // plannerLock (taken above) covers plan creation, the wisdom export and the wisdom import.
             Buffers b(api, fft_size);
@@ -3143,16 +3155,29 @@ public:
                     }
                     break;
                 case PlannerPolicy::Auto:
-                default:
-                    m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE | FFTW_WISDOM_ONLY);
-                    if (m_plan) {
-                        used = "FFTW_MEASURE (from wisdom)";
-                    } else {
-                        m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
-                        used = "FFTW_ESTIMATE (measuring in background)";
-                        start_background = true;
+                default: {
+                    // v2.13.1: PATIENT wisdom first (a PATIENT|WISDOM_ONLY request only accepts wisdom made
+                    // at PATIENT or EXHAUSTIVE rigour), then MEASURE wisdom, then ESTIMATE + background
+                    // MEASURE. Either of the last two arms the PATIENT escalation (see autoPatientEscalation).
+                    const bool escalate = autoPatientEscalation().load(std::memory_order_relaxed) && fft_size <= kAutoPatientMaxN;
+                    if (escalate) {
+                        m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_PATIENT | FFTW_WISDOM_ONLY);
+                        if (m_plan) used = "FFTW_PATIENT (from wisdom)";
+                    }
+                    if (!m_plan) {
+                        m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_MEASURE | FFTW_WISDOM_ONLY);
+                        if (m_plan) {
+                            used = escalate ? "FFTW_MEASURE (from wisdom; patient upgrade pending)" : "FFTW_MEASURE (from wisdom)";
+                        } else {
+                            m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
+                            used = "FFTW_ESTIMATE (measuring in background)";
+                            start_background = true;
+                        }
+                        m_escalate = escalate && m_plan != nullptr;
+                        m_escalateAt = escalationDueAt();
                     }
                     break;
+                }
             }
             if (!m_plan && want->honoursPolicy && policy != PlannerPolicy::Fast) {
                 m_plan = api.planR2C(static_cast<int>(fft_size), b.in, b.out, FFTW_ESTIMATE);
@@ -3351,7 +3376,8 @@ public:
     // background-measured plan when one is ready. Returns true when the plan changed.
     bool pollBackgroundPlan() override {
         reapGraveyard(false);
-        if (!m_bg || !m_bg->done.load(std::memory_order_acquire)) return false;
+        if (!m_bg) { maybeEscalateToPatient(); return false; }
+        if (!m_bg->done.load(std::memory_order_acquire)) return false;
         fftwf_plan ready = m_bg->plan.exchange(nullptr);
         if (!ready) {                                  // the measurement produced no plan: nothing to swap
             if (m_bg->thread.joinable()) m_bg->thread.join();   // done -> returns immediately
@@ -3378,8 +3404,11 @@ public:
         m_bg.reset();
         m_wants_upgrade = false;
         const char* rigor = (m_bg_rigor == FFTW_PATIENT) ? "FFTW_PATIENT" : "FFTW_MEASURE";
-        m_planStatus = std::string(tag()) + " (" + rigor + " upgraded in background - " + std::to_string(ms) + " ms, N=" + std::to_string(m_fft_size) + ")";
+        m_planStatus = std::string(tag()) + " (" + rigor + " upgraded in background - " + std::to_string(ms) + " ms, N=" + std::to_string(m_fft_size) +
+                       (m_escalate && m_bg_rigor != FFTW_PATIENT ? "; patient upgrade pending)" : ")");
         if (m_log) m_log->log(std::string("[FFT Plugin] [") + tag() + "] background " + rigor + " plan ready for N=" + std::to_string(m_fft_size) + " (" + std::to_string(ms) + " ms), swapped in");
+        // The MEASURE plan just became live: the escalation's stability clock starts now.
+        if (m_escalate) m_escalateAt = escalationDueAt();
         return true;
     }
 
@@ -3401,6 +3430,21 @@ public:
     }
 
 private:
+    // v2.13.1 Auto escalation (see autoPatientEscalation): starts the background FFTW_PATIENT measurement
+    // once the live MEASURE plan has been stable for autoPatientDelayMs(). Called from pollBackgroundPlan()
+    // on the pipeline owner, only when no measurement is running. Every condition that would make the
+    // start wrong (a plan waiting for the planner, a Multi-FFT batch in progress, Async off) just defers it.
+    void maybeEscalateToPatient() {
+        if (!m_escalate || m_bg || m_pending || !m_plan || !m_bg_allowed || m_bg_hold || m_fft_size == 0) return;
+        if (!autoPatientEscalation().load(std::memory_order_relaxed)) { m_escalate = false; return; }
+        if (std::chrono::steady_clock::now() < m_escalateAt) return;
+        m_escalate = false;
+        startBackgroundMeasure(m_fft_size, FFTW_PATIENT);
+        if (m_log) m_log->log(std::string("[FFT Plugin] [") + tag() + "] Auto: plan N=" + std::to_string(m_fft_size) +
+                              " stable, measuring FFTW_PATIENT in the background (once per size per machine; "
+                              "~15 % faster FFT; Planner = Measured opts out)", false);
+    }
+
     // Hands the live measurement (if any) to the graveyard without waiting for it. A measurement that
     // already finished is disposed of right here when the planner lock is free.
     void abandonBackground() noexcept {
@@ -3465,6 +3509,9 @@ private:
     bool m_pending{ false };               // the last prepare() found the planner lock taken
     size_t m_pendingSize{ 0 };             // the size it wanted (status)
     bool m_bg_hold{ false };               // background upgrades held for a batch (holdBackground)
+    // v2.13.1 Auto escalation: a PATIENT upgrade is owed for the live MEASURE plan, from m_escalateAt on.
+    bool m_escalate{ false };
+    std::chrono::steady_clock::time_point m_escalateAt{};
     struct RetiredPlan { void (*destroy)(fftwf_plan); fftwf_plan plan; };
     std::vector<RetiredPlan> m_retired;    // destroyed by reapGraveyard() when the lock is free
 };

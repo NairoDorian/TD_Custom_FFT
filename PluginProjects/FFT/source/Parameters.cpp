@@ -554,7 +554,7 @@ because the DSP branches on the toggle first.
 */
 Values eval(const TD::OP_Inputs* inputs, int* reads)
 {
-	Values v{};   // value-initialized: padding is zero, so two snapshots can be compared byte for byte (paramsDiffer)
+	Values v{};   // value-initialized. NOT a basis for a byte compare: MSVC leaves the padding indeterminate, which is why paramsDiffer() compares field by field
 	if (!inputs) return v;
 	int n = 0;
 	auto getI = [&](const char* name) { ++n; return inputs->getParInt(name); };
@@ -626,8 +626,14 @@ Values eval(const TD::OP_Inputs* inputs, int* reads)
 		v.cutoffHz    = v.highShelf ? getD(CutoffhzName) : 1000.0;
 		v.lowGainDb   = v.lowShelf ? std::clamp(getD(LowgaindbName), -60.0, 60.0) : 0.0;
 		v.lowCutoffHz = v.lowShelf ? getD(LowcutoffhzName) : 200.0;
-		v.q           = getD(QName);        // no clamp and no bounds check: the slider (0.1..4.0) is the only limit
-		v.amount      = getD(AmountName);   // likewise; the slider reaches 5.0 and the DSP treats it as a plain multiplier
+		v.q           = getD(QName);        // no clamp here: BiquadEQ::designShelf holds Q >= 0.01 and rejects a non-finite design
+		// v2.13.1: Amount is a plain multiplier on (filtered - dry), applied per sample at ingest, so a typed
+		// 1e30 wrote inf into the SampleRing (and the spectrum) for ~3 s. Held to 0..100 (the slider stops
+		// at 5); a NaN falls back to the default 1.
+		{
+			const double a = getD(AmountName);
+			v.amount = std::isfinite(a) ? std::clamp(a, 0.0, 100.0) : 1.0;
+		}
 	}
 
 	// --- Window & weighting ---

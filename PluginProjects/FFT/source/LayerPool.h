@@ -10,8 +10,9 @@
  *
  * WHY A DEDICATED POOL AND NOT std::execution::par: the parallel STL runs on the Windows thread pool
  * at NORMAL priority, below the HIGHEST / MMCSS analysis worker that waits for it - a priority
- * inversion on a busy machine. These helpers take the worker's own scheduling (HIGHEST, opted out of
- * EcoQoS throttling), exactly like the analysis worker in AsyncAnalysis.cpp.
+ * inversion on a busy machine. These helpers take the worker's own scheduling (HIGHEST, or MMCSS
+ * "Pro Audio" when Worker Priority = MMCSS since v2.13.1; opted out of EcoQoS throttling), exactly
+ * like the analysis worker in AsyncAnalysis.cpp.
  *
  * WHY STATIC ASSIGNMENT: the tasks are FFTs whose cost is known in advance (~N log N), so the caller
  * hands each helper a fixed task list, balanced once per configuration (longest task first onto the
@@ -47,19 +48,24 @@ public:
     LayerPool& operator=(const LayerPool&) = delete;
 
     // Number of helper threads (the caller is the extra one). Starting / joining threads happens only
-    // here, i.e. when the Layer Threads parameter, Multi-FFT or Async changes - never per job.
-    void resize(int helpers) {
+    // here, i.e. when the Layer Threads parameter, Multi-FFT, Async or Worker Priority changes - never per job.
+    // mmcss: register each helper with MMCSS "Pro Audio", like a worker whose Worker Priority = MMCSS
+    // (v2.13.1). Before, the helpers were always THREAD_PRIORITY_HIGHEST, i.e. far BELOW an MMCSS worker
+    // that spin-waits for them in run() - a priority inversion on a busy machine.
+    void resize(int helpers, bool mmcss = false) {
         helpers = std::max(0, helpers);
-        if (helpers == static_cast<int>(m_helpers.size())) return;
+        if (helpers == static_cast<int>(m_helpers.size()) && (helpers == 0 || mmcss == m_mmcss)) return;
         for (auto& h : m_helpers) {
             h->stop.store(true, std::memory_order_release);
             h->signal.signal();
             if (h->thread.joinable()) h->thread.join();
         }
         m_helpers.clear();
+        m_mmcss = mmcss;
         for (int i = 0; i < helpers; ++i) {
             m_helpers.push_back(std::make_unique<Helper>());
             Helper* h = m_helpers.back().get();
+            h->mmcss = mmcss;
             h->thread = std::thread([h]() { helperLoop(*h); });
         }
     }
@@ -125,6 +131,7 @@ private:
         alignas(64) std::atomic<uint64_t> done{ 0 };
         std::atomic<bool> sleeping{ false };
         std::atomic<bool> stop{ false };
+        bool mmcss{ false };                  // set before the thread starts, read once by it
         const int* tasks{ nullptr };
         int count{ 0 };
         TaskFn fn{ nullptr };
@@ -133,7 +140,26 @@ private:
 
     static void helperLoop(Helper& h) {
 #ifdef _WIN32
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        // Scheduling: the same choice the analysis worker made (AsyncAnalysis.cpp, ThreadScheduling).
+        // MMCSS is resolved at run time from avrt.dll, so there is no link dependency; when it is not
+        // available (or not asked for) the helper runs at THREAD_PRIORITY_HIGHEST.
+        using AvSetFn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
+        using AvRevertFn = BOOL(WINAPI*)(HANDLE);
+        HANDLE mmcssTask = nullptr;
+        AvRevertFn avRevert = nullptr;
+        if (h.mmcss) {
+            if (HMODULE avrt = LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+                auto avSet = reinterpret_cast<AvSetFn>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW"));
+                avRevert = reinterpret_cast<AvRevertFn>(GetProcAddress(avrt, "AvRevertMmThreadCharacteristics"));
+                DWORD taskIndex = 0;
+                if (avSet) mmcssTask = avSet(L"Pro Audio", &taskIndex);
+            }
+        }
+        if (!mmcssTask) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        struct MmcssRevert {
+            HANDLE task; AvRevertFn revert;
+            ~MmcssRevert() { if (task && revert) revert(task); }
+        } mmcssRevert{ mmcssTask, avRevert };
         using SetDescFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
         if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
             if (auto fn = reinterpret_cast<SetDescFn>(GetProcAddress(k32, "SetThreadDescription"))) fn(GetCurrentThread(), L"FFT Custom CHOP layer helper");
@@ -173,6 +199,7 @@ private:
 
     std::vector<std::unique_ptr<Helper>> m_helpers;
     uint64_t m_gen{ 0 };
+    bool m_mmcss{ false };
 };
 
 #endif // LAYER_POOL_H

@@ -59,7 +59,9 @@ if(GIT_FOUND)
     execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                     OUTPUT_VARIABLE _fft_hash OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _fft_hash_rc)
     if(_fft_hash_rc EQUAL 0 AND _fft_hash)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        # "-- ." scopes the check to this plugin's directory: TouchDesigner re-saves Plugin_FFT.toe at the
+        # repo root constantly, and that alone used to mark every build "+dirty" (v2.13.1).
+        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no -- . WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                         OUTPUT_VARIABLE _fft_dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
         set(FFT_GIT_HASH "${_fft_hash}")
         if(_fft_dirty)
@@ -90,7 +92,7 @@ td_plugin_optimize(FFT AVX2 FAST_MATH LTO)
 #   ninja -C build && ctest --test-dir build --output-on-failure
 #   build/bin/Release/fft_bench.exe --channels 8 --fft 32768
 # The test executable prints "N checks, M failures" as its last line; the
-# baseline is 607 checks, 0 failures (see the header of tests/dsp_tests.cpp).
+# baseline is recorded in CHANGELOG.md for each release (853 at v2.13.0).
 # That count is a coverage SIGNAL: it must not go down between revisions, and
 # a comment-only change must leave it exactly where it is.
 # ---------------------------------------------------------------------------

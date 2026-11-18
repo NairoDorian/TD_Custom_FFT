@@ -2585,6 +2585,119 @@ static void test_multi_fft_allocation_gate()
     CHECK(run(4, 3) == 0);
 }
 
+// ------------------------------------------------------------------------------------------
+// ===================== test_auto_patient_escalation (v2.13.1) =====================
+// WHAT:  Auto measures a PATIENT plan in the background once its MEASURE plan has been stable, swaps it
+//        in and writes it to wisdom; a fresh Auto engine then starts on PATIENT from wisdom and measures
+//        nothing more. Measured never escalates, and a size above kAutoPatientMaxN never does either.
+// WHY:   PATIENT is ~15 % faster per job than MEASURE at the default N (measured), and this is how the
+//        default policy gets it without a stall or a user action.
+// HOW TO CHANGE: the suite runs with the escalation switched off (main); this test switches it on for
+//        itself with a 50 ms stability delay, and restores both. N = 512 is planned by no other test.
+static void test_auto_patient_escalation()
+{
+    section("FFTWEngine Auto -> FFTW_PATIENT background escalation (v2.13.1)");
+    FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";
+    const double savedDelay = FFTWEngine::autoPatientDelayMs().load();
+    FFTWEngine::autoPatientEscalation() = true;
+    FFTWEngine::autoPatientDelayMs() = 50.0;
+    PlanLog log;
+    const size_t N = 512;                                    // planned by no other test (fast to measure at PATIENT)
+    AlignedVector frame(N, 0.0f), mag; AlignedComplexVector scratch;
+    frame[3] = 1.0f;                                         // impulse: |X[k]| == 1 for every k
+    {
+        FFTWEngine e;
+        e.prepare(N, PlannerPolicy::Auto, &log);
+        CHECK(e.hasPlan());
+        bool patient = false, sawPending = false;
+        for (int i = 0; i < 1500 && !patient; ++i) {          // 15 s ceiling: MEASURE, 50 ms, then PATIENT
+            e.pollBackgroundPlan();
+            e.executeRFFT(frame, mag, scratch);                // the plan in use keeps executing throughout
+            const std::string st = e.getPlanStatus();
+            sawPending = sawPending || st.find("patient upgrade pending") != std::string::npos;
+            patient = st.find("FFTW_PATIENT") != std::string::npos;
+            if (!patient) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::printf("  final: %s\n", e.getPlanStatus().c_str());
+        CHECK(sawPending);                                     // the MEASURE stage said what was coming
+        CHECK(patient);
+        CHECK(!e.upgradeInProgress());
+        e.executeRFFT(frame, mag, scratch);
+        CHECK_NEAR(mag[0], 1.0, 1e-4);
+        CHECK_NEAR(mag[N / 2], 1.0, 1e-4);
+    }
+    {   // the PATIENT plan is now in wisdom: a fresh Auto engine starts on it and measures nothing
+        FFTWEngine e2;
+        e2.prepare(N, PlannerPolicy::Auto, &log);
+        CHECK(e2.getPlanStatus().find("FFTW_PATIENT (from wisdom)") != std::string::npos);
+        for (int i = 0; i < 10; ++i) { e2.pollBackgroundPlan(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        CHECK(!e2.upgradeInProgress());
+    }
+    {   // Measured: MEASURE only, never a PATIENT measurement afterwards
+        FFTWEngine m;
+        m.prepare(5120, PlannerPolicy::Measured, &log);
+        for (int i = 0; i < 10; ++i) { m.pollBackgroundPlan(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        CHECK(!m.upgradeInProgress());
+        CHECK(m.getPlanStatus().find("PATIENT") == std::string::npos);
+    }
+    {   // above the cap (65536, in wisdom since test_background_plan): no escalation, no pending note
+        FFTWEngine big;
+        big.prepare(65536, PlannerPolicy::Auto, &log);
+        CHECK(big.getPlanStatus().find("pending") == std::string::npos);
+        for (int i = 0; i < 10; ++i) { big.pollBackgroundPlan(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+        CHECK(!big.upgradeInProgress());
+    }
+    FFTWEngine::autoPatientDelayMs() = savedDelay;
+    FFTWEngine::autoPatientEscalation() = false;
+}
+
+// ------------------------------------------------------------------------------------------
+// ===================== test_cpu_check_and_peak_v2131 =====================
+// WHAT:  (1) cpuSupportsAVX2() never answers yes without FMA (it used to skip the FMA bit on Windows 10+).
+//        (2) findPeakWithIndex() returns exactly the scalar "first maximum" (value and index) for every
+//        length 1..300 and for 16384, on noisy, rising, falling and tied data - including ties that
+//        straddle the 32-float block boundaries of the AVX2 kernel.
+// WHY:   (2) pins the v2.13.1 two-pass rewrite (max, then the first index equal to it) bit for bit.
+static void test_cpu_check_and_peak_v2131()
+{
+    section("CPU check (FMA) and findPeakWithIndex first-maximum contract (v2.13.1)");
+#if defined(_WIN32)
+    int info[4] = { 0, 0, 0, 0 };
+    __cpuid(info, 1);
+    const bool fma = (info[2] & (1 << 12)) != 0;
+    CHECK(!cpuSupportsAVX2() || fma);
+#endif
+    auto scalarPeak = [](const float* d, size_t n, size_t& idx) {
+        idx = 0; float m = d[0];
+        for (size_t i = 1; i < n; ++i) if (d[i] > m) { m = d[i]; idx = i; }
+        return m;
+    };
+    uint32_t rng = 12345u;
+    auto rnd = [&rng]() { rng = rng * 1664525u + 1013904223u; return static_cast<float>((rng >> 8) & 0xFFFF) / 65536.0f; };
+    int mismatches = 0;
+    auto check = [&](const AlignedVector& v) {
+        size_t ia = 0, ib = 0;
+        const float a = findPeakWithIndex(v.data(), v.size(), ia);
+        const float b = scalarPeak(v.data(), v.size(), ib);
+        if (a != b || ia != ib) ++mismatches;
+    };
+    for (size_t n = 1; n <= 300; ++n) {
+        AlignedVector v(n);
+        for (size_t i = 0; i < n; ++i) v[i] = rnd();                       check(v);   // noise
+        for (size_t i = 0; i < n; ++i) v[i] = static_cast<float>(i);       check(v);   // rising: last wins
+        for (size_t i = 0; i < n; ++i) v[i] = static_cast<float>(n - i);   check(v);   // falling: first wins
+        for (size_t i = 0; i < n; ++i) v[i] = std::floor(rnd() * 4.0f);    check(v);   // many ties
+        for (size_t i = 0; i < n; ++i) v[i] = 1.0f;                        check(v);   // all equal: index 0
+    }
+    AlignedVector big(16384);
+    for (size_t i = 0; i < big.size(); ++i) big[i] = rnd();
+    check(big);
+    big[31] = 2.0f; big[32] = 2.0f; big[16383] = 2.0f; check(big);            // ties across block edges
+    big[31] = 1.0f; check(big);
+    CHECK(mismatches == 0);
+    if (mismatches) std::printf("  findPeakWithIndex: %d mismatches against the scalar first maximum\n", mismatches);
+}
+
 int main()
 {
     // Unbuffered stdout, for the same reason as the bench: piped output is block-buffered by the MSVC
@@ -2597,6 +2710,10 @@ int main()
     // first prepare() (test_v23_helpers) used to import the user's real %LOCALAPPDATA% cache.
     FFTWEngine::wisdomPathOverride() = "fft_tests_wisdom.txt";
     std::remove("fft_tests_wisdom.txt");
+    // v2.13.1: Auto's background PATIENT escalation is off for the suite (the tests plan many sizes back to
+    // back and a PATIENT measurement would hold the process-wide planner lock under them);
+    // test_auto_patient_escalation switches it on for itself.
+    FFTWEngine::autoPatientEscalation() = false;
     // The build answer (was this compiled with AVX2?) and the runtime one (can this CPU run it?) are
     // independent, and the interesting rows in a failure report are the ones where they disagree.
     std::printf("FFT plugin DSP tests (AVX2 %s, CPU AVX2 %s)\n",
@@ -2645,6 +2762,8 @@ int main()
     test_ring_pipeline_path();
     test_async_off_first_plan();
     test_multi_fft_allocation_gate();
+    test_auto_patient_escalation();
+    test_cpu_check_and_peak_v2131();
     // The line the header's "the check count is a signal" section is about. Exit code is 0 only when
     // every check passed, which is what ctest --output-on-failure keys off.
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

@@ -89,15 +89,14 @@ bool g_cpuHasAVX2 = true;
 const char* kOpType    = "Fftcustom";   // must not collide with the built-in FFT CHOP
 const char* kOpLabel   = "FFT Custom";
 const char* kOpIcon    = "FFT";
-// The three version numbers reported in the popup's `Plugin:` line and by the Info DAT. They are
-// maintained by hand - nothing derives them from git - so a release that forgets to bump them makes
-// the popup lie about which build is loaded, which is exactly what happened for v2.9.0. The current
-// release these describe is v2.9.1 (2, 9, 1 below): keep them in step with CHANGELOG.md, and
-// remember the popup's `Plugin:` line is the only place in TouchDesigner that names the build.
+// The three version numbers reported in the popup's `Plugin:` line and by the Info DAT. The build defines
+// FFT_VERSION_* from plugin.json (CMakeLists.txt), so plugin.json is the single place to bump a release;
+// the literals below are only the fallback for a build that bypasses that CMake - keep them equal to
+// plugin.json anyway, because a hand-built DLL that reports an old version is how v2.9.0 lied.
 #ifndef FFT_VERSION_MAJOR
 #define FFT_VERSION_MAJOR 2
 #define FFT_VERSION_MINOR 13
-#define FFT_VERSION_PATCH 0
+#define FFT_VERSION_PATCH 1
 #endif
 // Generated from PluginProjects/FFT/plugin.json by CMakeLists.txt (FFT_VERSION_* definitions), so the
 // popup's `Plugin:` line, the Custom OP version and plugin.json can no longer drift apart (they did for
@@ -186,9 +185,23 @@ uint32_t fileImageStamp(const char* utf8Path)
 	CloseHandle(f);
 	return ok ? peStamp(buf, got) : 0;
 }
+// v2.13.1: the file's last-write time from its metadata (no open, no read), 0 when unavailable. The
+// periodic stale-DLL check runs inside a cook (renderInfoCache); it now re-reads the PE header only when
+// this moved, instead of opening and reading 4 KB of the DLL every 5 s on the cook thread (an
+// antivirus scan or a network share turns that open into a multi-millisecond stall).
+uint64_t fileWriteTime(const char* utf8Path)
+{
+	if (!utf8Path || !*utf8Path) return 0;
+	wchar_t wpath[MAX_PATH * 2] = {};
+	if (!MultiByteToWideChar(CP_UTF8, 0, utf8Path, -1, wpath, MAX_PATH * 2)) return 0;
+	WIN32_FILE_ATTRIBUTE_DATA a{};
+	if (!GetFileAttributesExW(wpath, GetFileExInfoStandard, &a)) return 0;
+	return (static_cast<uint64_t>(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+}
 #else
 uint32_t loadedImageStamp() { return 0; }
 uint32_t fileImageStamp(const char*) { return 0; }
+uint64_t fileWriteTime(const char*) { return 0; }
 #endif
 // "2026-11-07 14:02" (local time) or "unknown".
 std::string stampText(uint32_t t)
@@ -303,6 +316,7 @@ FFT::FFT(const OP_NodeInfo* info)
 	}
 	myLog.setDeferred(true);   // the worker must never call into Python; the cook thread flushes
 	myImageStamp = loadedImageStamp();
+	myDiskWriteTime = fileWriteTime(info ? info->pluginPath : nullptr);
 	myDiskStamp = fileImageStamp(info ? info->pluginPath : nullptr);
 	myDiskCheckedAt = std::chrono::steady_clock::now();
 	myPipeline = std::make_unique<AnalysisPipeline>(&myLog);
@@ -999,7 +1013,7 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 }
 
 // One Info CHOP channel, by index. THE COUNT IS A CONTRACT: this switch must cover every index below
-// getNumInfoCHOPChans()'s return value (36), and the positions must not move - a CHOP that references a
+// getNumInfoCHOPChans()'s return value (45), and the positions must not move - a CHOP that references a
 // channel by index would silently follow a reordering. New channels are appended at the end.
 //
 //   0 execute_count        how many times execute() has run    |  18 hz_per_sample        mean Hz between output bins
@@ -1121,15 +1135,15 @@ FFT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 // One Info DAT row. The fixed rows were formatted by renderInfoCache() (at most every kInfoRenderMs or
 // when the status / log changed); this only hands the cached strings over.
 //
-//   0 execute_count          8 window_resolution      16 hz_per_sample          22 resolution
-//   1 mode                   9 spectral_peak_freq     17 output_bandwidth_sps   23 multi_fft, 24 build
-//                                                                               25+ plan_log_* (newest 32)
-//   2 fft_size              10 simd_acceleration      18 channel_fanout
+//   0 execute_count          8 window_resolution      16 hz_per_sample          22 multi_fft
+//   1 mode                   9 spectral_peak_freq     17 output_bandwidth_sps   23 build
+//   2 fft_size              10 simd_acceleration      18 channel_fanout         24 resolution
 //   3 linear_bins           11 fft_engine             19 info_callback_calls  <- read this one first
-//   4 window_samples        12 cook_time              20 worker_pickup
+//   4 window_samples        12 cook_time              20 worker_pickup          25+ plan_log_* (newest 32)
 //   5 input_sample_rate     13 dsp_time               21 analysis_latency
 //   6 output_spectrum_axis  14 async_jobs
 //   7 output_sample_rate    15 fft_backend
+// (Order = the row() calls in renderInfoCache(); kInfoFixedRows = 25.)
 void
 FFT::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entries, void* reserved1)
 {
@@ -1226,8 +1240,11 @@ FFT::renderInfoCache(bool force)
 		snprintf(b, sizeof(b), "%.0f samples/s (%d bins x %.1f frames/s)", outputBandwidth(p), myOutputBins, dt_ms > 0.0 ? 1000.0 / dt_ms : 0.0);
 		row("output_bandwidth_sps", b);
 	}
-	row("channel_fanout", myAsync->parallelActive() ? "on: std::execution::par over the channel loop"
-	                                                : "off: one channel, nothing to fan out (expected - this node is mono per instance)");
+	// v2.13.1: say which mechanism fans out - Multi-FFT with Layer Threads > 1 uses the LayerPool (worker
+	// priority), a single-window multi-channel job uses std::execution::par over the channels.
+	row("channel_fanout", !myAsync->parallelActive() ? "off: one channel, nothing to fan out (expected - this node is mono per instance)"
+	                      : (s.multi && s.layerThreads > 1) ? "on: LayerPool helpers over the (channel x layer) tasks"
+	                                                        : "on: std::execution::par over the channel loop");
 	// The diagnostic row (see README, "The middle-click info popup"): counters frozen while the node visibly
 	// cooks = the chain is not entered; counters climbing with an ordinary popup length = a real string was
 	// handed over and not drawn. Refreshed with the rest of the cache (<= 4 Hz), which is plenty for that.
@@ -1273,10 +1290,13 @@ FFT::renderInfoCache(bool force)
 		}
 	}
 	{
-		// Build identity (X1b): which build runs, which is on disk. Re-checked every 5 s (one 4 KB read).
+		// Build identity (X1b): which build runs, which is on disk. Re-checked every 5 s: a metadata query,
+		// and the 4 KB PE-header read only when the file's write time moved (v2.13.1).
 		const auto nowc = std::chrono::steady_clock::now();
 		if (std::chrono::duration<double>(nowc - myDiskCheckedAt).count() > 5.0) {
-			myDiskStamp = fileImageStamp(myNodeInfo ? myNodeInfo->pluginPath : nullptr);
+			const char* path = myNodeInfo ? myNodeInfo->pluginPath : nullptr;
+			const uint64_t wt = fileWriteTime(path);
+			if (wt != myDiskWriteTime) { myDiskWriteTime = wt; myDiskStamp = fileImageStamp(path); }
 			myDiskCheckedAt = nowc;
 		}
 		const bool stale = myDiskStamp && myImageStamp && myDiskStamp != myImageStamp;

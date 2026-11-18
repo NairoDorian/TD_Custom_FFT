@@ -377,7 +377,7 @@ AnalysisPipeline::updatePool(const Parameters::Values& p, int channels)
     const int L = static_cast<int>(myLayers.size());
     const int tasks = L * std::max(1, channels);
     const int threads = (L > 1 && p.async) ? std::clamp(p.multiThreads, 1, std::max(1, tasks)) : 1;
-    myPool.resize(threads - 1);
+    myPool.resize(threads - 1, p.workerPriority == Parameters::WorkerPriority::Mmcss);   // helpers follow the worker's scheduling
     if (myBinsLayout == myLayout && myBinsChannels == channels && myBinsThreads == threads) return;
     std::vector<double> cost(static_cast<size_t>(tasks));
     for (int t = 0; t < tasks; ++t) {

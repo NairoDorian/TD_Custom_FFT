@@ -539,9 +539,11 @@ inline bool loadBackendFrom(const FftBackendInfo& info, const std::string& dir,
     // than against the host executable's directory - TouchDesigner's install folder, in practice.
     // The practical consequence for MKL: opened this way it finds its own mkl_intel_thread /
     // mkl_tbb_thread DLLs beside itself instead of hunting through TouchDesigner's folder.
-    HMODULE h = LoadLibraryExA(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    // (LOAD_WITH_ALTERED_SEARCH_PATH is only defined for an ABSOLUTE path - with a relative one Microsoft
+    // documents the behaviour as undefined - so it is used for `full` only when `dir` made it absolute.)
+    HMODULE h = LoadLibraryExA(full.c_str(), nullptr, dir.empty() ? 0 : LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!h && !dir.empty())
-        h = LoadLibraryExA(dllName, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);   // fall back to PATH
+        h = LoadLibraryExA(dllName, nullptr, 0);   // fall back to the standard search order (PATH included); v2.13.1: was LOAD_WITH_ALTERED_SEARCH_PATH on a bare name (undefined)
     if (!h) {
         out.error = "not found: " + full;
         return false;

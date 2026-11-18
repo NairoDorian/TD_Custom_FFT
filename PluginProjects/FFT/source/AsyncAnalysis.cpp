@@ -125,10 +125,16 @@ void AsyncAnalysis::runJob(const AnalysisJob& job)
 
     const uint64_t ver = myPipeline.statusVersion();
     if (ver != myStatusVersionSeen) {                       // strings are built only when plan/tables changed
-        std::lock_guard<std::mutex> lock(myStatusMutex);
-        myStatusCopy = myPipeline.status();
+        // v2.13.1: build the status (string concatenations, one getPlanStatus per engine) BEFORE taking
+        // the lock, then move it in. The cook thread's copyStatusIfNewer() takes the same mutex, so the
+        // old order made it wait for the whole build, not just for a move of two strings.
+        AnalysisPipeline::Status fresh = myPipeline.status();
+        {
+            std::lock_guard<std::mutex> lock(myStatusMutex);
+            myStatusCopy = std::move(fresh);
+            myStatusPubVersion.fetch_add(1, std::memory_order_release);
+        }
         myStatusVersionSeen = ver;
-        myStatusPubVersion.fetch_add(1, std::memory_order_release);
     }
 }
 

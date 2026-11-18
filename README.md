@@ -178,7 +178,7 @@ must be invoked with an absolute path from PowerShell. Delete `build/` when chan
 version: `td_plugin_use_fftw3` resolves the library from the version tag, and a stale `CMakeCache.txt`
 would keep pointing at the previous one.
 
-`fft_tests` prints a check count as well as a pass/fail; the baseline is **748 checks, 0 failures**. Treat the
+`fft_tests` prints a check count as well as a pass/fail; the baseline is **867 checks, 0 failures** (v2.13.1). Treat the
 count as a signal: a refactor that removes a check is as suspicious as one that fails one, so compare the
 number, not just the exit code. The oneMKL and from-wisdom test branches are machine-dependent - a different
 total on another machine is not a regression, but a different total on this one is.
@@ -223,7 +223,7 @@ tells TouchDesigner which parameters the current settings make inert (`setEnable
 | Spectrum | Multi-FFT Long-Layer Refresh | Menu | Every Frame | Every Frame = every layer every job (exact) · Hop-Scaled = layer 4 every 2nd job, 5 every 4th, 6 every 8th (previous magnitude re-used in between) |
 | Spectrum | Zero-Padding | Toggle | **On** | Off = the FFT runs on the window itself (N = window length rounded up to even, so the last bin is exactly Nyquist); Zero-Pad Len is greyed out. A power-of-two window is the fast case (the default 3175 → 3176 = 8·397 plans a slower FFT) |
 | Spectrum | Zero-Pad Len | Menu | 16384 | FFT size with Zero-Padding on (1K…64K; auto-grown to ≥ next pow2 of the window). Overridden by a Quality Preset |
-| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes faster than a MEASURE plan (9.70 against 11.55 µs at N = 16384, i9-13900H). The PATIENT search has no time limit: about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread (see *Threading*); the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
+| Spectrum | FFT Planner | Menu | Auto | Auto: instant plan now, measured plan upgraded in the background (wisdom-cached), and since v2.13.1 a PATIENT plan after that (N ≤ 32768, Async on, once the plan has been stable for 2 s, once per size per machine: −15 % per job at N = 16384) · Fast (Estimate only) · Measured (blocking, once per size) · **Patient**: like Auto but the background upgrade is `FFTW_PATIENT`, which executes faster than a MEASURE plan (9.70 against 11.55 µs at N = 16384, i9-13900H). The PATIENT search has no time limit: about 2.7 s of above-normal-priority planning at N = 32768 on the i9-13900H, longer on slower machines, once per size per machine and never on a TouchDesigner thread (see *Threading*); the resulting wisdom is also used by Auto. Only the FFTW3 backend honours the policy |
 | Spectrum | Input Ingest | Menu | Auto | Auto = only the samples that are new since the last cook, from the input's start index and cook count (an overlapping or re-delivered buffer is not appended twice) · Append All = the newest block, every cook |
 | EQ | EQ Enable | Toggle | **Off** | Off = no EQ code and no EQ parameter reads at all |
 | EQ | High Shelf / Low Shelf | Toggle | On / On | per-shelf bypass (only read when EQ Enable is on) |
@@ -395,7 +395,7 @@ on an idle CPU. FFTW3 backend with a measured plan unless the row says otherwise
 | stage: warp, Log linear, 16384 bins | 2.52 |
 | stage: warp, Log cubic, 16384 bins | 4.82 |
 | stage: dB normalised, 16384 bins | 3.58 |
-| stage: peak + index, 16384 bins | 0.94 |
+| stage: peak + index, 16384 bins | 0.94 (v2.13.1 two-pass: 0.41-0.62 typical, 0.93 worst case) |
 | spectral features, 8193 bins | ~3.5 |
 
 The FFT itself is most of the default cost — roughly two thirds, derived from two separate runs (11.55 µs FFTW3
@@ -442,6 +442,7 @@ Two threads, both named for the debugger, **neither below normal priority**:
 |---|---|---|
 | analysis worker (`FFT Custom CHOP analysis`) | `THREAD_PRIORITY_HIGHEST` (default), or MMCSS "Pro Audio" with `Worker Priority = MMCSS` | window → FFT → magnitude → warp → weighting → dB → ballistics → peak (→ spectral features) |
 | FFTW background planner (`FFT background planner`) | `THREAD_PRIORITY_ABOVE_NORMAL` | one `FFTW_MEASURE`/`FFTW_PATIENT` plan per FFT size, then exits |
+| Multi-FFT layer helpers (`FFT Custom CHOP layer helper`, Layer Threads − 1 of them) | the worker's: `THREAD_PRIORITY_HIGHEST`, or MMCSS "Pro Audio" with `Worker Priority = MMCSS` (v2.13.1) | their share of one job's (channel × layer) transforms; they spin ~50 µs after a batch, then sleep |
 
 The worker sits one notch above the planner so a cook always wins the core back from it; the planner is above
 normal so a measurement is not starved under load. A `FFTW_PATIENT` measurement has **no time limit**: it runs off

@@ -48,6 +48,92 @@ below still name as history, were retired 2026-09-23; see git history.)
 
 ---
 
+## [v2.13.1] - 2026-11-18 — Release-prep audit: Auto plans reach FFTW_PATIENT, a faster peak search, hardening
+
+The full two-repo audit behind this release is `../RELEASE_AUDIT_2026-11-18.md` (workspace root).
+
+### Changed
+- **FFT Planner = Auto now escalates to `FFTW_PATIENT`.** Auto used to stop at a MEASURE plan. Now it takes a
+  PATIENT plan from wisdom when one exists; otherwise, once its MEASURE plan has been stable for 2 s, it measures a
+  PATIENT plan on the background planner thread, swaps it in and writes it to wisdom, so the next session starts on
+  it. The status line says `FFTW_MEASURE (from wisdom; patient upgrade pending)` while one is owed. Bounded:
+  - N ≤ 32768 only (the default single N = 16384 and both Multi-FFT sizes qualify; a 65536 PATIENT run is many
+    seconds);
+  - only with Async on, never during a Multi-FFT planning batch, and once per size per machine;
+  - `Planner = Measured` opts out (MEASURE only); `Fast` and `Patient` are unchanged.
+- **Peak search in two passes** (`findPeakWithIndex`, every job, channel 0): the 4-chain max of `peakMagnitude`,
+  then the first index equal to it (32 floats per step, one movemask). Same "first maximum" (value and index) as
+  before, pinned bit for bit by a new test; the v2.12 one-pass form did compare + max + blendv + an index add per
+  vector.
+- **Layer helpers follow the worker's scheduling.** With Worker Priority = MMCSS the LayerPool helpers now register
+  with MMCSS "Pro Audio" too. They were always `THREAD_PRIORITY_HIGHEST`, far below an MMCSS worker that
+  spin-waits for them: a priority inversion on a busy machine (Multi-FFT + MMCSS only).
+- **The stale-DLL check no longer opens the DLL every 5 s on the cook thread.** It queries the file's write time
+  (metadata only) and re-reads the 4 KB PE header only when that moved. An antivirus scan or a network share
+  could turn the old open + read into a multi-millisecond stall inside a cook.
+- **The status snapshot is built outside its mutex.** The worker built the status strings while holding the mutex
+  the cook thread's `copyStatusIfNewer` takes, so a cook could wait for a whole status build after a plan change;
+  now it waits for a move at most.
+- The Info DAT `channel_fanout` row names the mechanism that fans out (LayerPool helpers or `std::execution::par`);
+  it always said `std::execution::par`.
+
+### Fixed
+- **`cpuSupportsAVX2()` never checked FMA on Windows 10+.** It returned true on `IsProcessorFeaturePresent(AVX2)`
+  alone, although every kernel uses FMA (`_mm256_fmadd_ps`) and the function's own comment required it. A VM that
+  exposes AVX2 but masks FMA would have faulted TouchDesigner instead of reporting "no AVX2/FMA". FMA is now
+  required on both paths.
+- **Backend loader fallback.** The PATH fallback called `LoadLibraryExA(<bare name>, LOAD_WITH_ALTERED_SEARCH_PATH)`;
+  Microsoft documents that flag with a relative path as undefined behaviour. The fallback now uses the standard
+  search order (flags 0); the absolute-path load next to `FFT.dll` is unchanged.
+- **EQ Blend Amount is bounded.** It multiplies `(filtered − dry)` per sample at ingest and was not clamped: a
+  typed `1e30` wrote `inf` into the SampleRing (and the spectrum) for ~3 s. Now 0..100 (the slider stops at 5),
+  NaN → 1.
+- **Build identity `+dirty`.** The configure-time git status covered the whole repository, so TouchDesigner
+  re-saving `Plugin_FFT.toe` marked every build dirty. Scoped to the plugin directory (`-- .`).
+- **bench: the peak stage measured nothing for a pure kernel.** `bench.cpp` discarded `findPeakWithIndex`'s result;
+  with the two-pass kernel the optimiser deleted the call (0.02 µs). Results now feed a volatile sink.
+
+### Verified
+- `fft_tests`: **867 checks, 0 failures** (853 + 14 new: `test_auto_patient_escalation` — MEASURE → pending →
+  PATIENT swap, then PATIENT from wisdom with nothing measured, Measured never escalates, 65536 never escalates;
+  `test_cpu_check_and_peak_v2131` — the FMA rule, and `findPeakWithIndex` against a scalar first maximum for every
+  length 1..300 and 16384 on noise / rising / falling / tied data). The suite runs with the escalation off (it plans
+  many sizes back to back); the escalation test switches it on for itself.
+- Build: MSVC 14.52.37025 (Visual Studio 18), 0 errors, 0 warnings. PluginBuilder_V2 `dev/ci.py --project` builds
+  the plugin through the builder's own runner (0 warnings) and its ctest passes.
+
+### Measured (i9-13900H, CPU load ~16-24 %, FFTW3)
+- Planner, FFT + magnitude stage at the default 8193 output bins, `fft_bench --auto-bins 1 --iters 600`, 3
+  interleaved rounds, median: MEASURE wisdom **12.58 µs** → PATIENT wisdom **10.51 µs (−16 %)**; job total
+  16.77 → 14.29 µs (**−15 %**). oneMKL, for reference: 9.58 µs (−24 %), job 13.75 µs.
+- Peak search, in-process microbenchmark (min of 40 rounds × 3 reps, interleaved, one pinned core), one-pass →
+  two-pass: 16384 bins noise 0.90 → 0.62 µs, audio-like 0.93 → 0.45 µs, falling 0.86 → 0.41 µs, rising (peak in the
+  last bin, the scan's worst case) 0.95 → 0.93 µs; 8193 bins 0.45–0.49 → 0.21–0.42 µs. In the bench's stage
+  harness, v2.13.0 vs v2.13.1 interleaved 5 rounds (pinned, high priority): peak stage median **1.08 → 0.74 µs**.
+  The job total moved by less than the run-to-run noise (the FFT stage alone swung ±20 % between rounds), so no
+  total is claimed for this change.
+- Cook thread, `--cook 300` (Async + Poll, caches evicted): mean 6.11 µs, p50 5.50 µs, p99 20.2 µs — unchanged
+  path, recorded as the 2.13.1 reference.
+
+### Notes / Still open
+- **Not yet observed in TouchDesigner** (nor is v2.13.0's Multi-FFT): everything above is headless.
+- What the escalation can make wait, once per size per machine: the PATIENT measurement holds FFTW's process-wide
+  planner lock (0.25 s measured at N = 512 in the test; ~2.7 s at 32768 on this machine per the README's
+  Patient figure; not separately timed at 16384). A re-plan requested meanwhile — a size
+  change, another node — holds its previous spectrum and shows the "waiting for the FFT planner" warning (nothing
+  blocks); deleting or hot-reloading the node during it waits for it, because the engine joins its planner thread
+  before the library code may go away. The explicit Patient policy always had both properties.
+- oneMKL stays opt-in (−24 % FFT here, but ~550 MB of runtime to distribute).
+
+### Documentation
+- Comments that contradicted the code, corrected: the Info CHOP channel count (36 → 45), the Info DAT row-index
+  table (rows 22-24), the "current release is v2.9.1" version note, `FFT.h`'s architecture text (FIFO → SampleRing;
+  LayerPool), `Parameters.h` (FIFO capacity copies of 3175; "nothing asserts" the planner numbering), `eval()`'s
+  "padding is zero, compare byte for byte" (the opposite of `paramsDiffer`'s correct note), `CMakeLists.txt`'s
+  607-check baseline. README: planner row, test baseline, peak timing, threading table.
+
+---
+
 ## [v2.13.0] - 2026-11-08 — Multi-FFT, a lock-free input ring, layer threads, and the audit fixes
 
 ### Added

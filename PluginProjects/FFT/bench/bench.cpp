@@ -73,6 +73,9 @@
 #include <vector>
 
 using namespace FFTDSP;
+
+// Consumes kernel results the stage timings would otherwise let the optimizer delete (see the peak stage).
+static volatile float g_benchSink = 0.0f;
 using clk = std::chrono::steady_clock;
 
 // Everything the command line can set, and the value each mode runs with when the flag is absent.
@@ -628,6 +631,9 @@ int main(int argc, char** argv)
     Args a = parse(argc, argv);
     // Private wisdom by default: a bench run must neither depend on nor rewrite the user's plan cache.
     if (a.privateWisdom) FFTWEngine::wisdomPathOverride() = "fft_bench_wisdom.txt";
+    // v2.13.1: a bench measures the plan it starts with - Auto's background PATIENT escalation would swap
+    // the plan mid-run. Measure PATIENT explicitly with --planner patient.
+    FFTWEngine::autoPatientEscalation() = false;
     if (!a.gate.empty()) return perfGate(a);
     if (a.multiAb > 0) return multiAb(a);
     const double sr = 44100.0;                                       // the input rate the whole run is modelled at
@@ -786,7 +792,9 @@ int main(int argc, char** argv)
             // 0 would follow instantly), per BallisticsFilter in DSPModules.h.
             if (a.ball) c.ball.apply(0.3f, 0.6f, c.warped, c.prev);
             tick(t, stages[7]);
-            size_t idx; findPeakWithIndex(c.warped.data(), c.warped.size(), idx);
+            // The result feeds a volatile sink: a pure kernel whose result is discarded is deleted by the
+            // optimizer (v2.13.1's two-pass findPeakWithIndex measured 0.02 us here until this was added).
+            { size_t idx; g_benchSink += findPeakWithIndex(c.warped.data(), c.warped.size(), idx) + static_cast<float>(idx); }
             tick(t, stages[8]);
         }
     }
@@ -835,7 +843,7 @@ int main(int argc, char** argv)
                 DecibelConverter::convertToDB(a.db, 80.0, 1.0f / (pk > 0 ? pk : 1.0f), c.warped);
             }
             if (a.ball) c.ball.apply(0.3f, 0.6f, c.warped, c.prev);
-            size_t idx; findPeakWithIndex(c.warped.data(), c.warped.size(), idx);
+            { size_t idx; g_benchSink += findPeakWithIndex(c.warped.data(), c.warped.size(), idx) + static_cast<float>(idx); }
         };
         std::vector<size_t> order(chans.size());
         std::iota(order.begin(), order.end(), 0);
