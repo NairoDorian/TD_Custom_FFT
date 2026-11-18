@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 #ifndef ANALYSIS_PIPELINE_H
 #define ANALYSIS_PIPELINE_H
 
@@ -126,6 +129,7 @@ public:
         int aggregation{ 0 };                // 0 off, 1 peak, 2 rms (Warp Aggregation)
         size_t aggregatedBins{ 0 };          // output bins that aggregate >= 2 FFT bins (largest group)
         size_t abandonedMeasurements{ 0 };   // background plans abandoned by a size/backend change, still running
+        int backendLive{ -1 };               // v2.13.2: registry index of the library the live plan runs on (0 FFTW3, 1 oneMKL), -1 = no plan
         // v2.13 Multi-FFT
         bool multi{ false };
         int layers{ 1 }, groups{ 1 }, layerThreads{ 1 };

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 // ===========================================================================================
 // fftw_threads_probe.cpp - does FFTW's built-in threading help this plugin?
 //

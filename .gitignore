@@ -12,6 +12,10 @@ lib/
 __Plugins__/**/*.dll
 __Plugins__/**/*.dll.old*
 *.dll.old*
+# License copies the build deploys beside FFT.dll (v2.13.2); their sources are LICENSE, NOTICE.md,
+# THIRD_PARTY_NOTICES.md and PluginProjects/FFT/3rdParty/fftw3/COPYING.
+__Plugins__/**/*.txt
+__Plugins__/**/*.md
 
 # The oneMKL runtime, when it is deployed next to FFT.dll so the FFT Backend toggle works in
 # TouchDesigner: the plugin resolves the library from its own directory (pluginDirectory() in

@@ -48,6 +48,54 @@ below still name as history, were retired 2026-09-23; see git history.)
 
 ---
 
+## [v2.13.2] - 2026-11-19 — Licensing, the live backend made visible, input-coverage warning, parameter bounds
+
+### Added
+- **License.** GPL-3.0-or-later with an additional permission (GPLv3 §7, the FSF's linking-exception wording) to
+  combine the plugin with the TouchDesigner C++ SDK and TouchDesigner: `LICENSE`, `NOTICE.md`,
+  `THIRD_PARTY_NOTICES.md`, an `SPDX-License-Identifier` line in every source file. `FFT.cpp` and
+  `Parameters.cpp` started from Derivative's CHOP sample and keep its Shared Use notice (that license requires
+  it); they are marked `GPL-3.0-or-later AND LicenseRef-Derivative-Shared-Use`. This was the release blocker F15.
+- **FFTW compliance.** `3rdParty/fftw3/COPYING` (FFTW's GPL-2.0 text) and `3rdParty/fftw3/SOURCE.md` — the
+  corresponding source: the upstream tarball (MD5), `fftw-3.3.11-cmake-version.patch` (the one-line change) and
+  `build_fftw.bat` (the exact configuration, now path-independent).
+- **The build deploys the licenses with the DLLs**: `FFT-LICENSE.txt`, `FFT-NOTICE.md`, `FFTW3-COPYING.txt`,
+  `THIRD_PARTY_NOTICES.md` land in `build/bin/<Config>` and `__Plugins__/FFT` (standalone POST_BUILD and
+  PluginBuilder's runtime manifest), so Install Plugin copies them too.
+- Info CHOP **`fft_backend_live`** (index 45): the library the live plan really runs on (0 FFTW3, 1 oneMKL, −1 no
+  plan), after any fallback. The Info DAT `dsp_time` row now names it and says that with Async on the analysis is
+  not part of TouchDesigner's cook time — which is why toggling FFT Backend left the cook time unchanged when
+  oneMKL was tried in TouchDesigner. Read `dsp_time_us` instead.
+- Info CHOP **`analyzed_fraction`** (index 46) and a **coverage warning** (audit F8): when more audio arrives per
+  analysis than the window reads, the samples in between were skipped silently. Now the share is reported and the
+  warning names the numbers and the remedy.
+
+### Changed
+- **Parameters carry hard bounds** (TouchDesigner clamps a typed or scripted value in the UI): the same bounds
+  `eval()` / the EQ design already applied — Output Bins 8..262144, Window Sampling 1..65536, Window Length
+  0.1..5000 ms, Layers / Layer Threads 1..6, Warp 0..1, Log Floor ≥ 1, Display Max ≥ 1, shelf gains ±60 dB,
+  cutoffs ≥ 1 Hz, Q ≥ 0.01, EQ Blend 0..100, Kaiser 0..100, dB Range ≥ 0.001, coefficients 0..0.99, ms ≥ 0.
+  Sliders are unchanged.
+- `getWarningString` reports every active warning joined with " | " (a second one used to be dropped), built in a
+  fixed buffer (no allocation on that per-cook callback).
+
+### Verified
+- `fft_tests` **868 checks, 0 failures** (+1: the live backend in `Status`). MSVC 14.52, 0 warnings. The four
+  license files are present in `__Plugins__/FFT` after a standalone build.
+- oneMKL from the installed `Documents/Derivative/Plugins/FFT` folder, loaded with the plugin's own loader
+  (`loadBackend`), r2c N = 16384, min of 60×100: **FFTW3 12.32 µs, oneMKL 8.71 µs**; mapped modules `mkl_rt.3`,
+  `mkl_sequential.3`, `mkl_core.3`, `mkl_avx2.3` — never TouchDesigner's `libiomp5md.dll`.
+
+### Notes / Still open
+- v2.13.1 was loaded and installed in TouchDesigner by the user; v2.13.2's new channels and warning are headless-
+  verified only.
+- Licensing judgment that remains the distributor's: FFTW is shipped as a separate, runtime-loaded, replaceable DLL
+  next to a GPL program that carries an SDK permission FFTW itself does not grant. For certainty in a closed or
+  commercial redistribution, use FFTW's commercial license from MIT or ship the oneMKL backend only
+  (THIRD_PARTY_NOTICES.md).
+
+---
+
 ## [v2.13.1] - 2026-11-18 — Release-prep audit: Auto plans reach FFTW_PATIENT, a faster peak search, hardening
 
 The full two-repo audit behind this release is `../RELEASE_AUDIT_2026-11-18.md` (workspace root).

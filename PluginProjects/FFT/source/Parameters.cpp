@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later AND LicenseRef-Derivative-Shared-Use
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): this project's code is GPL-3.0-or-later
+// with the additional permission for the TouchDesigner SDK in NOTICE.md (repository root). This file started
+// from Derivative's CPlusPlus CHOP sample; the portions derived from it remain under Derivative's Shared Use
+// License below, whose notice the file keeps as that license requires.
 /* Shared Use License: This file is owned by Derivative Inc. (Derivative)
 * and can only be used, and/or modified for use, in conjunction with
 * Derivative's TouchDesigner software, and only if you are a licensee who has
@@ -87,6 +92,7 @@ more accurate.
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <type_traits>
 
 // ---------------------------------------------------------------------------------------------
@@ -152,8 +158,18 @@ void appendMenu(TD::OP_ParameterManager* manager, const char* page, const char* 
 
 // One float (double) control. def is what the parameter starts at in a fresh node; sliderMin/sliderMax
 // are drag limits only (see the note above) - eval() is what enforces the hard bounds.
+// v2.13.2: hardMin / hardMax (NaN = none) make TouchDesigner itself enforce the bound eval() clamps to, so a
+// typed or scripted value is clamped in the UI too instead of being stored out of range and clamped silently
+// on every cook. They restate eval()'s bounds - change both together.
+void setHardBounds(TD::OP_NumericParameter& np, double hardMin, double hardMax)
+{
+	if (std::isfinite(hardMin)) { np.minValues[0] = hardMin; np.clampMins[0] = true; }
+	if (std::isfinite(hardMax)) { np.maxValues[0] = hardMax; np.clampMaxes[0] = true; }
+}
+
 void appendFloat(TD::OP_ParameterManager* manager, const char* page, const char* name, const char* label,
-                 double def, double sliderMin, double sliderMax)
+                 double def, double sliderMin, double sliderMax,
+                 double hardMin = std::numeric_limits<double>::quiet_NaN(), double hardMax = std::numeric_limits<double>::quiet_NaN())
 {
 	TD::OP_NumericParameter np;
 	np.page = page;
@@ -162,13 +178,15 @@ void appendFloat(TD::OP_ParameterManager* manager, const char* page, const char*
 	np.defaultValues[0] = def;
 	np.minSliders[0] = sliderMin;
 	np.maxSliders[0] = sliderMax;
+	setHardBounds(np, hardMin, hardMax);
 	manager->appendFloat(np);
 }
 
 // One integer control, same contract as appendFloat. Integers are used where a fractional value is
 // meaningless (Output Bins, Window Sampling) rather than as an optimization.
 void appendInt(TD::OP_ParameterManager* manager, const char* page, const char* name, const char* label,
-               int def, int sliderMin, int sliderMax)
+               int def, int sliderMin, int sliderMax,
+               double hardMin = std::numeric_limits<double>::quiet_NaN(), double hardMax = std::numeric_limits<double>::quiet_NaN())
 {
 	TD::OP_NumericParameter np;
 	np.page = page;
@@ -177,6 +195,7 @@ void appendInt(TD::OP_ParameterManager* manager, const char* page, const char* n
 	np.defaultValues[0] = def;
 	np.minSliders[0] = sliderMin;
 	np.maxSliders[0] = sliderMax;
+	setHardBounds(np, hardMin, hardMax);
 	manager->appendInt(np);
 }
 
@@ -366,20 +385,20 @@ void setup(TD::OP_ParameterManager* manager)
 	// Display Max and Output Bins reach past the widest input the node accepts (384 kHz -> 192 kHz
 	// Nyquist) and past the largest pad (64K -> 32769 bins) so that the linear/no-resample output is
 	// reachable from the UI at every setting, without a dedicated toggle for it.
-	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 192000.0);
+	appendFloat(manager, "Spectrum", DisplaymaxName, DisplaymaxLabel, 24000.0, 100.0, 192000.0, 1.0);
 	appendMenu (manager, "Spectrum", BinsmodeName,   BinsmodeLabel,   kBinsmodeNames, kBinsmodeLabels, static_cast<int>(BinsMode::Auto));
-	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 65536);   // the output sample count in Fixed
-	appendFloat(manager, "Spectrum", WarpName,       WarpLabel,       0.963, 0.0, 1.0);
+	appendInt  (manager, "Spectrum", BinsName,       BinsLabel,       16384, 256, 65536, kMinBins, kMaxBins);   // the output sample count in Fixed
+	appendFloat(manager, "Spectrum", WarpName,       WarpLabel,       0.963, 0.0, 1.0, 0.0, 1.0);
 	appendMenu (manager, "Spectrum", WarpinterpName, WarpinterpLabel, kWarpinterpNames, kWarpinterpLabels, static_cast<int>(WarpInterp::Linear));
 	appendMenu (manager, "Spectrum", WarpaggName,    WarpaggLabel,    kWarpaggNames,  kWarpaggLabels,  static_cast<int>(WarpAggregate::Peak));
-	appendFloat(manager, "Spectrum", LogfloorName,   LogfloorLabel,   20.0, 1.0, 500.0);
+	appendFloat(manager, "Spectrum", LogfloorName,   LogfloorLabel,   20.0, 1.0, 500.0, 1.0);
 	appendMenu (manager, "Spectrum", WinmodeName,    WinmodeLabel,    kWinmodeNames, kWinmodeLabels, static_cast<int>(WinMode::Samples));
-	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768);
-	appendFloat(manager, "Spectrum", WinmsName,      WinmsLabel,      72.0, 1.0, 1000.0);
+	appendInt  (manager, "Spectrum", WinsamplesName, WinsamplesLabel, 3175, 1, 32768, 1, kMaxWinSamples);
+	appendFloat(manager, "Spectrum", WinmsName,      WinmsLabel,      72.0, 1.0, 1000.0, 0.1, 5000.0);
 	// v2.13 Multi-FFT: takes over the three window-length parameters above (they are greyed out and
 	// keep their stored values, so switching it off restores the user's window).
 	appendToggle(manager, "Spectrum", MultifftName,  MultifftLabel,   false);
-	appendInt  (manager, "Spectrum", MultilayersName, MultilayersLabel, kMultiMaxLayers, 2, kMultiMaxLayers);
+	appendInt  (manager, "Spectrum", MultilayersName, MultilayersLabel, kMultiMaxLayers, 2, kMultiMaxLayers, 1, kMultiMaxLayers);
 	appendMenu (manager, "Spectrum", MultirefreshName, MultirefreshLabel, kMultirefreshNames, kMultirefreshLabels, static_cast<int>(MultiRefresh::EveryFrame));
 	// The Pad menu opens on INDEX 4, not on a length: the menu stores an index into kPadValues
 	// (Parameters.h), which is where the actual sample counts live. Index 4 is 16384 == kPadDefault,
@@ -412,12 +431,12 @@ void setup(TD::OP_ParameterManager* manager)
 	appendToggle(manager, "EQ", EqenableName,  EqenableLabel,  false);
 	appendToggle(manager, "EQ", HighshelfName, HighshelfLabel, true);
 	appendToggle(manager, "EQ", LowshelfName,  LowshelfLabel,  true);
-	appendFloat(manager, "EQ", GaindbName,      GaindbLabel,      6.0,   -24.0, 24.0);
-	appendFloat(manager, "EQ", CutoffhzName,    CutoffhzLabel,    1000.0, 20.0, 20000.0);
-	appendFloat(manager, "EQ", LowgaindbName,   LowgaindbLabel,   0.0,   -24.0, 24.0);
-	appendFloat(manager, "EQ", LowcutoffhzName, LowcutoffhzLabel, 200.0,  20.0, 5000.0);
-	appendFloat(manager, "EQ", QName,           QLabel,           0.707,  0.1,  4.0);
-	appendFloat(manager, "EQ", AmountName,      AmountLabel,      1.0,    0.0,  5.0);
+	appendFloat(manager, "EQ", GaindbName,      GaindbLabel,      6.0,   -24.0, 24.0, -60.0, 60.0);
+	appendFloat(manager, "EQ", CutoffhzName,    CutoffhzLabel,    1000.0, 20.0, 20000.0, 1.0);
+	appendFloat(manager, "EQ", LowgaindbName,   LowgaindbLabel,   0.0,   -24.0, 24.0, -60.0, 60.0);
+	appendFloat(manager, "EQ", LowcutoffhzName, LowcutoffhzLabel, 200.0,  20.0, 5000.0, 1.0);
+	appendFloat(manager, "EQ", QName,           QLabel,           0.707,  0.1,  4.0, 0.01);
+	appendFloat(manager, "EQ", AmountName,      AmountLabel,      1.0,    0.0,  5.0, 0.0, 100.0);
 
 	// --- Page 3: Window & Weighting ---
 	// Kaiser Beta opens at 15.0 and its slider stops at 1.0..55.0, but eval() clamps a typed value to
@@ -427,7 +446,7 @@ void setup(TD::OP_ParameterManager* manager)
 	// window type is Kaiser, so the value is inert for the other five types.
 	appendMenu (manager, "Window & Weighting", WindowName,    WindowLabel,    kWindowNames,    kWindowLabels,    static_cast<int>(WindowType::Kaiser));
 	appendMenu (manager, "Window & Weighting", KaisermodeName, KaisermodeLabel, kKaisermodeNames, kKaisermodeLabels, static_cast<int>(BetaMode::Manual));
-	appendFloat(manager, "Window & Weighting", KaiserName,    KaiserLabel,    15.0, 1.0, 55.0);
+	appendFloat(manager, "Window & Weighting", KaiserName,    KaiserLabel,    15.0, 1.0, 55.0, 0.0, 100.0);
 	appendMenu (manager, "Window & Weighting", WeightingName, WeightingLabel, kWeightingNames, kWeightingLabels, static_cast<int>(Weighting::Off));
 	appendMenu (manager, "Window & Weighting", MagnormName,   MagnormLabel,   kMagnormNames,   kMagnormLabels,   static_cast<int>(MagNorm::CoherentGain));
 
@@ -443,13 +462,13 @@ void setup(TD::OP_ParameterManager* manager)
 	// stop exactly where eval() clamps (0.99), which DSPModules.h says is deliberate.
 	appendMenu (manager, "Loudness & Ballistics", LoudnessName,  LoudnessLabel,  kLoudnessNames, kLoudnessLabels, static_cast<int>(Loudness::Off));
 	appendMenu (manager, "Loudness & Ballistics", DbrefName,     DbrefLabel,     kDbrefNames,    kDbrefLabels,    static_cast<int>(DbRef::FramePeak));
-	appendFloat(manager, "Loudness & Ballistics", DbrangeName,   DbrangeLabel,   80.0, 10.0, 160.0);
+	appendFloat(manager, "Loudness & Ballistics", DbrangeName,   DbrangeLabel,   80.0, 10.0, 160.0, 1e-3);
 	appendToggle(manager, "Loudness & Ballistics", BallenableName, BallenableLabel, false);
 	appendMenu (manager, "Loudness & Ballistics", BallmodeName,  BallmodeLabel,  kBallmodeNames, kBallmodeLabels, static_cast<int>(BallisticsMode::Coefficient));
-	appendFloat(manager, "Loudness & Ballistics", AttackName,    AttackLabel,    0.0, 0.0, 0.99);
-	appendFloat(manager, "Loudness & Ballistics", ReleaseName,   ReleaseLabel,   0.0, 0.0, 0.99);
-	appendFloat(manager, "Loudness & Ballistics", AttackmsName,  AttackmsLabel,  50.0, 0.0, 2000.0);
-	appendFloat(manager, "Loudness & Ballistics", ReleasemsName, ReleasemsLabel, 200.0, 0.0, 5000.0);
+	appendFloat(manager, "Loudness & Ballistics", AttackName,    AttackLabel,    0.0, 0.0, 0.99, 0.0, 0.99);
+	appendFloat(manager, "Loudness & Ballistics", ReleaseName,   ReleaseLabel,   0.0, 0.0, 0.99, 0.0, 0.99);
+	appendFloat(manager, "Loudness & Ballistics", AttackmsName,  AttackmsLabel,  50.0, 0.0, 2000.0, 0.0);
+	appendFloat(manager, "Loudness & Ballistics", ReleasemsName, ReleasemsLabel, 200.0, 0.0, 5000.0, 0.0);
 	// Reset is a PULSE, not a toggle: it has no stored value and no entry in Parameters::Values.
 	// TouchDesigner calls the operator's pulse callback when the user presses it, and that callback
 	// (FFT::pulsePressed(), source/FFT.cpp) compares the incoming name against Parameters::ResetName
@@ -486,7 +505,7 @@ void setup(TD::OP_ParameterManager* manager)
 	appendToggle(manager, "Performance", FeaturesName,    FeaturesLabel,    false);
 	// v2.13: how many threads one Multi-FFT job is split over (1 = the analysis worker alone). The
 	// helpers run at the worker's priority and exist only while Multi-FFT and Async are both on.
-	appendInt  (manager, "Performance", MultithreadsName, MultithreadsLabel, 3, 1, kMultiMaxLayers);
+	appendInt  (manager, "Performance", MultithreadsName, MultithreadsLabel, 3, 1, kMultiMaxLayers, 1, kMultiMaxLayers);
 	// (v2.7.0) "Update Every N Cooks" / "Parameter Poll Every N Cooks" removed: both made the node
 	// strictly worse. Update Every N Cooks halved the spectrum's effective update rate to save a cost
 	// that the async worker already took off the cook thread; Parameter Poll Every N Cooks saved

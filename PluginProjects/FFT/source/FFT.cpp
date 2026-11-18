@@ -1,4 +1,9 @@
-﻿/* Shared Use License: This file is owned by Derivative Inc. (Derivative)
+﻿// SPDX-License-Identifier: GPL-3.0-or-later AND LicenseRef-Derivative-Shared-Use
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): this project's code is GPL-3.0-or-later
+// with the additional permission for the TouchDesigner SDK in NOTICE.md (repository root). This file started
+// from Derivative's CPlusPlus CHOP sample; the portions derived from it remain under Derivative's Shared Use
+// License below, whose notice the file keeps as that license requires.
+/* Shared Use License: This file is owned by Derivative Inc. (Derivative)
 * and can only be used, and/or modified for use, in conjunction with
 * Derivative's TouchDesigner software, and only if you are a licensee who has
 * accepted Derivative's TouchDesigner license or assignment agreement
@@ -96,7 +101,7 @@ const char* kOpIcon    = "FFT";
 #ifndef FFT_VERSION_MAJOR
 #define FFT_VERSION_MAJOR 2
 #define FFT_VERSION_MINOR 13
-#define FFT_VERSION_PATCH 1
+#define FFT_VERSION_PATCH 2
 #endif
 // Generated from PluginProjects/FFT/plugin.json by CMakeLists.txt (FFT_VERSION_* definitions), so the
 // popup's `Plugin:` line, the Custom OP version and plugin.json can no longer drift apart (they did for
@@ -907,6 +912,13 @@ FFT::executeImpl(CHOP_Output* output, const OP_Inputs* inputs)
 	                        mySampleRate != myLastJobRate || Parameters::paramsDiffer(p, myLastJobParams);
 	if (publishJob) {
 		const double jobDtMs = audioFrameMs(myPendingFresh, mySampleRate, myPendingFrameMs);
+		// Coverage (v2.13.2, audit F8): a job analyses the newest win_samples; anything older that arrived
+		// since the previous job is skipped. Only jobs that carried audio say anything about it.
+		if (myPendingFresh > 0.0) {
+			myCoverageFresh = myPendingFresh;
+			myCoverageWindow = win_samples;
+			myAnalyzedFraction = (myPendingFresh > win_samples) ? static_cast<double>(win_samples) / myPendingFresh : 1.0;
+		}
 		fillJob(myAsync->jobSlot(), num_channels, win_samples, jobDtMs);
 		myAsync->publish();
 		myHaveJob = true;
@@ -1009,7 +1021,7 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 	// First callback of the chain in every cook: refresh the cached Info DAT rows and popup text here
 	// (a timestamp compare in the steady state - see renderInfoCache).
 	renderInfoCache(false);
-	return 45;
+	return 47;
 }
 
 // One Info CHOP channel, by index. THE COUNT IS A CONTRACT: this switch must cover every index below
@@ -1041,6 +1053,9 @@ FFT::getNumInfoCHOPChans(void* reserved1)
 //                                                              |  42 ring_torn_drops      frames dropped: the input ring was lapped
 //                                                              |  43 planner_held_jobs    jobs held while a plan waited for the planner
 //                                                              |  44 stale_cooks          cooks with no new audio (held, not re-analysed)
+//                                                              |  v2.13.2:
+//                                                              |  45 fft_backend_live     library the live plan runs on: 0 FFTW3, 1 oneMKL, -1 none
+//                                                              |  46 analyzed_fraction    share of the input audio the analysis saw (1 = all)
 void
 FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 {
@@ -1103,6 +1118,8 @@ FFT::getInfoCHOPChan(int index, OP_InfoCHOPChan* chan, void* reserved1)
 	case 42: set("ring_torn_drops", static_cast<double>(myAsync->pipeline().ringTornDrops())); break;
 	case 43: set("planner_held_jobs", static_cast<double>(myAsync->pipeline().plannerHeldJobs())); break;
 	case 44: set("stale_cooks", static_cast<double>(myStaleCooks)); break;
+	case 45: set("fft_backend_live", s.backendLive); break;
+	case 46: set("analyzed_fraction", myAnalyzedFraction); break;
 	default: break;
 	}
 }
@@ -1218,8 +1235,12 @@ FFT::renderInfoCache(bool force)
 	row("simd_acceleration", myCpuOk ? "AVX2 256-bit FMA" : "UNSUPPORTED CPU (no AVX2)");
 	myDatName[r] = "fft_engine"; myDatValue[r] = s.plan; if (s.planUpgrading) myDatValue[r] += " [measuring better plan in background]"; ++r;
 	snprintf(b, sizeof(b), "cook %.1f us (params %.1f us / %d reads this cook)", myLastCookUs, myParamUs, myParamReads); row("cook_time", b);
-	snprintf(b, sizeof(b), "%.1f us per analysis (%s%s)", dspUs, myAsyncActive ? "off the cook thread" : "on the cook thread",
-	         myAsync->parallelActive() ? ", channel loop parallel" : ""); row("dsp_time", b);
+	// v2.13.2: names the library the plan really runs on, and says where the time is spent - with Async on it
+	// is NOT part of the cook time TouchDesigner shows, which is why a backend switch is invisible there.
+	snprintf(b, sizeof(b), "%.1f us per analysis on %s (%s%s)", dspUs,
+	         s.backendLive >= 0 ? FFTDSP::backendById(s.backendLive).logTag : "no plan",
+	         myAsyncActive ? "worker thread: not in TouchDesigner's cook time" : "on the cook thread",
+	         myAsync->parallelActive() ? ", fanned out" : ""); row("dsp_time", b);
 	snprintf(b, sizeof(b), "%llu dropped, hold %d frame(s)", static_cast<unsigned long long>(myAsync->jobsDropped()), myHoldFrames); row("async_jobs", b);
 	{
 		// Which library is loaded, and where its wisdom lives (per backend; resolved once per backend).
@@ -1386,12 +1407,26 @@ FFT::getWarningString(OP_String* warning, void* reserved1)
 {
 	// v2.13: a plan waiting for the process-wide FFT planner (another node's measurement) also holds the
 	// spectrum, and it is not load - say which one it is (audit F4).
+	// v2.13.2 (audit F8): every active warning is reported, joined with " | " (a second one used to be lost),
+	// built in place in myWarningBuf - no allocation on this per-cook callback.
 	const AnalysisPipeline::Status& s = statusSnapshot();
-	if (s.plannerWaiting) {
-		warning->setString("Waiting for the FFT planner (another FFT node is measuring a plan); the previous spectrum is held, nothing blocks.");
-	} else if (myAsyncActive && myHoldFrames > 3) {
-		warning->setString("Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins, use a Visual preset, or (Multi-FFT) raise Layer Threads / use Hop-Scaled refresh.");
-	}
+	size_t len = 0;
+	myWarningBuf[0] = '\0';
+	auto add = [this, &len](const char* fmt, auto... args) {
+		const size_t cap = sizeof(myWarningBuf);
+		if (len + 4 >= cap) return;
+		if (len) { std::memcpy(myWarningBuf + len, " | ", 3); len += 3; myWarningBuf[len] = '\0'; }
+		const int n = std::snprintf(myWarningBuf + len, cap - len, fmt, args...);
+		if (n > 0) len = std::min(cap - 1, len + static_cast<size_t>(n));
+	};
+	if (s.plannerWaiting)
+		add("%s", "Waiting for the FFT planner (another FFT node is measuring a plan); the previous spectrum is held, nothing blocks.");
+	if (myAsyncActive && myHoldFrames > 3)
+		add("%s", "Analysis worker is falling behind (holding the previous spectrum); reduce Zero-Pad Len or Output Bins, use a Visual preset, or (Multi-FFT) raise Layer Threads / use Hop-Scaled refresh.");
+	if (myAnalyzedFraction < 0.999)
+		add("Only %.0f %% of the input audio is analysed: about %.0f new samples arrive per analysis but the window reads %d. Raise Window Sampling (or use Multi-FFT), or raise the frame rate.",
+		    100.0 * myAnalyzedFraction, myCoverageFresh, myCoverageWindow);
+	if (len) warning->setString(myWarningBuf);
 }
 
 // The node's error. TouchDesigner reports an errored node's error INSTEAD of its operator information,

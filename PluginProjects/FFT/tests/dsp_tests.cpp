@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 // ==========================================================================================
 // FFT DSP unit tests - headless, no TouchDesigner required.
 // ==========================================================================================
@@ -1290,6 +1293,7 @@ static void test_pipeline_process()
 
     AnalysisPipeline::Status st = pipeline.status();
     CHECK(!st.plan.empty());                            // a description of the live plan, for the Info DAT
+    CHECK(st.backendLive == 0);                         // v2.13.2: the live library (FFTW3 = registry index 0)
     CHECK(st.fftSize == static_cast<size_t>(N));        // padSize won: fftSizeFrom(p, 3175) == 32768
     CHECK(st.capacity == static_cast<size_t>(win_samples));   // the FIFO is exactly one window long
     CHECK(st.outputBins == bins);

@@ -82,6 +82,25 @@ target_compile_definitions(FFT PRIVATE "FFT_GIT_HASH=\"${FFT_GIT_HASH}\"")
 # unreachable. The DLL is still copied next to the plugin, so the default backend works out of the box.
 td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)
 
+# License files travel with the DLLs (v2.13.2): the plugin's GPL-3.0 text and NOTICE (with the TouchDesigner
+# SDK permission), FFTW's GPL-2.0 COPYING, and the third-party notices. Copied under names that say whose they
+# are, then staged like runtime DLLs - into build/bin/<Config>, into __Plugins__/FFT (standalone POST_BUILD, or
+# PluginBuilder's runtime manifest) and so into the folder Install Plugin copies.
+set(_fft_lic_dir "${CMAKE_BINARY_DIR}/licenses")
+set(_fft_lic_files "")
+foreach(_pair
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../LICENSE|FFT-LICENSE.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../NOTICE.md|FFT-NOTICE.md"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../THIRD_PARTY_NOTICES.md|THIRD_PARTY_NOTICES.md"
+        "${CMAKE_CURRENT_SOURCE_DIR}/3rdParty/fftw3/COPYING|FFTW3-COPYING.txt")
+    string(REPLACE "|" ";" _pair "${_pair}")
+    list(GET _pair 0 _src)
+    list(GET _pair 1 _dst)
+    configure_file("${_src}" "${_fft_lic_dir}/${_dst}" COPYONLY)
+    list(APPEND _fft_lic_files "${_fft_lic_dir}/${_dst}")
+endforeach()
+td_plugin_add_runtime_dll(FFT ${_fft_lic_files})
+
 # /O2 /Oi /Ot /Gy /arch:AVX2 /fp:fast, plus LTO: the AVX2 intrinsics in DSPModules.h are only worth
 # what the inliner does with them, and /GL lets the inliner work across FFT.cpp / AnalysisPipeline.cpp
 # / Parameters.cpp instead of stopping at each translation unit.

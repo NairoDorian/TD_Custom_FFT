@@ -1,0 +1,5 @@
+--- fftw-3.3.11/CMakeLists.txt
++++ fftw-3.3.11/CMakeLists.txt
+@@ -282 +282 @@
+-set (FFTW_VERSION 3.3.10)
++set (FFTW_VERSION 3.3.11)

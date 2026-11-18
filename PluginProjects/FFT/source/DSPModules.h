@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 #ifndef DSP_MODULES_H
 #define DSP_MODULES_H
 
@@ -2944,6 +2947,9 @@ public:
     const char* tag() const { return m_backend.info ? m_backend.info->logTag : "FFT"; }
 
     std::string backendReport() const override { return describeBackend(m_backend); }
+    // v2.13.2: the library the live plan was actually made with - after the fallback to FFTW3 when the
+    // selected backend could not be loaded. nullptr before the first prepare().
+    const FftBackendInfo* liveBackend() const noexcept { return m_backend.info; }
 
     // Destroys the live plan and resets the size/status. Safe to call repeatedly and on a node that
     // never had a plan. It joins the background thread first: a measurement in flight holds a

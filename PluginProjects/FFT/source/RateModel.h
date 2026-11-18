@@ -1,6 +1,6 @@
-// RateModel.h - part of Plugin_FFT (TD_Custom_FFT). Original project code: it contains nothing from
-// Derivative's samples, so it carries the project's own terms (README.md, "License / third party"),
-// not the Derivative Shared Use License that the files derived from the SDK samples keep.
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 #pragma once
 
 // ---------------------------------------------------------------------------------------------

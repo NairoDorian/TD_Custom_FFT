@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 #ifndef FFT_H
 #define FFT_H
 
@@ -345,6 +348,13 @@ private:
 	double				myPendingFresh{ 0.0 };     // samples since the last published job
 	double				myPendingFrameMs{ 0.0 };   // TouchDesigner frame time since the last published job
 	uint64_t			myStaleCooks{ 0 };         // cooks that held instead of publishing (telemetry)
+	// v2.13.2 (audit F8): input coverage. When more audio arrives per published job than the history one job
+	// reads (the largest window), the samples in between are never analysed. Measured at each publish that
+	// carried new audio; reported as the Info CHOP analyzed_fraction and as a warning when below 1.
+	double				myAnalyzedFraction{ 1.0 };
+	double				myCoverageFresh{ 0.0 };    // samples the last such job carried
+	int					myCoverageWindow{ 0 };     // the window they were analysed with
+	char				myWarningBuf[768]{};       // getWarningString's text, built in place (no allocation)
 	// Build identity (X1b): the link time of the loaded image, and of the file on disk at pluginPath
 	// (re-read every few seconds) - a newer file on disk means the node runs a stale DLL.
 	uint32_t			myImageStamp{ 0 };

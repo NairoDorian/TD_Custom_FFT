@@ -13,8 +13,9 @@ Current as of 2026-09-23, v2.12.1.
 > | F10 unvalidated combinations | **Mostly fixed**: shelf gains and Log Floor (v2.13.0), EQ Blend Amount (v2.13.1). Q and cutoffs are sanitised inside `designShelf` |
 > | F17 comments contradicting code | **Largely fixed in v2.13.1** (see its CHANGELOG *Documentation*) |
 > | F18 DLL search falls back to PATH | **Partly**: v2.13.1 removed the undefined `LOAD_WITH_ALTERED_SEARCH_PATH`-on-a-bare-name call; the PATH fallback itself remains by design |
-> | **F15 licensing** | **Open — still the release blocker**: no LICENSE file; FFTW's GPL `COPYING` not shipped; see the root audit §5 |
-> | F8 warnings/resolution, F9 non-advancing input, F12 test gaps, F13 perf gate, F14 bench replica (still uses `FIFOBuffer`), F16 dead code | **Open** (F13 re-measured 2026-11-18: default pipeline 15.2 µs vs a 24.9 µs baseline — a 2.3× slowdown still passes) |
+> | **F15 licensing** | **Fixed in v2.13.2**: GPL-3.0-or-later + a TouchDesigner-SDK permission (`LICENSE`, `NOTICE.md`), `THIRD_PARTY_NOTICES.md`, FFTW `COPYING` + `SOURCE.md`, SPDX lines, licenses deployed beside the DLL |
+> | F8 warnings | **Mostly fixed in v2.13.2**: all warnings reported (joined), input-coverage warning + `analyzed_fraction`; the true-resolution rows are still open |
+> | F9 non-advancing input, F12 test gaps, F13 perf gate, F14 bench replica (still uses `FIFOBuffer`), F16 dead code | **Open** (F13 re-measured 2026-11-18: default pipeline 15.2 µs vs a 24.9 µs baseline — a 2.3× slowdown still passes) |
 
 **Scope.** A read of every file in `PluginProjects/FFT/source/`, plus `CMakeLists.txt`, `plugin.json`,
 `tests/dsp_tests.cpp`, `bench/bench.cpp` and `bench/perf_baseline.json`, at HEAD `53ab7ab`. Nothing was built

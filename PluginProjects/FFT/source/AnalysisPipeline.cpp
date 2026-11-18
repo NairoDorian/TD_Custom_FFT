@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 NairoDorian. Part of Plugin_FFT (TD_Custom_FFT): GPL-3.0-or-later with the additional
+// permission for the TouchDesigner SDK in NOTICE.md (repository root). Third-party terms: THIRD_PARTY_NOTICES.md.
 /*
  * ===========================================================================
  *             ANALYSIS PIPELINE — IMPLEMENTATION
@@ -124,6 +127,7 @@ AnalysisPipeline::status() const
     for (size_t i = 1; i < myGroups.size(); ++i)
         if (myGroups[i].engine) s.plan += " | " + myGroups[i].engine->getPlanStatus();
     s.backend = e0 ? e0->backendReport() : std::string();
+    if (e0 && e0->hasPlan() && e0->liveBackend()) s.backendLive = FFTDSP::backendIndex(*e0->liveBackend());
     s.planFailed = planFailed();
     s.fftSize = g0 ? g0->fftSize : 0;
     s.capacity = myCapacity;
@@ -673,8 +677,9 @@ AnalysisPipeline::process(const AnalysisJob& job, AnalysisResult& res)
         return false;
     }
 
-    // Spectral features (channel 0, optional): from layer 1's LINEAR magnitude, so they do not depend on
-    // the display axis and react as fast as the shortest window (D6). In Multi-FFT that layer carries
+    // Spectral features (channel 0, optional): from layer 1's LINEAR magnitude, so they react as fast as the
+    // shortest window (D6). Not axis-free: magnitudes are computed only up to the bins the warp reads, so
+    // Display Max bounds the band the features see (v2.13.2: this comment used to claim the opposite). In Multi-FFT that layer carries
     // the gain 1/L; the band levels are corrected back to what a single 1024-sample analysis reads.
     res.hasFeatures = p.features && nch > 0 && !myChannels.empty();
     if (res.hasFeatures) {

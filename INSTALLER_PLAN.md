@@ -245,6 +245,14 @@ Tooling:
 
 ## 6. Licensing obligations (do these before the first public installer)
 
+> **Status v2.13.2 (2026-11-19): items 1, 2 and 4's file set are done.** `LICENSE` (GPL-3.0 text) +
+> `NOTICE.md` (GPL-3.0-or-later with a §7 permission for the TouchDesigner SDK — needed because `FFT.cpp` /
+> `Parameters.cpp` keep Derivative's Shared Use notice), `THIRD_PARTY_NOTICES.md`, FFTW's `COPYING`,
+> `3rdParty/fftw3/SOURCE.md` (tarball + patch + `build_fftw.bat`), SPDX lines in every source file, and the build
+> deploys `FFT-LICENSE.txt`, `FFT-NOTICE.md`, `FFTW3-COPYING.txt`, `THIRD_PARTY_NOTICES.md` beside `FFT.dll`.
+> Remaining at release time: attach `fftw-3.3.11.tar.gz` to each GitHub release that ships the DLL (SOURCE.md
+> promises it), and ship `oneMKL-licenses/` with any oneMKL DLLs.
+
 1. **Add a `LICENSE` for Plugin_FFT.** The repo has none, and an installer needs one for `LicenseFile=`. FFTW
    is GPL-2.0-or-later and is loaded dynamically, so the combined distribution falls under the GPL (the
    README already says so). The simplest consistent choice is GPL-3.0-or-later or GPL-2.0-or-later for the

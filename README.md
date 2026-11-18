@@ -178,7 +178,7 @@ must be invoked with an absolute path from PowerShell. Delete `build/` when chan
 version: `td_plugin_use_fftw3` resolves the library from the version tag, and a stale `CMakeCache.txt`
 would keep pointing at the previous one.
 
-`fft_tests` prints a check count as well as a pass/fail; the baseline is **867 checks, 0 failures** (v2.13.1). Treat the
+`fft_tests` prints a check count as well as a pass/fail; the baseline is **868 checks, 0 failures** (v2.13.2). Treat the
 count as a signal: a refactor that removes a check is as suspicious as one that fails one, so compare the
 number, not just the exit code. The oneMKL and from-wisdom test branches are machine-dependent - a different
 total on another machine is not a regression, but a different total on this one is.
@@ -337,6 +337,9 @@ it is (`hz_per_sample` does, since the same band is split into more or fewer ste
 | `output_spectrum_axis` (Info DAT) | The axis itself: `hz_per_sample × bins = 0…top` |
 | `output_bandwidth_sps` | Measured throughput, `bins × (frames actually producing a spectrum)/s` — the same number as `output_sample_rate` computed from the cook delta actually observed rather than from `me.time.rate` |
 | `linear_grid` | 1 when the built warp is the identity, i.e. the output grid *is* the linear FFT grid and the magnitude was copied rather than resampled. Read from the warp tables, not from a parameter, so it cannot disagree with what the DSP did |
+| `fft_backend_live` | (v2.13.2) The library the live plan actually runs on — 0 FFTW3, 1 Intel oneMKL, −1 no plan. It reflects a fallback: with `FFT Backend` on but oneMKL missing, it stays 0 |
+| `dsp_time_us` | The analysis itself, per job. **With Async on this is the number a backend switch moves** (the Info DAT `dsp_time` row names the library); TouchDesigner's own cook time does not include it |
+| `analyzed_fraction` | (v2.13.2) Share of the input audio the analysis saw: 1 normally; below 1 when more audio arrives per analysis than the window reads (a short window at a low frame rate), which also raises a warning |
 | `channel_fanout` | 1 when the last cook fanned its channel loop out over cores. 0 is the normal reading: `Mono Mix` (the default) has one channel and nothing to split, and several mono channels means several node instances |
 
 `getInfoPopupString` (middle-click the node) prints the rate, the axis and the measured throughput, plus the
@@ -418,6 +421,12 @@ A PATIENT plan narrows the gap without closing it (oneMKL still leads by ~13 % a
 because it is 3 MB, vendored and wisdom-cached; oneMKL loads 5 DLLs (~177 MiB on this CPU) and spends ~39 ms
 initialising once per process (on the worker thread when Async is on). Deployment notes, the OpenMP hazard it
 avoids and the DLL list are in [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
+
+**Seeing the difference in TouchDesigner.** With Async on (the default) the FFT runs on the analysis worker,
+not in the cook, so toggling the backend does **not** change the node's cook time or TouchDesigner's performance
+monitor. Read Info CHOP `dsp_time_us` (or the Info DAT `dsp_time` row, which names the live library) and
+`fft_backend_live`. Measured 2026-11-19 from an installed `Documents/Derivative/Plugins/FFT` folder with the
+plugin's loader, r2c N = 16384: FFTW3 12.32 µs, oneMKL 8.71 µs.
 
 ### Measuring
 
@@ -572,18 +581,25 @@ about **0.6 µs per cook** on the i9-13900H. Re-take that number after touching 
 
 ## License / third party
 
-**FFTW3 is GPL.** The build vendors FFTW 3.3.11 (single precision, AVX2) as `libfftw3f-3.3.11-avx2.dll` and ships
-it beside `FFT.dll`; distributing the plugin therefore falls under the GPL. `3rdParty/fftw3/VERSION` records the
-source URL, the MD5 of the tarball, the SHA-256 of the built DLL, and the one upstream patch (upstream's CMake
-build still stamps 3.3.10). If GPL is a problem for a project, the FFT backend is a swap: the `IFFTEngine`
-interface and the registry in `FftBackend.h` exist for that.
+**Plugin_FFT is free software under the GNU GPL, version 3 or (at your option) any later version**, with an
+additional permission (GPLv3 §7) to combine it with the TouchDesigner C++ SDK and TouchDesigner — see
+[`LICENSE`](LICENSE) (the GPL text) and [`NOTICE.md`](NOTICE.md) (copyright, the permission, and which terms
+apply to which file). Every source file starts with an `SPDX-License-Identifier` line. `source/FFT.cpp` and
+`source/Parameters.cpp` started from Derivative's CPlusPlus CHOP sample and keep Derivative's Shared Use License
+notice for those portions, as that license requires; the permission in NOTICE.md is what makes the combination
+distributable under the GPL.
+
+**FFTW 3.3.11 is GPL-2.0-or-later**, vendored as `libfftw3f-3.3.11-avx2.dll` and shipped beside `FFT.dll` as a
+separate, replaceable library. Its license is `3rdParty/fftw3/COPYING`; the corresponding source (the unmodified
+upstream tarball, the one-line patch and the build script) is listed in
+[`3rdParty/fftw3/SOURCE.md`](PluginProjects/FFT/3rdParty/fftw3/SOURCE.md). `FFT.dll` does not link FFTW: it loads
+whichever FFTW3-API library is selected at run time (this FFTW build, or Intel oneMKL's independent
+implementation).
 
 **Intel oneMKL is optional and not distributed with this project** (14 DLLs, ~456 MiB; see *Building >
 Standalone*). It is under the Intel Simplified Software License — redistribution allowed, no royalty, but the
-DLLs may not be modified or renamed and the license notices have to ship with them, which is the user's call and
-not a build script's. The `FFT Backend` toggle loads it from wherever the user installs it; if it is not there
-the node logs which file it looked for and uses FFTW3. This is also why neither library is *linked*: both export
-the same `fftwf_*` symbols, so a link would freeze the choice at build time and make the toggle impossible.
+DLLs may not be modified or renamed and its `license.txt` / `third-party-programs.txt` have to ship with them.
 
-**The repository has no `LICENSE` file yet.** What it needs before the plugin is distributed is listed in
-[INSTALLER_PLAN.md](INSTALLER_PLAN.md), §6.
+The build copies `FFT-LICENSE.txt`, `FFT-NOTICE.md`, `FFTW3-COPYING.txt` and `THIRD_PARTY_NOTICES.md` next to
+`FFT.dll` in `__Plugins__/FFT/`, so Install Plugin and any copy of that folder carry them. Details and the
+commercial-use notes: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
