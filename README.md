@@ -1,35 +1,138 @@
-# TouchDesigner Custom FFT CHOP (`Plugin_FFT`)
+# TD Custom FFT: the FFT Custom CHOP for TouchDesigner
 
-A real-time C++ CHOP for **Derivative TouchDesigner** (C++ API 10, TouchDesigner 2025.30000+) that turns
-audio into a psychoacoustically scaled magnitude spectrum: FFTW3 (or, optionally, Intel oneMKL)
-single-precision R2C transform, 256-bit AVX2/FMA post-processing, Log/Mel/ERB/Bark/Chroma re-mapping, equal-loudness weighting,
-dB conversion with selectable reference, and attack/release ballistics — all with zero allocations
-in the cook loop.
+A real-time audio spectrum operator for **TouchDesigner** (Windows x64). Audio in, a psychoacoustically scaled
+magnitude spectrum out: an FFTW3 (or, optionally, Intel oneMKL) transform on a worker thread, 256-bit AVX2/FMA
+post-processing, Log / Mel / ERB / Bark / Chroma axes, Multi-FFT, equal-loudness weighting, dB with a selectable
+reference, and attack/release ballistics, with no allocation, lock or system call on TouchDesigner's cook thread.
 
-Built with [PluginBuilder_V2](../PluginBuilder_V2) (hot reload from TouchDesigner) but also builds
-standalone with CMake + Ninja and ships headless tests and a per-stage benchmark.
+[![Download for Windows](https://img.shields.io/badge/Download_for_Windows-TD__Custom__FFT--Setup.exe-0078d4?style=for-the-badge)](https://github.com/NairoDorian/TD_Custom_FFT/releases/latest/download/TD_Custom_FFT-Setup.exe)
+[![Latest release](https://img.shields.io/github/v/release/NairoDorian/TD_Custom_FFT?style=for-the-badge)](https://github.com/NairoDorian/TD_Custom_FFT/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/NairoDorian/TD_Custom_FFT/build.yml?branch=main&style=for-the-badge)](https://github.com/NairoDorian/TD_Custom_FFT/actions/workflows/build.yml)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue?style=for-the-badge)](LICENSE)
 
-> **Relation to PluginBuilder_V2:** this project is the *consumer*; `../PluginBuilder_V2` is the
-> *toolchain*. Shared contract: `cmake/TDPlugin.cmake` (`td_add_plugin`, `td_plugin_use_fftw3`,
-> `td_plugin_optimize`), `plugin.json` manifest (family CHOP, optype `Fftcustom`), vendored API-10
-> headers in `../PluginBuilder_V2/include/`, rename-in-place deploy into `__Plugins__/FFT/`, and the
-> `PluginBuilder.tox` hot-reload loop. Cross-repo CI from the builder folder:
-> `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`. Builder-side changes are in
-> `../PluginBuilder_V2/CHANGELOG.md`.
+- **Readable spectra out of the box:** a log-warped axis, Peak aggregation so no narrow peak is lost, a Kaiser
+  window (β set by hand or derived from the dB range), linear or cubic interpolation, Quality Presets for 60/120 fps
+  visuals.
+- **Multi-FFT:** layers from 1024 to 32768 points averaged on one grid: sharp transients and resolved bass at once.
+- **Any output length:** the FFT's own N/2+1 bins, an exact count you choose (more than N/2+1 included), or the
+  raw rfft magnitude.
+- **Built for real time:** the analysis runs on its own thread behind wait-free buffers; the cook only copies.
+  Measured on an i9-13900H: ~5.5 µs median cook, ~14 µs analysis at the defaults.
+- **Diagnostics:** an Info CHOP (45 channels), an Info DAT, a middle-click popup, and warnings that say what to
+  change.
+
+Windows only: the plugin is compiled for x64 AVX2 + FMA and uses Win32 APIs.
 
 ---
 
-## How to use this documentation
+## Install
 
-Six markdown files, six different jobs. Read the one that matches your question:
+**Requirements:** Windows 10 or 11 (64-bit) · a CPU with AVX2 + FMA (Intel since 2013, AMD since 2015) ·
+TouchDesigner 2025.30000 or later (developed on 2025.33230) · the Microsoft Visual C++ Redistributable (x64),
+current version. The installers check all of these and offer to install the Visual C++ runtime when it is
+too old.
+
+There are three ways to install; the installer is the simplest. Each one puts the plugin in
+`Documents\Derivative\Plugins\FFT\` for the current user (no administrator rights) and the example project in
+`Documents\TD_Custom_FFT\Examples\`. **Close TouchDesigner first**: it keeps the plugin files open.
+
+### a) Installer (recommended)
+
+Download **[TD_Custom_FFT-Setup.exe](https://github.com/NairoDorian/TD_Custom_FFT/releases/latest/download/TD_Custom_FFT-Setup.exe)**
+and run it. Choose **Standard** (the operator with its FFTW3 backend, plus the example) or **Full** (adds the
+optional Intel oneMKL backend, downloaded during setup from nuget.org: 166 MB, checked against a pinned SHA-256).
+Running a newer Setup over an older install updates it and keeps an up-to-date oneMKL without downloading it again.
+Remove it from *Settings > Apps*.
+
+> **Unsigned installer.** Windows SmartScreen may say it does not recognise the publisher. Click **More info**,
+> then **Run anyway**. (Code signing costs money; the release page lists the SHA-256 of every file.)
+
+### b) One line of PowerShell
+
+```powershell
+irm https://raw.githubusercontent.com/NairoDorian/TD_Custom_FFT/main/installer/install.ps1 | iex
+```
+
+It downloads the latest release, checks its SHA-256, runs the same checks as the installer, and asks whether to
+add oneMKL. With options:
+
+```powershell
+$fft = [scriptblock]::Create((irm https://raw.githubusercontent.com/NairoDorian/TD_Custom_FFT/main/installer/install.ps1))
+& $fft -OneMKL -Yes      # with oneMKL, no questions (studio / scripted installs)
+& $fft -Version v2.14.0  # a specific release
+& $fft -Uninstall        # remove the plugin and the examples (-Purge also deletes the FFT planning cache)
+```
+
+### c) Zip (manual or offline)
+
+Download **[TD_Custom_FFT-Windows.zip](https://github.com/NairoDorian/TD_Custom_FFT/releases/latest/download/TD_Custom_FFT-Windows.zip)**,
+extract it, and either double-click **`Install.cmd`** (the script above, run from the zip's own files) or copy the
+`FFT` folder into `Documents\Derivative\Plugins\` yourself. Keep the folder's files together: `FFT.dll` loads the
+FFTW DLL from its own folder.
+
+### From source
+
+See [Building](#building). A build deploys into this repository's `__Plugins__/FFT/`; `Plugin_FFT.toe` loads it
+from there.
+
+## Quick start
+
+1. Start TouchDesigner, press **Tab** and create **CHOP > FFT Custom** (operator type `Fftcustom`, so it never
+   collides with TouchDesigner's own operators). If TouchDesigner asks whether to load the plugin, allow it.
+2. Wire audio into it: an **Audio Device In** or **Audio File In** CHOP.
+3. The output is one channel per analysed channel (one with the default **Mono Mix**), one sample per spectrum
+   bin, low to high frequency: 8193 samples at the defaults. View it in the CHOP viewer, or feed it to a
+   **CHOP to TOP**, a **Trail CHOP** or a **POP** network.
+4. Useful first settings: **Quality Preset** = *Visual 60 fps*; **Output Bins Mode** = *Fixed* with
+   **Output Bins** = 256 for a compact spectrum; **Scale** *Log* or *Mel*; **Loudness Mode** *dB* for a level
+   display; **Multi-FFT** on for sharp transients *and* bass detail.
+5. Middle-click the node for its info popup; connect an **Info CHOP** for timings, the peak frequency and the
+   spectral features. Every parameter is described in [Parameters](#parameters).
+
+## Example project
+
+[`examples/Circular_Audio_Spectrum.toe`](examples/Circular_Audio_Spectrum.toe): a live spectrum drawn as a ring
+with POPs, using Multi-FFT, a log-warped fixed-size output and C-weighting. Choose your own audio input device in
+it first; see [`examples/README.md`](examples/README.md).
+
+## Troubleshooting
+
+| What you see | Why, and what to do |
+|---|---|
+| **FFT Custom is not in the Tab menu** | TouchDesigner was running during the install (restart it); the files are not in `Documents\Derivative\Plugins\FFT\` (the folder must hold `FFT.dll` *and* `libfftw3f-3.3.11-avx2.dll`); or TouchDesigner is older than 2025.30000 |
+| **TouchDesigner cannot load the plugin** ("module could not be found", or a crash on load) | An old or missing Visual C++ runtime: install the current [Visual C++ Redistributable (x64)](https://aka.ms/vc14/vc_redist.x64.exe), or run the installer again (it offers it) |
+| Node error *"This CPU has no AVX2/FMA support"* | The CPU (or a virtual machine that hides AVX2/FMA) cannot run the plugin's kernels; the node outputs silence instead of crashing |
+| Warning *"FFT Backend is set to oneMKL, which could not be loaded"* | The node asks for the optional oneMKL backend (the example project's nodes do), which is not installed. It runs on FFTW3 meanwhile: same spectrum, slower FFT. Install oneMKL (Setup *Full*, or `install.ps1 -OneMKL`) or turn **FFT Backend** off |
+| Warning *"Only N % of the input audio is analysed"* | The window is shorter than the audio arriving per frame (a short window at a low frame rate): raise **Window Sampling**, use **Multi-FFT**, or raise the frame rate |
+| Warning *"Analysis worker is falling behind"* | Too much work per frame: lower **Zero-Pad Len** or **Output Bins**, use a *Visual* preset; with Multi-FFT, raise **Layer Threads** or use *Hop-Scaled* refresh |
+| The spectrum changes slightly a few seconds after a new FFT size | The FFTW planner measures a faster plan in the background and swaps it in; the result is cached per machine (`%LOCALAPPDATA%\TD_Custom_FFT\`) |
+
+Still stuck? Open an [issue](https://github.com/NairoDorian/TD_Custom_FFT/issues) with your TouchDesigner build,
+your CPU, and the node's Info DAT `fft_backend` and `simd_acceleration` rows.
+
+---
+
+## The rest of this file, and the other documents
+
+From here on, this README is the reference: what every parameter does, how the resampling works, performance,
+threading, the diagnostics, and building. It is written for people who use the node in depth or change it.
+
+> **Built with [PluginBuilder_V2](https://github.com/NairoDorian/PluginBuilder_V2)** (hot reload from
+> TouchDesigner), and also builds standalone with CMake + Ninja, with headless tests and a per-stage benchmark.
+> This project is the *consumer*; PluginBuilder_V2, checked out beside it, is the *toolchain*. Shared contract:
+> `cmake/TDPlugin.cmake` (`td_add_plugin`, `td_plugin_use_fftw3`, `td_plugin_optimize`), the `plugin.json`
+> manifest (family CHOP, optype `Fftcustom`), the vendored API-10 headers in `PluginBuilder_V2/include/`,
+> rename-in-place deploy into `__Plugins__/FFT/`, and the `PluginBuilder_V2.tox` hot-reload loop. Cross-repo CI
+> from the builder folder: `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`.
 
 | File | What it is for | Read it when |
 |---|---|---|
-| **README.md** (this file) | What the node does, every parameter, building and testing, current performance, the diagnostics | You are using the node, or about to change something and want to know what it is for |
+| **README.md** (this file) | Install, what the node does, every parameter, building and testing, current performance, the diagnostics | You are using the node, or about to change something and want to know what it is for |
 | [CHANGELOG.md](CHANGELOG.md) | Version history, newest first, with the A/B measurements behind each performance change and the optimisations that were measured and *not* kept | You want to know *when* something changed, or what a kernel change actually bought |
-| [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md) | The current audit and the open plan: where the time goes, what is still open and why rejected ideas were rejected | You want the to-do list and its acceptance criteria, or something to make faster |
-| [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md) | What is worth porting from EssentiaTD (features, cook-model gaps, test harness) | You are adding a feature or a robustness fix and want prior art |
-| [INSTALLER_PLAN.md](INSTALLER_PLAN.md) | Plan for a per-user Windows installer: exact DLL set, prerequisite checks, licensing, build pipeline | You want to ship the plugin to another machine |
+| [examples/README.md](examples/README.md) | The example projects | You want to see the node in a real network |
+| [docs/INSTALLER.md](docs/INSTALLER.md) | How the installers and the release pipeline work: exact file set, checks, the oneMKL download, what was tested, the release checklist | You maintain the installers or cut a release |
+| [docs/AUDIT_AND_PLAN.md](docs/AUDIT_AND_PLAN.md) | The current audit and the open plan: where the time goes, what is still open and why rejected ideas were rejected | You want the to-do list and its acceptance criteria, or something to make faster |
+| [docs/ESSENTIATD_LESSONS.md](docs/ESSENTIATD_LESSONS.md) | What is worth porting from EssentiaTD (features, cook-model gaps, test harness) | You are adding a feature or a robustness fix and want prior art |
 | [PluginProjects/FFT/3rdParty/fftw3/README.md](PluginProjects/FFT/3rdParty/fftw3/README.md) | The vendored FFTW build, the oneMKL alternative, and the license terms of both | You are rebuilding or replacing the FFT library |
 
 Two conventions, so the numbers can be trusted:
@@ -108,10 +211,12 @@ symbol is ambiguous across files.
   Job and result handoff are wait-free triple buffers (`AsyncAnalysis`); with `Worker Wake = Poll` (default) the
   worker polls every 2 ms on a high-resolution timer (no kernel wake-up per cook) — no mutex, no syscall, no allocation
   on the cook thread after warm-up. `Worker Priority` can register the worker with MMCSS "Pro Audio".
-- **Diagnostics**: Info CHOP (36 channels: `cook_time_us`, `dsp_time_us`, `peak_freq_hz`, `hold_frames`, `jobs_dropped`,
+- **Diagnostics**: Info CHOP (45 channels: `cook_time_us`, `dsp_time_us`, `peak_freq_hz`, `hold_frames`, `jobs_dropped`,
   `output_bins`, `kaiser_beta`, `pickup_p50_us`/`pickup_p99_us`, `analysis_latency_ms`, `aggregated_bins`, the eight
   `feature_*` channels, …), Info DAT (plan log, `window_resolution`, `resolution`, `info_callback_calls`, …),
-  middle-click popup, warning/error strings, AVX2 CPU guard (no illegal-instruction crash).
+  middle-click popup, warning/error strings (all active warnings at once: a worker falling behind, a planner wait,
+  input audio the window never sees, an FFT Backend that fell back to FFTW3), AVX2 CPU guard (no
+  illegal-instruction crash).
 - **Spectral features** (optional, off by default): centroid, rolloff, flatness, flux, RMS and bass/mid/high band
   levels as Info CHOP channels, computed on the worker.
 - Textport logging through `PySys_WriteStdout` (no Python script injection).
@@ -119,10 +224,19 @@ symbol is ambiguous across files.
 ## Project layout
 
 ```text
+TD_Custom_FFT/            <-- this repository (a dev checkout is usually named Plugin_FFT)
+├── README.md, CHANGELOG.md, RELEASE_NOTES.md, LICENSE, NOTICE.md, THIRD_PARTY_NOTICES.md
+├── Plugin_FFT.toe        <-- the dev project: PluginBuilder hot reload and a test network
+├── examples/             <-- example projects (Circular_Audio_Spectrum.toe) and their README
+├── installer/            <-- Setup.exe script, install.ps1, the oneMKL pin, build_release.py (docs/INSTALLER.md)
+├── docs/                 <-- maintainer notes: INSTALLER.md, AUDIT_AND_PLAN.md, ESSENTIATD_LESSONS.md
+├── .github/workflows/    <-- CI: build, test and package on every push; a GitHub Release on a v* tag
+├── __Plugins__/FFT/      <-- where a local build deploys (the binaries are git-ignored)
+└── PluginProjects/FFT/   <-- the plugin:
+
 PluginProjects/FFT/
 ├── CMakeLists.txt        <-- short: include(PluginBuilder_V2/cmake/TDPlugin.cmake) + td_add_plugin(...)
-├── plugin.json           <-- manifest read by PluginBuilder (family, optype, deps)
-├── _c.bat / _b.bat       <-- standalone configure / build helpers (vcvars64 + cmake); see Building > Standalone
+├── plugin.json           <-- manifest read by PluginBuilder (family, optype, deps) - and the one place the version lives
 ├── source/
 │   ├── DSPModules.h      <-- TouchDesigner-independent DSP (FIFO, EQ, window, warp, weighting, dB, ballistics, FFTW engine)
 │   ├── AnalysisPipeline.h/.cpp <-- the stage ORDER and the table caches; the only caller of DSPModules.h
@@ -131,7 +245,7 @@ PluginProjects/FFT/
 │   ├── AsyncAnalysis.h/.cpp <-- cook <-> worker handoff (wait-free triple buffers, wake policy, priority), TD-free
 │   ├── FFT.h / FFT.cpp   <-- the CHOP operator (API 10 entry points, cook, telemetry, Info CHOP/DAT, popup)
 │   └── Parameters.h/.cpp <-- typed parameter definitions (enum classes, single eval() per cook, grey-out states)
-├── tests/dsp_tests.cpp   <-- headless golden-vector tests (748 checks, incl. lock-free handoff stress)
+├── tests/dsp_tests.cpp   <-- headless golden-vector tests (872 checks, incl. lock-free handoff stress)
 ├── bench/bench.cpp       <-- per-stage benchmark + cook-thread simulation (--cook N, --info N, --backend fftw3|mkl, --gate)
 ├── bench/perf_baseline.json <-- baseline for the perf-regression gate (`ctest -L perf`)
 ├── bench/fftw_threads_probe.cpp <-- measures whether FFTW's built-in threading helps (it does not)
@@ -149,43 +263,54 @@ headers directly and would otherwise fail at link time, not at compile time.
 
 ## Building
 
+The build needs [PluginBuilder_V2](https://github.com/NairoDorian/PluginBuilder_V2) (the CMake module and the
+TouchDesigner SDK headers) checked out **beside** this repository: `PluginProjects/FFT/CMakeLists.txt` looks for
+`../../../PluginBuilder_V2` (override with `-DPLUGIN_BUILDER_DIR=` or the environment variable of that name). CI
+pins the commit it builds with (`PLUGIN_BUILDER_REF` in `.github/workflows/build.yml`).
+
+```cmd
+git clone https://github.com/NairoDorian/TD_Custom_FFT.git Plugin_FFT
+git clone https://github.com/NairoDorian/PluginBuilder_V2.git
+```
+
 ### From TouchDesigner (PluginBuilder_V2)
-Drop `PluginBuilder.tox` into `Plugin_FFT.toe`, type `FFT` as the plugin name — PluginBuilder finds the
+Drop `PluginBuilder_V2.tox` into `Plugin_FFT.toe`, type `FFT` as the plugin name — PluginBuilder finds the
 existing project (via this folder's `plugin.json`), configures, compiles on every source save and
 hot-reloads the DLL (rename-in-place, no unload gap). The loader path, `plugin.json` manifest,
 `__Plugins__/FFT/` deploy folder and the CMake functions (`td_add_plugin`, `td_plugin_use_fftw3 ... DYNAMIC`,
-`td_plugin_optimize`) all come from the sibling [PluginBuilder_V2](../PluginBuilder_V2) repo; `CMakeLists.txt`
-resolves it as `../../../PluginBuilder_V2` (override with `-DPLUGIN_BUILDER_DIR=`). Headless check after a
-builder upgrade: `python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT`.
+`td_plugin_optimize`) all come from PluginBuilder_V2. Headless check after a builder upgrade:
+`python ../PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT`.
 
 ### Standalone
+From a *x64 Native Tools* command prompt (or after `vcvarsall.bat x64`; Ninja comes with Visual Studio's C++ CMake
+tools):
 ```cmd
-call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
-cd PluginProjects\FFT
+cd Plugin_FFT\PluginProjects\FFT
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build
-ctest --test-dir build --output-on-failure          # DSP unit tests
+cmake --build build
+ctest --test-dir build -LE perf --output-on-failure  # DSP unit tests (-L perf runs the perf gate)
 build\bin\Release\fft_bench.exe --channels 8        # per-stage timings
 build\bin\Release\fft_bench.exe --channels 1 --db 0 --weight 0 --ball 0 --cook 300   # cook-thread cost (async / inline)
 build\bin\Release\fft_bench.exe --info 2000         # info-callback / middle-click access cost
 ```
 
-`_c.bat` and `_b.bat` in `PluginProjects/FFT/` are that sequence with the absolute paths already filled
-in: `_c.bat` configures, `_b.bat` builds. Extra arguments pass through to CMake / the build, e.g.
-`_b.bat --target fft_tests` builds one target, or `_c.bat -DFFT_BUILD_BENCH=OFF` configures without the
-benchmark. Both call `vcvars64.bat` themselves, so they do not need a Developer Command Prompt - but they
-must be invoked with an absolute path from PowerShell. Delete `build/` when changing the vendored FFTW
-version: `td_plugin_use_fftw3` resolves the library from the version tag, and a stale `CMakeCache.txt`
-would keep pointing at the previous one.
+On the maintainer's machine, `PluginProjects/FFT/_c.bat` (configure) and `_b.bat` (build) wrap that sequence with
+absolute paths and a `vcvars64.bat` call; they are local helpers and git-ignored, so write your own if you want
+them. Delete `build/` when changing the vendored FFTW version: `td_plugin_use_fftw3` resolves the library from
+the version tag, and a stale `CMakeCache.txt` would keep pointing at the previous one.
 
-`fft_tests` prints a check count as well as a pass/fail; the baseline is **868 checks, 0 failures** (v2.13.2). Treat the
-count as a signal: a refactor that removes a check is as suspicious as one that fails one, so compare the
-number, not just the exit code. The oneMKL and from-wisdom test branches are machine-dependent - a different
-total on another machine is not a regression, but a different total on this one is.
+`fft_tests` prints a check count as well as a pass/fail; the baseline is **872 checks, 0 failures** (v2.14.0, on
+the i9-13900H with oneMKL beside the tests; 871 without it). Treat the count as a signal: a refactor that removes a
+check is as suspicious as one that fails one, so compare the number, not just the exit code. The oneMKL and
+from-wisdom test branches are machine-dependent - a different total on another machine is not a regression, but a
+different total on this one is. Six checks are wall-clock contracts (a 2 ms timer, a non-blocking `prepare()`, wake
+latencies); on a loaded or virtual machine set `FFT_TEST_TIMING_SCALE` (CI uses 4) to widen them without
+skipping them.
 
 A standalone build deploys `FFT.dll` + `libfftw3f-3.3.11-avx2.dll` into `__Plugins__/FFT/` (rename-in-place).
-The oneMKL DLLs are never deployed by the build: they are optional and the user's to install (the plugin only
-*looks* for them, in its own directory). The deployment set is 14 `.3.dll` files, ~456 MiB: `mkl_rt`,
+The oneMKL DLLs are never deployed by the build: they are optional (the plugin only *looks* for them, in its own
+directory), and for an installed plugin the installers download them ([docs/INSTALLER.md](docs/INSTALLER.md)).
+The deployment set is 14 `.3.dll` files, ~456 MiB: `mkl_rt`,
 `mkl_core`, `mkl_sequential`, the kernel set `mkl_def` / `mkl_mc3` / `mkl_avx2` / `mkl_avx512` / `mkl_avx10` and the
 VML set `mkl_vml_def` / `mkl_vml_mc3` / `mkl_vml_avx2` / `mkl_vml_avx512` / `mkl_vml_avx10` / `mkl_vml_cmpt`, plus the
 `oneMKL-licenses/` folder. `mkl_intel_thread`, `mkl_tbb_thread` and `libimalloc.dll` are **not** needed: the plugin
@@ -196,6 +321,25 @@ and runs on FFTW3 alone; only the `FFT Backend` toggle needs oneMKL. Details in
 [`3rdParty/fftw3/README.md`](PluginProjects/FFT/3rdParty/fftw3/README.md#using-intel-onemkl-instead-the-fft-backend-toggle).
 
 Requirements: Windows 10/11 x64, Visual Studio 2022/2026 C++ tools, CMake ≥ 3.21, Ninja, a CPU with AVX2 + FMA.
+
+### Verifying a build in TouchDesigner
+
+The tests drive the DSP, not TouchDesigner, so a build that changes the node is checked in TouchDesigner too:
+
+1. Open `Plugin_FFT.toe` and pulse **Reload Plugin** on the PluginBuilder COMP (a standalone build has already
+   deployed into `__Plugins__/FFT/`). The middle-click popup's `Plugin:` line must show the new version, today's link
+   time, and no `STALE`.
+2. Info DAT: `fft_backend` names the library and its path; with FFT Backend on and oneMKL present it says oneMKL,
+   without it the node shows the fallback warning and `fft_backend_live` stays 0.
+3. Info CHOP `cook_time_us` and `dsp_time_us` in the expected range; `jobs_dropped` and `ring_torn_drops` at 0.
+4. Exercise what the change touched (Multi-FFT, presets, the parameter that moved), then pulse **Install Plugin**
+   if the Documents copy should follow.
+
+### Packaging a release
+
+`python installer/build_release.py` turns a finished build into the installer, the zip, the stamped `install.ps1`
+and `SHA256SUMS.txt`; pushing a `v*` tag makes CI do the same and publish a GitHub Release. The checks it makes and
+the release checklist are in [docs/INSTALLER.md](docs/INSTALLER.md).
 
 ## Parameters
 
@@ -599,6 +743,8 @@ implementation).
 **Intel oneMKL is optional and not distributed with this project** (14 DLLs, ~456 MiB; see *Building >
 Standalone*). It is under the Intel Simplified Software License — redistribution allowed, no royalty, but the
 DLLs may not be modified or renamed and its `license.txt` / `third-party-programs.txt` have to ship with them.
+The installers download it from nuget.org on the user's machine (a pinned package, SHA-256 checked) and install
+both notices beside it; neither the repository nor a release contains it.
 
 The build copies `FFT-LICENSE.txt`, `FFT-NOTICE.md`, `FFTW3-COPYING.txt` and `THIRD_PARTY_NOTICES.md` next to
 `FFT.dll` in `__Plugins__/FFT/`, so Install Plugin and any copy of that folder carry them. Details and the

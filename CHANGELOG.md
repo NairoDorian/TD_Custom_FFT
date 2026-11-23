@@ -34,17 +34,89 @@ Two conventions that matter if you are adding an entry:
   claims more than was measured is worse than no entry.
 
 For what the node does *now* (rather than when it changed), see [README.md](README.md); for the
-performance analysis and the current plan, see [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md).
+performance analysis and the current plan, see [AUDIT_AND_PLAN.md](docs/AUDIT_AND_PLAN.md).
 (The older FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md, which entries
 below still name as history, were retired 2026-09-23; see git history.)
 
 > **Relationship to PluginBuilder_V2:** this plugin is built by the sibling
-> [`../PluginBuilder_V2`](../PluginBuilder_V2) repository — CMake module (`TDPlugin.cmake`),
+> [`PluginBuilder_V2`](https://github.com/NairoDorian/PluginBuilder_V2) repository — CMake module (`TDPlugin.cmake`),
 > rename-in-place deploy, API-10 SDK headers, `PluginBuilder.tox` hot reload, and
 > `dev/ci.py --project PluginProjects/FFT` as the cross-repo smoke test. Builder-side version
 > history lives in *that* repo's CHANGELOG; entries here are DSP/node behaviour only, except
 > where a builder contract change is what made a release possible (e.g. 2.9.0's backend toggle
 > needed `td_plugin_use_fftw3(... VERSION ... DYNAMIC)`).
+
+---
+
+## [v2.14.0] - 2026-11-23 — First public release: installers, an example project, CI; the oneMKL fallback made visible
+
+### Added
+- **`TD_Custom_FFT-Setup.exe`** (Inno Setup 6.7, `installer/TD_Custom_FFT.iss`). Per user, no administrator rights:
+  the plugin into `Documents\Derivative\Plugins\FFT`, the example into `Documents\TD_Custom_FFT\Examples`. Components
+  *core* / *oneMKL* / *examples*; Standard and Full types. Before copying it checks the CPU (AVX2), that
+  TouchDesigner is closed (Retry/Cancel; aborts when silent), and that the Visual C++ runtime is at least the one the
+  build's compiler needs (offers Microsoft's redistributable). The optional **Intel oneMKL is downloaded from
+  nuget.org at install time** - `intelmkl.redist.win-x64` 2026.1.0.226, pinned with its SHA-256 in
+  `installer/onemkl.json` - so the project never redistributes it; exactly the 14 DLLs the plugin uses are installed,
+  with Intel's notices. An upgrade keeps a oneMKL that is already the pinned one instead of downloading 166 MB
+  again, removes it when the component is unticked, and wipes stale plugin DLLs (TouchDesigner would register the
+  operator twice). The uninstaller lives in `%LOCALAPPDATA%\TD_Custom_FFT\Uninstall`, out of TouchDesigner's plugin
+  folder. Modelled on EssentiaTD's installer; what was taken and what was added is in `docs/INSTALLER.md` §9.
+- **`installer/install.ps1`**, the same install as a script: `irm …/installer/install.ps1 | iex`, `Install.cmd` in the
+  release zip, or `-File`. Windows PowerShell 5.1 and 7; `-OneMKL`, `-OneMklPackage <file>` (offline),
+  `-RemoveOneMKL`, `-Uninstall [-Purge]`, `-Version`, `-Destination`, `-Source <zip|folder>`, `-Yes` (unattended),
+  `-Force`. It verifies the release zip's SHA-256 and the VC++ redistributable's Microsoft signature, and never
+  calls `exit` on the `iex` path (that would close the user's shell).
+- **`installer/build_release.py`** writes every release asset from a finished build: the installer, the zip
+  (`FFT/`, `Examples/`, `install.ps1`, `Install.cmd`, `README.txt`, `manifest.json`), the stamped `install.ps1`,
+  FFTW's source tarball (`--fftw-source`) and `SHA256SUMS.txt`. The file list comes from the build's runtime manifest,
+  the VC++ floor from the compiler CMake recorded, the FFTW DLL is checked against `3rdParty/fftw3/VERSION`; with
+  `--release`, the tag must match `plugin.json` and `FFT.dll` must embed the tagged, clean commit.
+- **CI** (`.github/workflows/build.yml`): build (MSVC, Ninja) + `ctest -LE perf` + packaging on every push and pull
+  request, with PluginBuilder_V2 checked out beside the repository at a pinned commit; a `v*` tag publishes a GitHub
+  Release (a tag with `-` publishes a pre-release).
+- **Example project** `examples/Circular_Audio_Spectrum.toe` (a live spectrum ring built with POPs: Multi-FFT, a
+  log-warped fixed-size output, C-weighting) and `examples/README.md`.
+- **A warning when FFT Backend falls back.** With the toggle on and oneMKL not loadable from the plugin's folder, the
+  node used to run on FFTW3 with the reason only in the textport and the `fft_backend_live` channel, so a project
+  saved with oneMKL on (the example is one) looked fine on a machine without it and silently ran slower. The node
+  now says so and names the fix. `AnalysisPipeline::Status::backendFallback`: a plan exists and its library is not
+  the requested one - which `FFTWEngine::prepare()` only allows on a failed load.
+
+### Changed
+- `getWarningString`'s buffer 768 → 1024 bytes, so all four warnings fit at once.
+- `tests/dsp_tests.cpp`: the six wall-clock assertions are multiplied by `FFT_TEST_TIMING_SCALE` (default 1; CI uses
+  4). On a shared VM they would fail for reasons that are not the code's; they still run, so the check count is the
+  same.
+
+### Documentation
+- **README** restructured for users first: Install (Setup.exe, a PowerShell line, the zip), Quick start, the example,
+  Troubleshooting; then the reference as before. New: the repository layout, building from a fresh clone (the
+  PluginBuilder_V2 sibling), *Verifying a build in TouchDesigner*, *Packaging a release*. Corrected: Info CHOP 45
+  channels (was 36), the test count, `PluginBuilder_V2.tox`, the local-only `_c.bat` / `_b.bat`.
+- `AUDIT_AND_PLAN.md` and `ESSENTIATD_LESSONS.md` moved to `docs/`; `INSTALLER_PLAN.md` became `docs/INSTALLER.md`,
+  rewritten from a plan into what was built, how it was tested and the release checklist. The audit's status table
+  records P11 and P14.
+- `3rdParty/fftw3/README.md`: the License section said there was no `COPYING` and no `LICENSE` (both exist since
+  v2.13.2); the oneMKL section points to the installers. Links that pointed outside the repository (the sibling
+  PluginBuilder_V2, a local audit note) now point to GitHub or are plain text; `.vscode/` paths are relative.
+
+### Verified
+- Build MSVC 14.52.37025, 0 warnings. `fft_tests` **872 checks, 0 failures** (+4: the fallback status and its pipeline
+  run), three consecutive runs, also with `FFT_TEST_TIMING_SCALE=4`; **871** from a folder without oneMKL, which
+  exercises the fallback branch (`live 0, fallback yes`). `ctest -LE perf` as CI runs it: passed.
+- Installers, on this machine into scratch folders: Setup.exe silent install with oneMKL (download + SHA-256 +
+  extraction, 15 s), upgrade (no download, set kept), core-only upgrade (set removed), uninstall (nothing left but
+  the wisdom cache); both installers refuse while a `TouchDesigner*.exe` runs; `install.ps1` under 5.1 and 7, from
+  the zip and as a script block, every oneMKL path, uninstall, and the `iex` error path. Details: `docs/INSTALLER.md`
+  §7.
+
+### Still open
+- **Not yet seen in TouchDesigner:** the new warning's text, and the example with and without oneMKL.
+- The installers on a clean machine (Windows Sandbox + TouchDesigner), the interactive wizard pages and the VC++
+  update path (this machine already has 14.52); CI's first run on GitHub's runners.
+- `waitFor(2 ms) p95 < 6 ms` failed once in nine local runs, right after a rebuild while the machine was busy: the
+  F12 class (timing assertions in the correctness suite), which the timing scale contains in CI but does not remove.
 
 ---
 
@@ -464,9 +536,9 @@ Follow-up commit `de8b13a`, same day, same version number.
 
 ### Documentation
 - FFT_REALTIME_OPTIMIZATION_ANALYSIS.md and FFT_REALTIME_PERFORMANCE_ROADMAP.md are retired (see git
-  history). [AUDIT_AND_PLAN.md](AUDIT_AND_PLAN.md) supersedes both.
-- New notes: [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md)
-  and [INSTALLER_PLAN.md](INSTALLER_PLAN.md).
+  history). [AUDIT_AND_PLAN.md](docs/AUDIT_AND_PLAN.md) supersedes both.
+- New notes: [ESSENTIATD_LESSONS.md](docs/ESSENTIATD_LESSONS.md)
+  and [INSTALLER_PLAN.md](docs/INSTALLER.md).
 - `FFT_REFERENCE/` (the original Python prototype) is removed from the repository. It is kept on disk
   and is now gitignored.
 - `PluginProjects/FFT/3rdParty/fftw3/README.md`: the oneMKL file list is now the trimmed set above,

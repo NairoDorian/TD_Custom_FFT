@@ -130,6 +130,10 @@ public:
         size_t aggregatedBins{ 0 };          // output bins that aggregate >= 2 FFT bins (largest group)
         size_t abandonedMeasurements{ 0 };   // background plans abandoned by a size/backend change, still running
         int backendLive{ -1 };               // v2.13.2: registry index of the library the live plan runs on (0 FFTW3, 1 oneMKL), -1 = no plan
+        // v2.14.0: the live plan runs on a different library than FFT Backend asks for - the selected one could
+        // not be loaded (oneMKL not installed beside FFT.dll) and the engine fell back to FFTW3. Only set while a
+        // plan exists, so a size or backend change in flight never reads as a fallback. Feeds getWarningString.
+        bool backendFallback{ false };
         // v2.13 Multi-FFT
         bool multi{ false };
         int layers{ 1 }, groups{ 1 }, layerThreads{ 1 };

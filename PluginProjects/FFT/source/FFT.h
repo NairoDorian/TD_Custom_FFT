@@ -354,7 +354,7 @@ private:
 	double				myAnalyzedFraction{ 1.0 };
 	double				myCoverageFresh{ 0.0 };    // samples the last such job carried
 	int					myCoverageWindow{ 0 };     // the window they were analysed with
-	char				myWarningBuf[768]{};       // getWarningString's text, built in place (no allocation)
+	char				myWarningBuf[1024]{};      // getWarningString's text, built in place (no allocation); fits all four warnings at once (v2.14.0)
 	// Build identity (X1b): the link time of the loaded image, and of the file on disk at pluginPath
 	// (re-read every few seconds) - a newer file on disk means the node runs a stale DLL.
 	uint32_t			myImageStamp{ 0 };

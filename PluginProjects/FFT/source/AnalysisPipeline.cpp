@@ -127,7 +127,12 @@ AnalysisPipeline::status() const
     for (size_t i = 1; i < myGroups.size(); ++i)
         if (myGroups[i].engine) s.plan += " | " + myGroups[i].engine->getPlanStatus();
     s.backend = e0 ? e0->backendReport() : std::string();
-    if (e0 && e0->hasPlan() && e0->liveBackend()) s.backendLive = FFTDSP::backendIndex(*e0->liveBackend());
+    if (e0 && e0->hasPlan() && e0->liveBackend()) {
+        s.backendLive = FFTDSP::backendIndex(*e0->liveBackend());
+        // FFTWEngine::prepare() re-points its backend before it plans, so with a plan in hand a live library
+        // other than the requested one can only mean the requested one failed to load (the fallback).
+        s.backendFallback = e0->liveBackend() != &backendInfo();
+    }
     s.planFailed = planFailed();
     s.fftSize = g0 ? g0->fftSize : 0;
     s.capacity = myCapacity;

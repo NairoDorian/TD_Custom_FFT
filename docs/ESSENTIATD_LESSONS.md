@@ -14,7 +14,7 @@ The ~420 vendored Essentia headers and the 107 MB static lib were inventoried, n
 
 **Lens:** Plugin_FFT is an FFT-only CHOP. Tonal key detection, beat tracking and BPM do not apply. What
 counts is anything that touches the spectrum, the cook model, TouchDesigner integration, robustness, testing
-and distribution. The installer is covered separately in `INSTALLER_PLAN.md`.
+and distribution. The installer is covered separately in `INSTALLER.md`.
 
 ---
 
@@ -360,7 +360,7 @@ following, all computed from the linear magnitude:
   - GitHub Release on `v*` tags with unversioned asset names.
   - No code signing anywhere; macOS ad-hoc only.
   - Plugin_FFT has **no CI yet**. §5 of the installer plan sketches a workflow.
-- **Installer:** see `INSTALLER_PLAN.md`, which adapts their `.iss` line by line.
+- **Installer:** see `INSTALLER.md`, which adapts their `.iss` line by line.
 
 ---
 

@@ -6,8 +6,8 @@
             "compileCommands": "${workspaceFolder}/build/compile_commands.json",
             "includePath": [
                 "${workspaceFolder}/source",
-                "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/PluginBuilder_V2/include",
-                "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT/PluginProjects/FFT/3rdParty/fftw3/include"
+                "${workspaceFolder}/../../../PluginBuilder_V2/include",
+                "${workspaceFolder}/3rdParty/fftw3/include"
             ],
             "defines": [
                 "_WINDOWS",

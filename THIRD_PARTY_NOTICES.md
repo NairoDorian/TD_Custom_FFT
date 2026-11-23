@@ -28,10 +28,23 @@ carry them.
 ## Intel oneMKL — optional backend (FFT Backend toggle on)
 
 - **License:** Intel Simplified Software License (redistribution of the unmodified, un-renamed binaries is
-  permitted). Not part of this repository: install oneMKL (or copy its runtime) next to `FFT.dll`
-  (`3rdParty/fftw3/README.md` lists the DLLs).
+  permitted). Not part of this repository or of any release: the installers (`TD_Custom_FFT-Setup.exe`,
+  `installer/install.ps1`) download the pinned `intelmkl.redist.win-x64` package from nuget.org on the user's
+  machine, check its SHA-256 and install its 14 runtime DLLs next to `FFT.dll`, with `license.txt` and
+  `third-party-programs.txt` in `oneMKL-licenses/` (`installer/onemkl.json`; by hand: `3rdParty/fftw3/README.md`).
 - **If you redistribute it**, ship oneMKL's `license.txt` and `third-party-programs.txt` with the DLLs — the
   plugin folder keeps them in `oneMKL-licenses/`.
+
+## The installer (`TD_Custom_FFT-Setup.exe`)
+
+- Built with **Inno Setup** (Copyright (C) 1997-2026 Jordan Russell, portions Martijn Laan;
+  <https://jrsoftware.org/isinfo.php>), under the Inno Setup License, which permits redistribution of the compiled
+  setup with its copyright notices kept in place (they are, in the setup's own About box and resources).
+- The setup embeds Inno's `is7z.dll` (`ArchiveExtraction=full`, used to unpack the oneMKL `.nupkg`): a recompiled
+  **7-Zip** `7z.dll` by Igor Pavlov, under the GNU LGPL 2.1 or later, with the unRAR license restriction on its RAR
+  code (it may not be used to re-create the RAR compression algorithm). Source: <https://www.7-zip.org/> and Inno
+  Setup's own build of it in <https://github.com/jrsoftware/issrc>.
+- `install.ps1`, `Install.cmd` and `build_release.py` are this project's code.
 
 ## TouchDesigner C++ SDK (Derivative Inc.)
 
@@ -43,6 +56,7 @@ carry them.
 
 ## Build-time only (not distributed in the plugin)
 
-- **PluginBuilder_V2** (`../PluginBuilder_V2`, MIT): the CMake module and build tooling.
+- **PluginBuilder_V2** (<https://github.com/NairoDorian/PluginBuilder_V2>, checked out beside this repository;
+  MIT): the CMake module and build tooling.
 - The test and benchmark executables (`tests/`, `bench/`) are this project's code under the same terms as the
   plugin.

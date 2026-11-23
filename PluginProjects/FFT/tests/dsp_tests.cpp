@@ -200,6 +200,27 @@ static bool moduleLoaded(const char* prefix)
 // last printed line as the whole diagnosis, see main()) says which test it was in.
 static void section(const char* name) { std::printf("[%s]\n", name); }
 
+// Wall-clock bounds. Six checks below are timing contracts (a 2 ms high-resolution timer, a prepare() that never
+// stalls the caller, a dormant worker's wake-up, the Signal wake latency). They hold on an idle desktop; a shared
+// CI virtual machine is neither idle nor real-time, so CI sets FFT_TEST_TIMING_SCALE (v2.14.0: 4 in
+// .github/workflows/build.yml) to widen every such bound by that factor. The checks still run, so the count does
+// not change; they then mean "not broken" rather than "fast". Unset, or outside 1..100, the factor is 1.
+static double timingScale()
+{
+    static const double scale = [] {
+        double d = 1.0;
+#ifdef _MSC_VER
+        char* v = nullptr;
+        size_t n = 0;
+        if (_dupenv_s(&v, &n, "FFT_TEST_TIMING_SCALE") == 0 && v) { d = std::atof(v); std::free(v); }
+#else
+        if (const char* v = std::getenv("FFT_TEST_TIMING_SCALE")) d = std::atof(v);
+#endif
+        return (d >= 1.0 && d <= 100.0) ? d : 1.0;
+    }();
+    return scale;
+}
+
 // ------------------------------------------------------------------------------------------
 // ===================== test_fifo =====================
 // WHAT:  FIFOBuffer::get() always hands back exactly `capacity` samples, oldest-first, with the
@@ -558,7 +579,7 @@ static void test_background_plan()
     e.prepare(65536, PlannerPolicy::Auto, &log);            // a size unlikely to be in wisdom on a fresh machine
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  prepare(65536, Auto) returned in %.1f ms: %s\n", ms, e.getPlanStatus().c_str());
-    CHECK(ms < 250.0);                                       // never a MEASURE-length stall on the calling thread
+    CHECK(ms < 250.0 * timingScale());                                       // never a MEASURE-length stall on the calling thread
     // 65536 + 1 zero samples with a single impulse; the impulse makes every bin's magnitude exactly
     // 1, so the magnitude checks below do not depend on the window or on any scaling choice.
     AlignedVector frame(65536, 0.0f), mag; AlignedComplexVector scratch;
@@ -580,7 +601,7 @@ static void test_background_plan()
     pe.prepare(2048, PlannerPolicy::Patient, &log);
     ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  prepare(2048, Patient) returned in %.1f ms: %s\n", ms, pe.getPlanStatus().c_str());
-    CHECK(ms < 250.0);
+    CHECK(ms < 250.0 * timingScale());
     AlignedVector pframe(2048, 0.0f), pmag; AlignedComplexVector pscratch;
     pframe[7] = 1.0f;
     for (int i = 0; i < 1500 && !pe.pollBackgroundPlan(); ++i) {   // 1500 x 10 ms = 15 s: patient planning is slower
@@ -1156,7 +1177,7 @@ static void test_triple_buffer_and_signal()
                 min_ms, p95_ms, worst_ms, sig.highResolutionTimer() ? "yes" : "no");
     CHECK(timeouts == 200);
     CHECK(min_ms >= 1.0);                           // it did wait, and did not return early
-    if (sig.highResolutionTimer()) CHECK(p95_ms < 6.0);
+    if (sig.highResolutionTimer()) CHECK(p95_ms < 6.0 * timingScale());
     sig.signal();
     CHECK(sig.waitFor(1000));                       // a pending signal returns true instead of timing out
 }
@@ -1294,6 +1315,37 @@ static void test_pipeline_process()
     AnalysisPipeline::Status st = pipeline.status();
     CHECK(!st.plan.empty());                            // a description of the live plan, for the Info DAT
     CHECK(st.backendLive == 0);                         // v2.13.2: the live library (FFTW3 = registry index 0)
+    CHECK(!st.backendFallback);                         // v2.14.0: FFTW3 asked for, FFTW3 live - no warning
+
+    // v2.14.0: asking for oneMKL either runs on it or falls back to FFTW3, and the status must say which,
+    // because the node's warning (FFT::getWarningString) is built from backendFallback. Both outcomes are
+    // legitimate - oneMKL is optional - so the expectation follows what this machine can load; the check
+    // count does not change with it.
+    {
+        const bool mklHere = FFTDSP::cachedBackend(
+            FFTDSP::backendById(static_cast<int>(Parameters::Backend::OneMkl))).loaded();
+        AnalysisPipeline mklPipeline(&log);
+        AnalysisJob mklJob = job;
+        mklJob.p.backend = Parameters::Backend::OneMkl;
+        AnalysisResult mklRes;
+        // prepare() only try_locks the process-wide planner, and the pipeline above may still be measuring
+        // its plan in the background: a job that finds the planner busy keeps no plan (backendLive -1) and
+        // the next job retries - so drive jobs until one plans. 500 x 10 ms = a 5 s ceiling, then it fails.
+        AnalysisPipeline::Status ms;
+        for (int i = 0; i < 500; ++i) {
+            mklJob.seq = 100 + static_cast<uint64_t>(i);
+            mklPipeline.process(mklJob, mklRes);
+            ms = mklPipeline.status();
+            if (ms.backendLive >= 0) break;
+            mklJob.reset = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::printf("  FFT Backend = oneMKL: live %d, fallback %s (oneMKL %s here)\n", ms.backendLive,
+                    ms.backendFallback ? "yes" : "no", mklHere ? "installed" : "not installed");
+        CHECK(ms.backendLive == (mklHere ? 1 : 0));
+        CHECK(ms.backendFallback == !mklHere);
+        CHECK_NEAR(mklRes.peakHz, f0, 2.0 * sr / N + 1.0);   // the same tone on either library
+    }
     CHECK(st.fftSize == static_cast<size_t>(N));        // padSize won: fftSizeFrom(p, 3175) == 32768
     CHECK(st.capacity == static_cast<size_t>(win_samples));   // the FIFO is exactly one window long
     CHECK(st.outputBins == bins);
@@ -1896,7 +1948,7 @@ static void test_async_analysis()
     }
     std::printf("  dormant -> woken pickup: worst %.2f ms over 3 cycles, lost %d\n", worstWake, lost);
     CHECK(lost == 0);
-    CHECK(worstWake < 10.0);                          // one kernel wake-up + one analysis, not a poll period
+    CHECK(worstWake < 10.0 * timingScale());                         // one kernel wake-up + one analysis, not a poll period
     // many jobs at random gaps across the poll interval: latest-wins, never a lost final job
     std::mt19937 rng(11);
     std::uniform_int_distribution<int> gap(0, 3000);
@@ -1914,7 +1966,7 @@ static void test_async_analysis()
     std::sort(sig.begin(), sig.end());
     std::printf("  Signal wake: result latency median %.3f ms (includes the analysis)\n", sig[sig.size() / 2]);
     CHECK(sig.front() >= 0.0);
-    CHECK(sig[sig.size() / 2] < 1.5);                 // woken per job: well under the 2 ms poll period
+    CHECK(sig[sig.size() / 2] < 1.5 * timingScale());                // woken per job: well under the 2 ms poll period
     // MMCSS priority restarts the worker and keeps working
     a.configure(true, Parameters::WorkerWake::Poll, Parameters::WorkerPriority::Mmcss);
     publish();
@@ -1942,7 +1994,7 @@ static void test_planner_graveyard()
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::printf("  size change during a measurement: prepare() returned in %.2f ms (measuring: %s, abandoned: %zu)\n",
                 ms, measuring ? "yes" : "no", e.abandonedMeasurements());
-    CHECK(ms < 250.0);
+    CHECK(ms < 250.0 * timingScale());
     CHECK(e.hasPlan() && e.fftSize() == 1024);
     // the abandoned measurement is reaped once it finishes (poll drives the reaping)
     const auto t1 = std::chrono::steady_clock::now();
@@ -2709,6 +2761,7 @@ int main()
     // running. With this, the last line printed is the crash site - and that line is the whole
     // diagnosis, because the alternative is bisecting by re-running with tests commented out.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (timingScale() != 1.0) std::printf("FFT_TEST_TIMING_SCALE: wall-clock bounds widened x%.1f\n", timingScale());
     // Hermetic wisdom: every FFTWEngine in this process reads and writes a private file next to the
     // executable, set BEFORE the first prepare() - importWisdomOnce() latches once per process, and the
     // first prepare() (test_v23_helpers) used to import the user's real %LOCALAPPDATA% cache.

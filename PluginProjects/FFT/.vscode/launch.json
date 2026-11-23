@@ -14,9 +14,9 @@
             "request": "launch",
             "program": "C:/Program Files/Derivative/TouchDesigner/bin/TouchDesigner.exe",
             "args": [
-                "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT/Plugin_FFT.toe"
+                "${workspaceFolder}/../../Plugin_FFT.toe"
             ],
-            "cwd": "C:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/Plugin_FFT",
+            "cwd": "${workspaceFolder}/../..",
             "console": "internalConsole",
             "environment": [
                 {

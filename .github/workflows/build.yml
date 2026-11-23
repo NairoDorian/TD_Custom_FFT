@@ -1,0 +1,120 @@
+# Build, test and package the FFT Custom CHOP; publish a GitHub Release on a v* tag.
+#
+#   push / pull request -> build (MSVC, Ninja, Release) -> ctest (headless DSP tests) -> installer + zip as an
+#                          artifact of the run
+#   tag vX.Y.Z           -> the same, with build_release.py --release (the tag must equal plugin.json's version
+#                          and FFT.dll must come from that clean commit), plus FFTW's source tarball (GPL), then
+#                          a GitHub Release with RELEASE_NOTES.md as its body. A tag with a '-' (v2.14.0-rc1)
+#                          makes a pre-release, which /releases/latest ignores - the way to try the pipeline.
+#
+# The CMake build needs PluginBuilder_V2 (cmake/TDPlugin.cmake + the TouchDesigner SDK headers) as a sibling
+# of this repository, exactly as on a dev machine; it is checked out at a pinned commit.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGIN_BUILDER_REPO: NairoDorian/PluginBuilder_V2
+  # PluginBuilder_V2 2.2.2. Bump deliberately: it owns the compiler flags, the deploy and the SDK headers.
+  PLUGIN_BUILDER_REF: 44df042427d116e50065d02204ea5c01df72391d
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout TD_Custom_FFT
+        uses: actions/checkout@v5
+        with:
+          path: Plugin_FFT
+
+      - name: Checkout PluginBuilder_V2 (pinned)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.PLUGIN_BUILDER_REPO }}
+          ref: ${{ env.PLUGIN_BUILDER_REF }}
+          path: PluginBuilder_V2
+
+      - name: MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Ninja (the generator every local build uses) and Inno Setup >= 6.5 (ArchiveExtraction=full, used for the
+      # oneMKL .nupkg). Both may already be on the image; choco is a no-op then.
+      - name: Tools (Ninja, Inno Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          choco upgrade innosetup -y --no-progress
+          ninja --version
+          cmake --version | Select-Object -First 1
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S Plugin_FFT/PluginProjects/FFT -B Plugin_FFT/PluginProjects/FFT/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build Plugin_FFT/PluginProjects/FFT/build
+
+      # The DSP suite, without the perf gate (absolute timings mean nothing on a shared VM). A runner is not idle
+      # either, so its few wall-clock assertions are widened 4x (tests/dsp_tests.cpp, timingScale).
+      - name: Test
+        shell: pwsh
+        env:
+          FFT_TEST_TIMING_SCALE: '4'
+        run: ctest --test-dir Plugin_FFT/PluginProjects/FFT/build -LE perf --output-on-failure
+
+      - name: Package (installer, zip, install.ps1)
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $extra = @('--release', '--tag', $env:GITHUB_REF_NAME, '--fftw-source') }
+          python Plugin_FFT/installer/build_release.py @extra
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Content Plugin_FFT/installer/dist/SHA256SUMS.txt
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v5
+        with:
+          name: TD_Custom_FFT-${{ github.sha }}
+          path: Plugin_FFT/installer/dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # For RELEASE_NOTES.md: watchers are notified with the body that exists at publish time.
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: TD_Custom_FFT-${{ github.sha }}
+          path: dist
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

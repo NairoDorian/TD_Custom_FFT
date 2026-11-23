@@ -7,11 +7,11 @@ this file is the authoritative record (hashes, source MD5, flags, the one upstre
 README explains how the build uses it, how to rebuild or replace it, and how the oneMKL alternative
 is deployed.
 
-The tree is consumed through the sibling [`PluginBuilder_V2`](../../../../../PluginBuilder_V2) CMake
+The tree is consumed through the sibling [`PluginBuilder_V2`](https://github.com/NairoDorian/PluginBuilder_V2) CMake
 module: `td_plugin_use_fftw3(FFT VERSION 3.3.11-avx2 DYNAMIC)` in
 [`PluginProjects/FFT/CMakeLists.txt`](../../CMakeLists.txt). If you change the build tag, the file
 names or the link mode, update this README and `td_plugin_use_fftw3` in
-`PluginBuilder_V2/cmake/TDPlugin.cmake` together, then rebuild via `PluginBuilder.tox` or
+`PluginBuilder_V2/cmake/TDPlugin.cmake` together, then rebuild via `PluginBuilder_V2.tox` or
 `python PluginBuilder_V2/dev/ci.py --project PluginProjects/FFT`.
 
 ## Contents
@@ -325,7 +325,11 @@ by `mkl_rt.3.dll`.**
 ### Deploying oneMKL
 
 oneMKL is not redistributed in this repository: its DLLs are Intel-licensed and the ISSL requires
-their notice files to ship with them. To enable the toggle:
+their notice files to ship with them. **The installers do all of the steps below** for an installed plugin:
+the Setup.exe "Intel oneMKL" component, or `install.ps1 -OneMKL`, download the package pinned in
+[`installer/onemkl.json`](../../../../installer/onemkl.json) from nuget.org, check its SHA-256 and copy exactly
+the files listed here ([`docs/INSTALLER.md`](../../../../docs/INSTALLER.md)). To enable the toggle by hand (or in
+the dev `__Plugins__/FFT/` folder):
 
 1. Get the runtime — `intelmkl.redist.win-x64` from nuget.org, or the oneMKL component of the oneAPI
    toolkit (https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html).
@@ -369,8 +373,11 @@ plugin logs the file it looked for and falls back to FFTW3 for that node.
 
 ## License
 
-FFTW is GPL, and the vendored DLL is deployed beside `FFT.dll`, so distributing the plugin falls
-under the GPL. This directory holds no copy of FFTW's `COPYING`, and the repository has no `LICENSE`
-file; adding both is planned in [`INSTALLER_PLAN.md`](../../../../INSTALLER_PLAN.md) §6. oneMKL is
-under the Intel Simplified Software License and is not distributed with this project. See
-"License / third party" in the [project README](../../../../README.md).
+FFTW is GPL-2.0-or-later ([`COPYING`](COPYING)), and the vendored DLL is deployed beside `FFT.dll`, so
+distributing the plugin falls under the GPL; the plugin itself is GPL-3.0-or-later
+([`LICENSE`](../../../../LICENSE), [`NOTICE.md`](../../../../NOTICE.md)). The build copies `COPYING` next to the
+DLL as `FFTW3-COPYING.txt`, and [`SOURCE.md`](SOURCE.md) is the written offer of the corresponding source; the
+release workflow attaches `fftw-3.3.11.tar.gz` and the patch to every GitHub release. oneMKL is under the Intel
+Simplified Software License and is not distributed with this project: the installers download it from nuget.org
+on the user's machine and install its `license.txt` beside it ([`docs/INSTALLER.md`](../../../../docs/INSTALLER.md)).
+See "License / third party" in the [project README](../../../../README.md).

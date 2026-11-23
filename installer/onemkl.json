@@ -1,0 +1,33 @@
+{
+  "_comment": "The one place the optional Intel oneMKL runtime is pinned. build_release.py reads it into the installer (TD_Custom_FFT.iss) and into the release zip's manifest.json, which install.ps1 reads. Neither installer redistributes oneMKL: both download this exact package from nuget.org on the user's machine and refuse it unless its SHA-256 matches. To move to a newer oneMKL: change package_version, url, size and sha256 together (the SHA-512 NuGet publishes for the .nupkg is a cross-check), confirm the dlls list against the package, and test the FFT Backend toggle in TouchDesigner.",
+  "package": "intelmkl.redist.win-x64",
+  "package_version": "2026.1.0.226",
+  "url": "https://api.nuget.org/v3-flatcontainer/intelmkl.redist.win-x64/2026.1.0.226/intelmkl.redist.win-x64.2026.1.0.226.nupkg",
+  "size": 173918077,
+  "sha256": "ac2d4a14a70b021557170f53460b57038af5ab1977e82a05aca8e4a5af7bcb61",
+  "nuget_sha512": "s+qR45n7r29pyDpnWEUbRpObKXWU2McH9/9+dY13y8xTQALhM0zITuSux0/cJJRLcPuHPQVNqZHDARU9Gv4lDw==",
+  "file_version": "2026.1.0.0",
+  "installed_size": 477862080,
+  "dll_dir": "runtimes/win-x64/native",
+  "dlls": [
+    "mkl_rt.3.dll",
+    "mkl_core.3.dll",
+    "mkl_sequential.3.dll",
+    "mkl_def.3.dll",
+    "mkl_mc3.3.dll",
+    "mkl_avx2.3.dll",
+    "mkl_avx512.3.dll",
+    "mkl_avx10.3.dll",
+    "mkl_vml_def.3.dll",
+    "mkl_vml_mc3.3.dll",
+    "mkl_vml_avx2.3.dll",
+    "mkl_vml_avx512.3.dll",
+    "mkl_vml_avx10.3.dll",
+    "mkl_vml_cmpt.3.dll"
+  ],
+  "licenses": {
+    "license.txt": "license.txt",
+    "share/doc/mkl/licensing/third-party-programs.txt": "third-party-programs.txt"
+  },
+  "marker": "nuget-package.txt"
+}

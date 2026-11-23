@@ -100,8 +100,8 @@ const char* kOpIcon    = "FFT";
 // plugin.json anyway, because a hand-built DLL that reports an old version is how v2.9.0 lied.
 #ifndef FFT_VERSION_MAJOR
 #define FFT_VERSION_MAJOR 2
-#define FFT_VERSION_MINOR 13
-#define FFT_VERSION_PATCH 2
+#define FFT_VERSION_MINOR 14
+#define FFT_VERSION_PATCH 0
 #endif
 // Generated from PluginProjects/FFT/plugin.json by CMakeLists.txt (FFT_VERSION_* definitions), so the
 // popup's `Plugin:` line, the Custom OP version and plugin.json can no longer drift apart (they did for
@@ -1426,6 +1426,13 @@ FFT::getWarningString(OP_String* warning, void* reserved1)
 	if (myAnalyzedFraction < 0.999)
 		add("Only %.0f %% of the input audio is analysed: about %.0f new samples arrive per analysis but the window reads %d. Raise Window Sampling (or use Multi-FFT), or raise the frame rate.",
 		    100.0 * myAnalyzedFraction, myCoverageFresh, myCoverageWindow);
+	// v2.14.0: the FFT Backend toggle asks for a library that is not installed. The node keeps working on FFTW3
+	// (FFTWEngine::prepare falls back), which used to be visible only in the textport and the fft_backend_live
+	// channel - so a project saved with oneMKL on (the bundled example is one) looked fine and silently ran slower.
+	if (s.backendFallback)
+		add("FFT Backend is set to %s, which could not be loaded from the plugin's folder (the textport says why): this node runs on %s - same spectrum, slower FFT. Install the oneMKL component (TD_Custom_FFT-Setup.exe, or install.ps1 -OneMKL) or turn FFT Backend off.",
+		    FFTDSP::backendById(static_cast<int>(myParams.backend)).logTag,
+		    s.backendLive >= 0 ? FFTDSP::backendById(s.backendLive).logTag : "FFTW3");
 	if (len) warning->setString(myWarningBuf);
 }
 

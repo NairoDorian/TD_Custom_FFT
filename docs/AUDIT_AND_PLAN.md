@@ -3,7 +3,7 @@
 Current as of 2026-09-23, v2.12.1.
 
 > **Status at v2.13.1 (2026-11-18), re-checked in the code — read this first.** The release-prep audit of both
-> repositories is [`../RELEASE_AUDIT_2026-11-18.md`](../RELEASE_AUDIT_2026-11-18.md); it supersedes the plan in §6
+> repositories is `RELEASE_AUDIT_2026-11-18.md` (a working note kept beside the two project folders, not in this repository); it supersedes the plan in §6
 > for release purposes. Finding by finding:
 >
 > | Finding | Status |
@@ -14,17 +14,18 @@ Current as of 2026-09-23, v2.12.1.
 > | F17 comments contradicting code | **Largely fixed in v2.13.1** (see its CHANGELOG *Documentation*) |
 > | F18 DLL search falls back to PATH | **Partly**: v2.13.1 removed the undefined `LOAD_WITH_ALTERED_SEARCH_PATH`-on-a-bare-name call; the PATH fallback itself remains by design |
 > | **F15 licensing** | **Fixed in v2.13.2**: GPL-3.0-or-later + a TouchDesigner-SDK permission (`LICENSE`, `NOTICE.md`), `THIRD_PARTY_NOTICES.md`, FFTW `COPYING` + `SOURCE.md`, SPDX lines, licenses deployed beside the DLL |
-> | F8 warnings | **Mostly fixed in v2.13.2**: all warnings reported (joined), input-coverage warning + `analyzed_fraction`; the true-resolution rows are still open |
-> | F9 non-advancing input, F12 test gaps, F13 perf gate, F14 bench replica (still uses `FIFOBuffer`), F16 dead code | **Open** (F13 re-measured 2026-11-18: default pipeline 15.2 µs vs a 24.9 µs baseline — a 2.3× slowdown still passes) |
+> | F8 warnings | **Mostly fixed in v2.13.2**: all warnings reported (joined), input-coverage warning + `analyzed_fraction`; the true-resolution rows are still open. v2.14.0 adds the oneMKL-fallback warning |
+> | F9 non-advancing input, F12 test gaps, F13 perf gate, F14 bench replica (still uses `FIFOBuffer`), F16 dead code | **Open** (F13 re-measured 2026-11-18: default pipeline 15.2 µs vs a 24.9 µs baseline — a 2.3× slowdown still passes). F12: v2.14.0 made the six wall-clock checks scalable (`FFT_TEST_TIMING_SCALE`, CI uses 4) instead of moving them to the `perf` label |
+> | P14 installer, CI | **Built in v2.14.0** ([INSTALLER.md](INSTALLER.md)): `TD_Custom_FFT-Setup.exe` (Inno Setup) and `install.ps1`, both tested silent + scripted on the dev machine; a GitHub Actions build/test/release workflow. The clean-machine run (Windows Sandbox + TouchDesigner) is still open |
 
 **Scope.** A read of every file in `PluginProjects/FFT/source/`, plus `CMakeLists.txt`, `plugin.json`,
 `tests/dsp_tests.cpp`, `bench/bench.cpp` and `bench/perf_baseline.json`, at HEAD `53ab7ab`. Nothing was built
 or run for this audit. Every number below is quoted from a named source, and every finding cites `file:line`.
 References are to the tree at HEAD, so they go stale on the first edit: search for the symbol named next to each one.
 
-**Companion documents.** History is in [CHANGELOG.md](CHANGELOG.md). Usage and the parameter reference are in
-[README.md](README.md). What to port from EssentiaTD is in [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md), and
-packaging and licensing are in [INSTALLER_PLAN.md](INSTALLER_PLAN.md). Where those documents already cover a
+**Companion documents.** History is in [CHANGELOG.md](../CHANGELOG.md). Usage and the parameter reference are in
+[README.md](../README.md). What to port from EssentiaTD is in [ESSENTIATD_LESSONS.md](ESSENTIATD_LESSONS.md), and
+packaging and licensing are in [INSTALLER.md](INSTALLER.md). Where those documents already cover a
 topic, this one links to them instead of repeating them.
 
 **Severity.** **High**: wrong output, or blocks a release. **Medium**: a real-time or robustness risk under
@@ -304,7 +305,7 @@ bounds that duration since v2.12.1. Four paths take the lock *blocking*:
 - The repository has no LICENSE file.
 - FFTW's GPL `COPYING` is shipped neither in `3rdParty/fftw3/bin` nor in `__Plugins__/FFT`.
 - `RateModel.h:1-3` points to "the project's own terms", and none exist.
-- The obligations and file list are in [INSTALLER_PLAN.md §6](INSTALLER_PLAN.md).
+- The obligations and file list are in [INSTALLER.md](INSTALLER.md).
 
 ### F16 — Low — Dead code
 Nothing in the plugin calls any of these:
@@ -418,10 +419,10 @@ Effort: **S** ≤ ½ day, **M** ≤ 2 days, **L** > 2 days.
 | P8 | **Planner-wait containment:** `try_lock` in `prepare()` and `destroyPlan()` (keep the old plan and retry on the next job), destruction through the graveyard, a "planner busy" status row. Document the teardown wait | F4 | M | With a PATIENT measurement at N 65536 running on node A: node B's size change with Async off has cook max < 1 ms; switching A's Async off has cook max < 1 ms; the Info DAT shows the wait |
 | P9 | **Headless `execute()` harness** (the TDStubs pattern, [ESSENTIATD_LESSONS.md §5](ESSENTIATD_LESSONS.md)) | F12 | M | P1–P3, P6 and P7 are tested through the shipped `getOutputInfo`/`execute`, plus the error-latch lifecycle and declared width == published width |
 | P10 | **Test and gate hygiene:** move the timing checks to the `perf` label; bench defaults = plugin defaults (Auto bins); rebuild `--info` on the real render code (TD-free) or drop it; regenerate the baseline on an idle machine; tighten the limit to 1.15× + 1 µs | F12, F13, F14 | S | 20 consecutive `fft_tests` runs with 0 failures during a parallel build; a deliberate +20 % in the default pipeline fails `ctest -L perf` |
-| P11 | **Licensing:** a LICENSE (GPL-compatible, because of FFTW), FFTW `COPYING` beside the DLL in `3rdParty` and in the deploy, fix the `RateModel.h` header | F15 | S | The files are present in the repository and in `__Plugins__/FFT`; the [INSTALLER_PLAN.md §6](INSTALLER_PLAN.md) checklist is complete |
+| P11 | **Licensing:** a LICENSE (GPL-compatible, because of FFTW), FFTW `COPYING` beside the DLL in `3rdParty` and in the deploy, fix the `RateModel.h` header | F15 | S | **Done in v2.13.2** (`LICENSE`, `NOTICE.md`, `THIRD_PARTY_NOTICES.md`, FFTW `COPYING` + `SOURCE.md`, deployed beside the DLL); the release workflow attaches the FFTW source tarball (v2.14.0) |
 | P12 | **Comment and dead-code sweep**, plus the small hardening items | F16, F17, F18, F10, F11 | S | A comment-only diff proven by the strip-comments projection; check count unchanged; `grep -E "607 checks|983 ?040|21 Info CHOP|FFT::runJob|nothing asserts"` returns nothing |
 | P13 | **Does TouchDesigner load every DLL in the Plugins tree at start-up?** (14 oneMKL DLLs, ~456 MB) | — | S | TD cold start measured with and without the oneMKL set (3 runs each) and the loaded-module list checked; if they load at start-up, oneMKL moves to a subfolder and is loaded by full path |
-| P14 | **Installer** ([INSTALLER_PLAN.md §8](INSTALLER_PLAN.md)) | — | M | Windows Sandbox: install → the node loads → uninstall leaves nothing behind |
+| P14 | **Installer** ([INSTALLER.md](INSTALLER.md)) - **built in v2.14.0**; the Windows Sandbox run is what is left | — | M | Windows Sandbox: install → the node loads → uninstall leaves nothing behind |
 | P15 | **HFC, mel band energies (`mel{i}_{lo}_{hi}`), MFCC-13.** HFC is the Σ pw·k that `featureSums` already accumulates | — | M | Each within 1e-3 relative of an independent reference; allocation gate green |
 | P16 | **SuperFlux novelty** on a short sub-window, plus an optional time-based adaptive onset pulse ([ESSENTIATD_LESSONS.md §1.3](ESSENTIATD_LESSONS.md)) | — | M | Onset F1 on a click track ≥ plain flux; no onset on a ±50-cent vibrato tone |
 | P17 | **dB-domain interpolation option**, with 10·log10 \|X\|² skipping the `sqrt` when dB is on. Default unchanged | — | S | dB-mode pipeline ≥ 1 µs faster at 16384 bins (interleaved A/B median); log-axis screenshot A/B |

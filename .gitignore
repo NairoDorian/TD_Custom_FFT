@@ -45,6 +45,11 @@ PluginProjects/FFT/3rdParty/fftw3/*.zip
 # The .exp is a byproduct of generating the .lib from the .def (ignored globally above), and the
 # runtime DLL is kept in bin/ only - CMake stages it from there, so lib/ holds no second copy.
 
+# Release packaging (installer/build_release.py): the staged files and the built assets, regenerated each run.
+installer/stage/
+installer/dist/
+*.nupkg
+
 # Visual Studio / VS Code / IDE temporary files
 .vs/
 launch.vs.json.user
